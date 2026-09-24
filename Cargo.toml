@@ -1,0 +1,16 @@
+[package]
+name = "compio-pool"
+version = "0.1.0"
+edition = "2024"
+description = "A thread-per-core connection pool for the compio runtime"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+compio = { version = "0.18", default-features = false, features = ["runtime", "time"] }
+
+[dev-dependencies]
+compio = { version = "0.18", features = ["runtime", "time", "macros", "net", "io"] }
+
+[[bench]]
+name = "acquire"
+harness = false
