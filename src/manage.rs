@@ -66,6 +66,16 @@ pub trait Manage: Send + Sync + 'static {
 /// [`Reservoir`](crate::Reservoir), so an idle connection on one compio thread
 /// can be picked up by a busy one instead of sitting unused.
 ///
+/// # Only idle connections, never one with an operation in flight
+///
+/// Moving a handle between drivers is sound only when nothing is still
+/// submitted against it. The pool upholds half of that for you: a connection
+/// reaches [`detach`](Detach::detach) only after its [`Pooled`](crate::Pooled)
+/// guard has been dropped, and a checkout cancelled mid-operation is poisoned
+/// and destroyed rather than parked. [`detach`](Detach::detach) returning
+/// `Option` is the other half — the implementation gets to *check*, rather
+/// than trust, that the handle is genuinely unshared.
+///
 /// # Platform reality
 ///
 /// Whether this is sound depends on the driver, and the answer differs by OS:
@@ -90,9 +100,25 @@ pub trait Detach: Manage {
     type Parked: Send + 'static;
 
     /// Converts a connection into its thread-portable form.
-    fn detach(conn: Self::Connection) -> Self::Parked;
+    ///
+    /// Returns `None` when the connection cannot be made portable — in
+    /// practice, when an IO operation still holds a reference to the
+    /// underlying handle. **The connection is consumed either way**: `None`
+    /// means it has been dropped, and the pool accounts for it as closed
+    /// rather than parked, then dials a replacement.
+    ///
+    /// With `compio`, the check is
+    /// [`SharedFd::try_unwrap`](compio::driver::SharedFd::try_unwrap), which
+    /// succeeds exactly when no submission still references the fd. See
+    /// `examples/steal.rs`.
+    fn detach(conn: Self::Connection) -> Option<Self::Parked>;
 
     /// Rebuilds a connection on the current thread.
+    ///
+    /// This is where the socket is re-wrapped in *this* thread's runtime —
+    /// `TcpStream::from_std`, or a `from_raw_fd` constructor, depending on the
+    /// compio version. Under io_uring and poll that is bookkeeping only; the
+    /// fd table is process-wide.
     ///
     /// Returning `Err` drops the parked connection; the caller falls back to
     /// opening a fresh one.

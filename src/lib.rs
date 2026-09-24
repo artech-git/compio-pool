@@ -38,7 +38,10 @@
 //!
 //! Pure sharding wastes connections when load is skewed: a quiet thread holds
 //! idle sockets a busy thread could use. The optional [`Reservoir`] fixes that
-//! by parking surplus connections in a shared stack that any thread may claim.
+//! with a bounded, lock-free `ArrayQueue` shared by every thread: a shard whose
+//! free list is over `min_idle` detaches the surplus into it, and a shard whose
+//! free list is empty pops from it before paying for a handshake. The claiming
+//! thread re-wraps the socket in its own runtime via [`Detach::attach`].
 //!
 //! It requires [`Detach`], which is **platform-dependent and deliberately
 //! opt-in**:
@@ -112,7 +115,7 @@ mod slot;
 pub use crate::{
     config::Config,
     error::Error,
-    exchange::{Exchange, NoExchange, Reservoir},
+    exchange::{Exchange, NoExchange, Parked, Reservoir, Unparked},
     guard::{OpGuard, Pooled},
     manage::{Detach, Manage},
     metrics::Metrics,

@@ -370,3 +370,169 @@ async fn a_timed_out_dial_gives_its_shard_budget_back() {
         "shard deadlocked after hung dials"
     );
 }
+
+/// The reservoir is bounded: surplus beyond its capacity is handed back and
+/// stays on the shard rather than being silently dropped.
+#[compio::test]
+async fn reservoir_capacity_is_respected() {
+    let _lock = common::detach_lock();
+    let manager = MovableManager::new();
+    let pool = Pool::builder(manager)
+        .config(cfg().max_size(4).min_idle(0))
+        .exchange(Reservoir::new(2))
+        .build();
+
+    // Hold all four at once so each one is a separate connection, then let
+    // them all go back at the same time.
+    let held: Vec<_> = {
+        let mut v = Vec::new();
+        for _ in 0..4 {
+            v.push(pool.acquire().await.unwrap());
+        }
+        v
+    };
+    drop(held);
+
+    let m = pool.metrics();
+    assert_eq!(m.parked, 2, "the reservoir should fill to capacity and stop");
+    assert_eq!(pool.local_idle(), 2, "the refused two stay on this shard");
+    assert_eq!(m.live, 2, "a parked connection belongs to no shard");
+    assert_eq!(m.closed, 0, "refusing an offer must not close anything");
+}
+
+/// A connection that cannot be detached is consumed by `detach`, so the pool
+/// has to account for it as closed rather than leak it out of the counters.
+#[compio::test]
+async fn a_connection_that_cannot_detach_is_closed() {
+    let _lock = common::detach_lock();
+    let manager = MovableManager::new();
+    let counts = manager.counts();
+    let pool = Pool::builder(manager)
+        .config(cfg().max_size(2).min_idle(0))
+        .exchange(Reservoir::new(8))
+        .build();
+
+    common::CAN_DETACH.store(false, SeqCst);
+
+    let held: Vec<_> = {
+        let mut v = Vec::new();
+        for _ in 0..2 {
+            v.push(pool.acquire().await.unwrap());
+        }
+        v
+    };
+    drop(held);
+
+    let m = pool.metrics();
+    assert_eq!(m.parked, 0, "nothing could be made portable");
+    assert_eq!(m.live, 0, "and nothing was kept");
+    assert_eq!(
+        m.closed, 2,
+        "a connection consumed by a failed detach must still be counted closed"
+    );
+    assert_eq!(m.created, m.closed, "created and closed must balance");
+    assert_eq!(
+        counts.disconnected.load(SeqCst),
+        0,
+        "detach consumed them, so `disconnect` never saw them"
+    );
+}
+
+/// A parked connection that cannot be reattached is counted closed, and the
+/// claiming thread falls back to dialling.
+#[test]
+fn a_failed_attach_is_counted_closed_and_redials() {
+    let _lock = common::detach_lock();
+    let manager = MovableManager::new();
+    let counts = manager.counts();
+    let pool = Pool::builder(manager)
+        .config(cfg().max_size(2).min_idle(0))
+        .exchange(Reservoir::new(8))
+        .build();
+
+    // Thread A parks one.
+    std::thread::spawn({
+        let pool = pool.clone();
+        move || {
+            compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    pool.acquire().await.unwrap();
+                })
+        }
+    })
+    .join()
+    .unwrap();
+    assert_eq!(pool.metrics().parked, 1);
+    assert_eq!(counts.connected.load(SeqCst), 1);
+
+    // Thread B pops it, fails to reattach, and dials instead.
+    common::CAN_ATTACH.store(false, SeqCst);
+    std::thread::spawn({
+        let pool = pool.clone();
+        move || {
+            compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    pool.acquire().await.unwrap();
+                })
+        }
+    })
+    .join()
+    .unwrap();
+
+    let m = pool.metrics();
+    assert_eq!(counts.connected.load(SeqCst), 2, "B had to dial its own");
+    assert!(
+        m.closed >= 1,
+        "the connection lost to a failed attach must be counted closed, got {}",
+        m.closed
+    );
+}
+
+/// Many threads parking and stealing at once must not lose or duplicate a
+/// connection: everything ever created is live, parked, or closed.
+#[test]
+fn concurrent_parking_and_stealing_conserves_connections() {
+    let _lock = common::detach_lock();
+    let manager = MovableManager::new();
+    let pool = Pool::builder(manager)
+        .config(cfg().max_size(4).min_idle(0))
+        .exchange(Reservoir::new(16))
+        .build();
+
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let pool = pool.clone();
+            std::thread::spawn(move || {
+                compio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(async move {
+                        for _ in 0..200 {
+                            let a = pool.acquire().await.unwrap();
+                            let b = pool.acquire().await.unwrap();
+                            drop(a);
+                            drop(b);
+                        }
+                    })
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+
+    let m = pool.metrics();
+    assert_eq!(m.live, 0, "every shard is gone, so nothing is held locally");
+    assert_eq!(
+        m.created,
+        m.closed + m.parked,
+        "created must equal closed + parked: {m:?}"
+    );
+    assert!(
+        m.parked <= 16,
+        "the reservoir must never exceed its capacity, got {}",
+        m.parked
+    );
+    assert!(m.unparked > 0, "threads should have stolen from each other");
+}

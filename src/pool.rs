@@ -15,7 +15,7 @@ use std::{
 use crate::{
     config::Config,
     error::Error,
-    exchange::{Exchange, NoExchange},
+    exchange::{Exchange, NoExchange, Parked, Unparked},
     guard::Pooled,
     manage::Manage,
     metrics::{Counters, Metrics},
@@ -299,11 +299,20 @@ impl<M: Manage, X: Exchange<M>> Pool<M, X> {
                 let unparked = self.inner.exchange.unpark().await;
                 reserved.disarm();
 
-                if let Some((conn, meta)) = unparked {
-                    Counters::inc(&self.inner.counters.unparked);
-                    Counters::inc(&self.inner.counters.live);
-                    Counters::inc(&self.inner.counters.acquires);
-                    return Ok(Pooled::new(Slot { conn, meta }, shard, self.clone()));
+                match unparked {
+                    // Someone else's idle socket, re-wrapped in this thread's
+                    // runtime. Cheaper than a handshake, so it is tried first.
+                    Unparked::Claimed(conn, meta) => {
+                        Counters::inc(&self.inner.counters.unparked);
+                        Counters::inc(&self.inner.counters.live);
+                        Counters::inc(&self.inner.counters.acquires);
+                        return Ok(Pooled::new(Slot { conn, meta }, shard, self.clone()));
+                    }
+                    // It was popped but could not be reattached, so it is gone.
+                    // Parking already decremented `live`; balance `created`
+                    // here and fall through to dialling a replacement.
+                    Unparked::Lost => Counters::inc(&self.inner.counters.closed),
+                    Unparked::Empty => {}
                 }
                 let reserved = Reserved::empty(&shard, &self.inner.counters);
                 let connected = self.inner.manager.connect().await;
@@ -361,13 +370,21 @@ impl<M: Manage, X: Exchange<M>> Pool<M, X> {
         if !shard.has_waiters() && shard.idle_len() >= self.inner.config.effective_min_idle() {
             let Slot { conn, meta } = slot;
             match self.inner.exchange.park(conn, meta) {
-                None => {
+                Parked::Accepted => {
                     // The reservoir took it; it is no longer this shard's.
                     Counters::dec(&self.inner.counters.live);
                     shard.release();
                     return;
                 }
-                Some((conn, meta)) => slot = Slot { conn, meta },
+                // `detach` found an operation still in flight and dropped it
+                // rather than hand a busy handle to another driver.
+                Parked::Destroyed => {
+                    Counters::dec(&self.inner.counters.live);
+                    Counters::inc(&self.inner.counters.closed);
+                    shard.release();
+                    return;
+                }
+                Parked::Refused(conn, meta) => slot = Slot { conn, meta },
             }
         }
 

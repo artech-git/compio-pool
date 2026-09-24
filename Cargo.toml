@@ -7,6 +7,8 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 compio = { version = "0.18", default-features = false, features = ["runtime", "time"] }
+# Lock-free bounded MPMC queue backing the cross-thread overflow pool.
+crossbeam-queue = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 compio = { version = "0.18", features = ["runtime", "time", "macros", "net", "io"] }

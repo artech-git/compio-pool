@@ -5,7 +5,7 @@ use std::{
     marker::PhantomData,
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
     },
 };
@@ -143,15 +143,47 @@ impl Manage for MovableManager {
     }
 }
 
+/// `Detach`'s methods are associated fns with no `self`, so a test that wants
+/// them to fail has to reach them through a global. Tests that flip these take
+/// [`detach_lock`] first, since the test binary runs them in parallel.
+pub static CAN_DETACH: AtomicBool = AtomicBool::new(true);
+pub static CAN_ATTACH: AtomicBool = AtomicBool::new(true);
+
+static DETACH_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialises tests that flip [`CAN_DETACH`] / [`CAN_ATTACH`], and restores
+/// both to the default when the guard drops.
+pub fn detach_lock() -> DetachGuard {
+    let guard = DETACH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    CAN_DETACH.store(true, SeqCst);
+    CAN_ATTACH.store(true, SeqCst);
+    DetachGuard(Some(guard))
+}
+
+pub struct DetachGuard(Option<MutexGuard<'static, ()>>);
+
+impl Drop for DetachGuard {
+    fn drop(&mut self) {
+        CAN_DETACH.store(true, SeqCst);
+        CAN_ATTACH.store(true, SeqCst);
+        drop(self.0.take());
+    }
+}
+
 impl Detach for MovableManager {
     /// Stands in for `OwnedFd`: `Send`, and enough to rebuild the connection.
     type Parked = u64;
 
-    fn detach(conn: MovableConn) -> u64 {
-        conn.id
+    fn detach(conn: MovableConn) -> Option<u64> {
+        // A real impl checks that no operation still holds the handle; this
+        // one just consults the switch. Either way the connection is consumed.
+        CAN_DETACH.load(SeqCst).then_some(conn.id)
     }
 
     async fn attach(id: u64) -> Result<MovableConn, &'static str> {
+        if !CAN_ATTACH.load(SeqCst) {
+            return Err("cannot attach");
+        }
         Ok(MovableConn {
             id,
             _not_send: PhantomData,

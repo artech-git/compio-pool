@@ -78,7 +78,7 @@ impl Params {
         let conns = env_usize("CONNS", 45);
         let threads = env_usize("THREADS", 5);
         assert!(
-            conns % threads == 0,
+            conns.is_multiple_of(threads),
             "CONNS ({conns}) must divide evenly into THREADS ({threads}); \
              max_size is per shard, so the per-thread budget has to be a whole number"
         );
@@ -528,7 +528,7 @@ fn us(nanos: u64) -> String {
     format!("{:.1}", nanos as f64 / 1_000.0)
 }
 
-fn latency_row(label: &str, samples: &mut Vec<u64>) {
+fn latency_row(label: &str, samples: &mut [u64]) {
     samples.sort_unstable();
     let mean = if samples.is_empty() {
         0
