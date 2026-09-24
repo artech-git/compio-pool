@@ -16,3 +16,7 @@ compio = { version = "0.18", features = ["runtime", "time", "macros", "net", "io
 [[bench]]
 name = "acquire"
 harness = false
+
+[[bench]]
+name = "exchange"
+harness = false
