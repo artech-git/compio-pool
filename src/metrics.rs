@@ -72,3 +72,75 @@ impl Counters {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters_start_at_zero() {
+        assert_eq!(Counters::default().snapshot(0), Metrics::default());
+    }
+
+    #[test]
+    fn inc_and_dec_move_one_at_a_time() {
+        let c = Counters::default();
+        Counters::inc(&c.live);
+        Counters::inc(&c.live);
+        Counters::dec(&c.live);
+        assert_eq!(c.live.load(Relaxed), 1);
+    }
+
+    /// Each field must be read from its own atomic — a copy-paste slip in
+    /// `snapshot` would otherwise go unnoticed.
+    #[test]
+    fn snapshot_maps_every_field_to_its_own_counter() {
+        let c = Counters::default();
+        c.live.store(1, Relaxed);
+        c.idle.store(2, Relaxed);
+        c.created.store(3, Relaxed);
+        c.closed.store(4, Relaxed);
+        c.acquires.store(5, Relaxed);
+        c.waits.store(6, Relaxed);
+        c.timeouts.store(7, Relaxed);
+        c.poisoned.store(8, Relaxed);
+        c.recycle_failures.store(9, Relaxed);
+        c.unparked.store(10, Relaxed);
+
+        assert_eq!(
+            c.snapshot(11),
+            Metrics {
+                live: 1,
+                idle: 2,
+                parked: 11,
+                created: 3,
+                closed: 4,
+                acquires: 5,
+                waits: 6,
+                timeouts: 7,
+                poisoned: 8,
+                recycle_failures: 9,
+                unparked: 10,
+            }
+        );
+    }
+
+    /// `parked` lives in the exchange, not in `Counters`, so it is passed in
+    /// rather than loaded.
+    #[test]
+    fn parked_comes_from_the_argument() {
+        let c = Counters::default();
+        assert_eq!(c.snapshot(0).parked, 0);
+        assert_eq!(c.snapshot(42).parked, 42);
+    }
+
+    #[test]
+    fn metrics_is_copy_eq_and_debug() {
+        let m = Counters::default().snapshot(1);
+        let copy = m;
+        assert_eq!(m, copy);
+        assert_ne!(m, Metrics::default());
+        assert!(format!("{m:?}").contains("parked"));
+        assert!(format!("{:?}", Counters::default()).contains("live"));
+    }
+}

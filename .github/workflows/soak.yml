@@ -1,0 +1,115 @@
+name: Soak
+
+# The long-running counterparts to the smoke-sized randomized jobs in CI. These
+# are the runs that actually find things; CI only proves the harnesses still
+# compile and that nothing trips on the first input.
+on:
+  schedule:
+    # 04:17 UTC — off the hour, so it does not queue behind everyone else's cron.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds to run each libFuzzer target
+        default: "900"
+      seeds:
+        description: COMPIO_POOL_FUZZ_SEEDS for the seeded suites
+        default: "2000"
+      steps_per_seed:
+        description: COMPIO_POOL_FUZZ_STEPS for the seeded suites
+        default: "5000"
+
+concurrency:
+  group: soak
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  seeded:
+    name: Seeded suites, turned up
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The knobs documented in docs/testing.md. A failure names the seed and
+      # step that produced it, so it replays exactly with the same two values.
+      - name: cargo test --test fuzz
+        run: cargo test --release --test fuzz --locked
+        env:
+          COMPIO_POOL_FUZZ_SEEDS: ${{ inputs.seeds || '2000' }}
+          COMPIO_POOL_FUZZ_STEPS: ${{ inputs.steps_per_seed || '5000' }}
+
+  libfuzzer:
+    name: ${{ matrix.target }} (coverage-guided)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [pool_ops, reservoir_ops]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # The corpus is carried between runs by the cache key below rather than
+      # committed, so a campaign starts from what yesterday's found interesting
+      # instead of from nothing.
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Run
+        run: >
+          cargo +nightly fuzz run ${{ matrix.target }} --
+          -max_total_time=${{ inputs.fuzz_seconds || '900' }} -max_len=4096
+        working-directory: fuzz
+      - name: Minimize corpus
+        if: success()
+        run: cargo +nightly fuzz cmin ${{ matrix.target }}
+        working-directory: fuzz
+      - name: Save corpus
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - name: Upload crash reproducer
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  miri-many-seeds:
+    name: Miri across many interleavings
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # CI runs Miri once. `-Zmiri-many-seeds` reruns under a different
+      # scheduling and weak-memory seed each time, which is the only way the
+      # reservoir's admission CAS gets exercised against an unlucky interleaving.
+      - name: cargo miri test --lib
+        run: cargo miri test --lib --locked
+        env:
+          MIRIFLAGS: >-
+            -Zmiri-strict-provenance -Zmiri-disable-isolation
+            -Zmiri-many-seeds=0..64

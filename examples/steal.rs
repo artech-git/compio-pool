@@ -232,7 +232,10 @@ mod unix {
         println!("after {PARKERS} threads parked their connections:");
         println!("  dials    {}", dials.load(Relaxed));
         println!("  parked   {}", after_park.parked);
-        println!("  live     {}  (a parked connection belongs to no shard)\n", after_park.live);
+        println!(
+            "  live     {}  (a parked connection belongs to no shard)\n",
+            after_park.live
+        );
         assert_eq!(after_park.parked as usize, total, "all should be parked");
         assert_eq!(after_park.live, 0);
 

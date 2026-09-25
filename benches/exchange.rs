@@ -16,9 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use compio_pool::{
-    Config, Detach, Exchange, Manage, Parked, Pool, Reservoir, SlotMeta, Unparked,
-};
+use compio_pool::{Config, Detach, Exchange, Manage, Parked, Pool, Reservoir, SlotMeta, Unparked};
 
 /// Does as little as possible, so what we measure is the exchange.
 struct NullManager;

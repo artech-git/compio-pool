@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
   pull_request:
   workflow_dispatch:
 
@@ -10,10 +9,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# `-D warnings` is deliberately *not* set here. The beta and nightly legs
+# compile the crate against lints that do not exist on stable yet — an upstream
+# deprecation landing in nightly would otherwise turn every open PR red for a
+# reason no PR caused. Jobs on a pinned toolchain opt in individually.
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
-  RUSTDOCFLAGS: -D warnings
 
 jobs:
   fmt:
@@ -48,12 +49,19 @@ jobs:
         include:
           - os: ubuntu-latest
             toolchain: beta
+    env:
+      # Stable is the leg that has to stay warning-clean; beta is here to give
+      # early warning of test failures, not to fail on a new lint.
+      RUSTFLAGS: ${{ matrix.toolchain == 'stable' && '-D warnings' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
+      # Examples are cfg-gated per platform (`unix_socket` and `steal` are Unix
+      # only), so building all targets on all three is what proves the gates are
+      # right rather than just absent.
       - name: Build (all targets, incl. examples and benches)
         run: cargo build --all-targets --locked
       - name: Test
@@ -61,18 +69,90 @@ jobs:
       - name: Doc tests
         run: cargo test --doc --locked
 
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      # Not 1.85, which edition 2024 alone would allow: `compio` pulls in
+      # `thin-cell`, which uses `cell_update`, stable since 1.88. Keep this in
+      # step with `rust-version` in Cargo.toml and the note in README.md.
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      # `--lib` only: dev-dependencies do not bind downstream users, and pinning
+      # the test-only deps to the MSRV would just make this job a maintenance tax.
+      - run: cargo build --lib --locked
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps --locked
 
+  miri:
+    name: Miri (undefined behaviour in the lock-free paths)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # The whole unit suite is runtime-free — the exchange tests poll by hand
+      # with `Waker::noop`, everything else is pure logic — so it runs under Miri
+      # unmodified. This is what keeps the CAS-based admission of decision 0006
+      # and the relaxed counters of decision 0008 honest; neither is provable by
+      # a test that only ever observes the happy interleaving.
+      - name: cargo miri test --lib
+        run: cargo miri test --lib --locked
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-disable-isolation
+
+  fuzz:
+    name: Fuzz targets build and run briefly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+      # A prebuilt binary; `cargo install cargo-fuzz` costs a couple of minutes
+      # of compile on every run and is not cached by rust-cache.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # A smoke run, not a campaign: enough to catch a target that stopped
+      # compiling or an invariant that now trips immediately. The real campaigns
+      # run nightly in soak.yml.
+      - name: pool_ops
+        run: cargo +nightly fuzz run pool_ops -- -runs=2000 -max_len=256
+        working-directory: fuzz
+      - name: reservoir_ops
+        run: cargo +nightly fuzz run reservoir_ops -- -runs=20000 -max_len=256
+        working-directory: fuzz
+      - name: Upload crash reproducer
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
   minimal-features:
     name: Library builds with its declared features only
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -80,3 +160,17 @@ jobs:
       # `cargo build --lib` ignores dev-dependencies, so this catches any
       # accidental reliance on compio features only enabled for tests.
       - run: cargo build --lib --locked
+
+  links:
+    name: Doc cross-links resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # README and docs/ link into each other and into docs/decisions/ heavily;
+      # a renamed file is otherwise invisible until a reader hits the 404.
+      # `--offline` checks relative paths only, so this never fails on a flaky
+      # external host.
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: --offline --no-progress --verbose "**/*.md"
+          fail: true

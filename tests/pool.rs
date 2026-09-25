@@ -170,8 +170,8 @@ async fn max_uses_retires_a_connection() {
     for _ in 0..2 {
         let _c = pool.acquire().await.unwrap();
     }
-    // Two checkouts done; the connection is now at its cap and retired on the
-    // next attempt to hand it out.
+    // Two checkouts done. `release` stamps `uses` before testing expiry, so the
+    // second return is what retires it; this third call dials a replacement.
     let _c = pool.acquire().await.unwrap();
     assert_eq!(counts.connected.load(SeqCst), 2);
     assert_eq!(counts.disconnected.load(SeqCst), 1);
@@ -270,6 +270,9 @@ fn shards_are_independent_per_thread() {
 /// another instead of sitting unused.
 #[test]
 fn reservoir_moves_a_connection_between_threads() {
+    // Without the lock, a sibling test flipping `CAN_ATTACH` can make thread B's
+    // reattach fail, and B then dials instead of claiming.
+    let _lock = common::detach_lock();
     let manager = MovableManager::new();
     let counts = manager.counts();
     let pool = Pool::builder(manager)
@@ -394,7 +397,10 @@ async fn reservoir_capacity_is_respected() {
     drop(held);
 
     let m = pool.metrics();
-    assert_eq!(m.parked, 2, "the reservoir should fill to capacity and stop");
+    assert_eq!(
+        m.parked, 2,
+        "the reservoir should fill to capacity and stop"
+    );
     assert_eq!(pool.local_idle(), 2, "the refused two stay on this shard");
     assert_eq!(m.live, 2, "a parked connection belongs to no shard");
     assert_eq!(m.closed, 0, "refusing an offer must not close anything");

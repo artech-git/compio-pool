@@ -1,0 +1,31 @@
+[package]
+name = "compio-pool-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+compio-pool = { path = ".." }
+compio = { version = "0.18", features = ["runtime", "time", "macros"] }
+
+[[bin]]
+name = "pool_ops"
+path = "fuzz_targets/pool_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reservoir_ops"
+path = "fuzz_targets/reservoir_ops.rs"
+test = false
+doc = false
+bench = false
+
+# Its own workspace, so the parent crate keeps building on stable.
+[workspace]
+members = ["."]

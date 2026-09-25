@@ -253,12 +253,7 @@ impl Samples {
 }
 
 /// Pooled path: check a connection out per request, hand it straight back.
-async fn pooled_task(
-    pool: Pool<NcatManager>,
-    rounds: usize,
-    payload: usize,
-    tag: u64,
-) -> Samples {
+async fn pooled_task(pool: Pool<NcatManager>, rounds: usize, payload: usize, tag: u64) -> Samples {
     let mut s = Samples::with_capacity(rounds);
     let mut req = vec![0u8; payload];
     let mut resp = vec![0u8; payload];
@@ -303,12 +298,7 @@ async fn pooled_task(
 
 /// Unpooled path: a fresh TCP handshake (and a fresh `cat` on the server) per
 /// request. This is the thing the pool is being compared against.
-async fn unpooled_task(
-    addr: SocketAddr,
-    rounds: usize,
-    payload: usize,
-    tag: u64,
-) -> Samples {
+async fn unpooled_task(addr: SocketAddr, rounds: usize, payload: usize, tag: u64) -> Samples {
     let mut s = Samples::with_capacity(rounds);
     let mut req = vec![0u8; payload];
     let mut resp = vec![0u8; payload];
@@ -409,77 +399,79 @@ fn run(
             let barrier = barrier.clone();
             let snapshots = snapshots.clone();
             std::thread::spawn(move || {
-                compio::runtime::Runtime::new().unwrap().block_on(async move {
-                    // Dial this shard's share of the 45 up front, so phase A
-                    // measures steady state and not the handshake.
-                    pool.warm().await.expect("warm");
+                compio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(async move {
+                        // Dial this shard's share of the 45 up front, so phase A
+                        // measures steady state and not the handshake.
+                        pool.warm().await.expect("warm");
 
-                    // Unreported warmup: touches every connection and forces
-                    // the server to fork its `cat` per socket, so phase A is
-                    // not the only one paying first-touch costs.
-                    let warmup: Vec<_> = (0..params_per_shard)
-                        .map(|i| {
-                            compio::runtime::spawn(pooled_task(
-                                pool.clone(),
-                                WARMUP_ROUNDS,
-                                payload,
-                                (thread * 1_000 + i) as u64,
-                            ))
-                        })
-                        .collect();
-                    for h in warmup {
-                        h.await.expect("warmup task panicked");
-                    }
+                        // Unreported warmup: touches every connection and forces
+                        // the server to fork its `cat` per socket, so phase A is
+                        // not the only one paying first-touch costs.
+                        let warmup: Vec<_> = (0..params_per_shard)
+                            .map(|i| {
+                                compio::runtime::spawn(pooled_task(
+                                    pool.clone(),
+                                    WARMUP_ROUNDS,
+                                    payload,
+                                    (thread * 1_000 + i) as u64,
+                                ))
+                            })
+                            .collect();
+                        for h in warmup {
+                            h.await.expect("warmup task panicked");
+                        }
 
-                    let mut out = Vec::new();
-                    for phase in phases {
+                        let mut out = Vec::new();
+                        for phase in phases {
+                            barrier.wait();
+                            if thread == 0 {
+                                snapshots.lock().unwrap().push(pool.metrics());
+                            }
+                            // Nothing runs between the two barriers, so the
+                            // snapshot lands on a quiesced pool.
+                            barrier.wait();
+                            let start = Instant::now();
+
+                            let handles: Vec<_> = (0..phase.tasks)
+                                .map(|i| {
+                                    let tag = (thread * 1_000 + i) as u64;
+                                    let pool = pool.clone();
+                                    if phase.pooled {
+                                        compio::runtime::spawn(pooled_task(
+                                            pool,
+                                            phase.rounds,
+                                            payload,
+                                            tag,
+                                        ))
+                                    } else {
+                                        compio::runtime::spawn(unpooled_task(
+                                            addr,
+                                            phase.rounds,
+                                            payload,
+                                            tag,
+                                        ))
+                                    }
+                                })
+                                .collect();
+
+                            let mut samples = Samples::default();
+                            for h in handles {
+                                samples.merge(h.await.expect("task panicked"));
+                            }
+                            out.push((samples, start.elapsed()));
+                        }
+
+                        // Closing snapshot, still on a live thread: once these
+                        // threads exit, the shards drop and `live` goes to zero.
                         barrier.wait();
                         if thread == 0 {
                             snapshots.lock().unwrap().push(pool.metrics());
                         }
-                        // Nothing runs between the two barriers, so the
-                        // snapshot lands on a quiesced pool.
                         barrier.wait();
-                        let start = Instant::now();
-
-                        let handles: Vec<_> = (0..phase.tasks)
-                            .map(|i| {
-                                let tag = (thread * 1_000 + i) as u64;
-                                let pool = pool.clone();
-                                if phase.pooled {
-                                    compio::runtime::spawn(pooled_task(
-                                        pool,
-                                        phase.rounds,
-                                        payload,
-                                        tag,
-                                    ))
-                                } else {
-                                    compio::runtime::spawn(unpooled_task(
-                                        addr,
-                                        phase.rounds,
-                                        payload,
-                                        tag,
-                                    ))
-                                }
-                            })
-                            .collect();
-
-                        let mut samples = Samples::default();
-                        for h in handles {
-                            samples.merge(h.await.expect("task panicked"));
-                        }
-                        out.push((samples, start.elapsed()));
-                    }
-
-                    // Closing snapshot, still on a live thread: once these
-                    // threads exit, the shards drop and `live` goes to zero.
-                    barrier.wait();
-                    if thread == 0 {
-                        snapshots.lock().unwrap().push(pool.metrics());
-                    }
-                    barrier.wait();
-                    out
-                })
+                        out
+                    })
             })
         })
         .collect();
@@ -785,7 +777,10 @@ fn main() -> io::Result<()> {
         "the pool should still be holding exactly {} connections",
         params.conns
     );
-    assert_eq!(final_metrics.timeouts, 0, "no checkout should have timed out");
+    assert_eq!(
+        final_metrics.timeouts, 0,
+        "no checkout should have timed out"
+    );
 
     // Close before `_server` is dropped, so the sockets go away before ncat does.
     pool.close();

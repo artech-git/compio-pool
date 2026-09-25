@@ -112,6 +112,9 @@ mod pool;
 mod shard;
 mod slot;
 
+#[cfg(test)]
+mod test_support;
+
 pub use crate::{
     config::Config,
     error::Error,

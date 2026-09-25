@@ -84,3 +84,125 @@ impl<C> Slot<C> {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every limit switched off, so a test can enable exactly one.
+    fn no_limits() -> Config {
+        Config::new()
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .max_uses(None)
+    }
+
+    #[test]
+    fn a_fresh_meta_starts_unused_at_its_generation() {
+        let m = SlotMeta::new(7);
+        assert_eq!(m.uses, 0);
+        assert_eq!(m.generation, 7);
+        assert_eq!(
+            m.created_at, m.last_used,
+            "a connection counts as just returned"
+        );
+    }
+
+    #[test]
+    fn age_and_idle_for_advance() {
+        let m = SlotMeta::new(0);
+        // Both read a monotonic clock, so the only safe assertion is ordering.
+        assert!(m.age() <= m.created_at.elapsed());
+        assert!(m.idle_for() <= m.last_used.elapsed());
+    }
+
+    #[test]
+    fn meta_is_clone_and_debug() {
+        let m = SlotMeta::new(3);
+        let c = m.clone();
+        assert_eq!(c.generation, 3);
+        assert!(format!("{m:?}").contains("generation"));
+    }
+
+    #[test]
+    fn a_new_slot_carries_its_connection_and_generation() {
+        let slot = Slot::new("conn", 4);
+        assert_eq!(slot.conn, "conn");
+        assert_eq!(slot.meta.generation, 4);
+        assert!(format!("{slot:?}").contains("conn"));
+    }
+
+    #[test]
+    fn a_slot_with_no_limits_never_expires() {
+        let slot = Slot::new((), 0);
+        assert!(!slot.is_expired(&no_limits(), 0));
+    }
+
+    #[test]
+    fn a_stale_generation_expires_the_slot() {
+        let slot = Slot::new((), 0);
+        assert!(
+            slot.is_expired(&no_limits(), 1),
+            "invalidate() bumps the generation; older connections must go"
+        );
+    }
+
+    /// A generation *ahead* of the pool's cannot happen, but the check is an
+    /// inequality, so pin the behaviour either way.
+    #[test]
+    fn any_generation_mismatch_expires_the_slot() {
+        let slot = Slot::new((), 5);
+        assert!(slot.is_expired(&no_limits(), 4));
+        assert!(!slot.is_expired(&no_limits(), 5));
+    }
+
+    #[test]
+    fn max_lifetime_expires_the_slot() {
+        let slot = Slot::new((), 0);
+        // `age() >= ZERO` always holds, so this is deterministic.
+        assert!(slot.is_expired(&no_limits().max_lifetime(Duration::ZERO), 0));
+    }
+
+    #[test]
+    fn a_lifetime_that_has_not_elapsed_does_not_expire_the_slot() {
+        let slot = Slot::new((), 0);
+        assert!(!slot.is_expired(&no_limits().max_lifetime(Duration::from_secs(3600)), 0));
+    }
+
+    #[test]
+    fn idle_timeout_expires_the_slot() {
+        let slot = Slot::new((), 0);
+        assert!(slot.is_expired(&no_limits().idle_timeout(Duration::ZERO), 0));
+    }
+
+    #[test]
+    fn an_idle_timeout_that_has_not_elapsed_does_not_expire_the_slot() {
+        let slot = Slot::new((), 0);
+        assert!(!slot.is_expired(&no_limits().idle_timeout(Duration::from_secs(3600)), 0));
+    }
+
+    #[test]
+    fn max_uses_expires_the_slot_once_reached() {
+        let mut slot = Slot::new((), 0);
+        let cfg = no_limits().max_uses(2u64);
+
+        assert!(!slot.is_expired(&cfg, 0), "unused");
+        slot.meta.uses = 1;
+        assert!(!slot.is_expired(&cfg, 0), "one checkout of two");
+        slot.meta.uses = 2;
+        assert!(slot.is_expired(&cfg, 0), "the cap is inclusive");
+        slot.meta.uses = 3;
+        assert!(slot.is_expired(&cfg, 0), "and stays tripped past it");
+    }
+
+    /// With every limit configured but none tripped, `is_expired` has to fall
+    /// all the way through to `false`.
+    #[test]
+    fn all_limits_set_and_none_tripped() {
+        let cfg = Config::new()
+            .max_lifetime(Duration::from_secs(3600))
+            .idle_timeout(Duration::from_secs(3600))
+            .max_uses(10u64);
+        assert!(!Slot::new((), 0).is_expired(&cfg, 0));
+    }
+}

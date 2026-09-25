@@ -573,3 +573,181 @@ impl<M: Manage, X: Exchange<M>> Builder<M, X> {
         Pool::with_exchange(self.manager, self.config, self.exchange)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestManager;
+
+    fn untimed() -> Config {
+        Config::new().max_lifetime(None).idle_timeout(None)
+    }
+
+    fn pool() -> Pool<TestManager> {
+        Pool::new(TestManager::new(), untimed())
+    }
+
+    // ---- Reserved: the cancellation-safety guard ----------------------------
+    //
+    // `acquire` claims shard budget before awaiting, and `acquire` is itself
+    // cancellable. These four cases are the whole contract.
+
+    /// A guard for a claim that has already been converted into a real checkout
+    /// must not touch anything when it goes out of scope.
+    #[test]
+    fn a_disarmed_empty_reservation_returns_nothing() {
+        let p = pool();
+        let shard = p.shard();
+        assert!(shard.try_reserve(4));
+
+        Reserved::empty(&shard, &p.inner.counters).disarm();
+
+        assert_eq!(shard.size(), 1, "the budget stayed claimed");
+        assert_eq!(p.metrics().closed, 0);
+    }
+
+    /// The point of the guard: a cancelled dial hands its budget back, or the
+    /// shard silently loses capacity until it sits at `max_size` holding nothing.
+    #[test]
+    fn a_dropped_empty_reservation_returns_the_budget() {
+        let p = pool();
+        let shard = p.shard();
+        assert!(shard.try_reserve(4));
+
+        drop(Reserved::empty(&shard, &p.inner.counters));
+
+        assert_eq!(shard.size(), 0);
+        let m = p.metrics();
+        assert_eq!(m.closed, 0, "there was no connection to close");
+        assert_eq!(m.live, 0);
+    }
+
+    #[test]
+    fn a_disarmed_holding_reservation_leaves_the_connection_counted() {
+        let p = pool();
+        let shard = p.shard();
+        assert!(shard.try_reserve(4));
+        Counters::inc(&p.inner.counters.live);
+
+        Reserved::holding(&shard, &p.inner.counters).disarm();
+
+        let m = p.metrics();
+        assert_eq!(m.live, 1, "the connection is still ours");
+        assert_eq!(m.closed, 0);
+        assert_eq!(shard.size(), 1);
+    }
+
+    /// A connection out of the free list but not yet in a guard is dropped by
+    /// the cancelled future, with no chance to await `disconnect`. It still has
+    /// to be accounted for.
+    #[test]
+    fn a_dropped_holding_reservation_counts_the_connection_closed() {
+        let p = pool();
+        let shard = p.shard();
+        assert!(shard.try_reserve(4));
+        Counters::inc(&p.inner.counters.live);
+
+        drop(Reserved::holding(&shard, &p.inner.counters));
+
+        let m = p.metrics();
+        assert_eq!(m.live, 0);
+        assert_eq!(m.closed, 1);
+        assert_eq!(shard.size(), 0, "and the budget comes back too");
+    }
+
+    // ---- The thread-local shard map -----------------------------------------
+
+    #[test]
+    fn a_shard_is_created_once_per_thread_and_then_reused() {
+        let p = pool();
+        let first = p.shard();
+        let second = p.shard();
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "the hit path must not rebuild the shard"
+        );
+        // A clone of the handle is the same pool, so the same shard.
+        assert!(Rc::ptr_eq(&first, &p.clone().shard()));
+    }
+
+    #[test]
+    fn two_pools_of_the_same_type_do_not_share_a_shard() {
+        let a = pool();
+        let b = pool();
+        assert!(
+            !Rc::ptr_eq(&a.shard(), &b.shard()),
+            "shards are keyed by pool id, not by connection type"
+        );
+    }
+
+    /// Outside a compio runtime there is nothing to spawn the reaper onto. The
+    /// pool must still be usable; expiry is then enforced on acquire instead.
+    #[test]
+    fn a_pool_with_a_reaper_config_works_without_a_runtime() {
+        let p = Pool::new(TestManager::new(), Config::new().min_idle(2));
+        assert!(p.config().needs_reaper());
+        assert_eq!(p.local_size(), 0);
+        assert_eq!(p.local_idle(), 0);
+    }
+
+    #[test]
+    fn a_pool_without_a_reaper_config_skips_the_spawn_entirely() {
+        let p = pool();
+        assert!(!p.config().needs_reaper());
+        assert_eq!(p.local_size(), 0);
+    }
+
+    // ---- Handle surface ------------------------------------------------------
+
+    #[test]
+    fn debug_reports_identity_state_and_metrics() {
+        let p = pool();
+        let s = format!("{p:?}");
+        assert!(s.contains("closed: false"), "got {s}");
+        assert!(s.contains("metrics"), "got {s}");
+
+        p.close();
+        assert!(format!("{p:?}").contains("closed: true"));
+    }
+
+    #[test]
+    fn pool_ids_are_unique() {
+        let a = pool();
+        let b = pool();
+        assert_ne!(a.inner.id, b.inner.id);
+    }
+
+    #[test]
+    fn destroy_closes_through_the_manager_and_frees_budget() {
+        let manager = TestManager::new();
+        let counts = manager.counts();
+        let p = Pool::new(manager, untimed());
+        let shard = p.shard();
+        assert!(shard.try_reserve(4));
+        Counters::inc(&p.inner.counters.live);
+
+        p.destroy(&shard, Slot::new(crate::test_support::TestConn::new(0), 0));
+
+        assert_eq!(counts.disconnected(), 1);
+        assert_eq!(shard.size(), 0);
+        let m = p.metrics();
+        assert_eq!((m.live, m.closed), (0, 1));
+    }
+
+    #[test]
+    fn forget_frees_budget_without_closing_anything() {
+        let manager = TestManager::new();
+        let counts = manager.counts();
+        let p = Pool::new(manager, untimed());
+        let shard = p.shard();
+        assert!(shard.try_reserve(4));
+        Counters::inc(&p.inner.counters.live);
+
+        p.forget(&shard);
+
+        assert_eq!(counts.disconnected(), 0, "the caller owns it now");
+        assert_eq!(shard.size(), 0, "but the shard may open a replacement");
+        let m = p.metrics();
+        assert_eq!((m.live, m.closed), (0, 0));
+    }
+}

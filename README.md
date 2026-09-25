@@ -12,6 +12,10 @@ Connections live in **per-thread shards**, never behind a shared mutex. The acqu
 touches no atomics and takes no lock, `Manage::Connection` is never required to be `Send`, and
 every connection is driven by the compio driver that created it.
 
+📖 **[Documentation](docs/)** — [architecture](docs/architecture.md) ·
+[design decisions](docs/decisions/) · [operating guide](docs/operations.md) ·
+[performance](docs/performance.md) · [testing](docs/testing.md)
+
 ---
 
 ## Why not just use `bb8` / `deadpool` / `r2d2`?
@@ -47,7 +51,7 @@ behind that phrase:
 | Storage | one shared `Mutex`/semaphore | one shard per thread, in a thread-local |
 | Fast-path cost | lock + atomics, contended by every worker | no lock, no atomics |
 | `max_size` | per process | **per thread** (see below) |
-| Work stealing | implicit: any worker, any connection | explicit and opt-in ([`Reservoir`](#letting-connections-migrate-between-threads)) |
+| Work stealing | implicit: any worker, any connection | explicit and opt-in (`Reservoir`) |
 | Cancelling mid-operation | readiness-based: safe to drop the future | completion-based: the op is still running — the connection must be destroyed |
 | Thread affinity | none | a connection is owned by one driver |
 
@@ -98,7 +102,10 @@ compio thread; the shard is created on first touch.
 
 ---
 
-## Design
+## Design in one page
+
+Full detail in [docs/architecture.md](docs/architecture.md); the reasoning, alternative by
+alternative, in [docs/decisions/](docs/decisions/).
 
 ### Per-thread shards
 
@@ -107,14 +114,17 @@ connections. The connections live in a thread-local shard keyed by pool id. That
 `Send + Sync` handle own `!Send` resources: a value in a thread-local is, by construction, only
 reachable from its own thread. At thread exit the shard drops and closes its connections *on the
 thread whose driver owns them*.
+→ [decision 0001](docs/decisions/0001-per-thread-shards.md)
 
 ### `max_size` is per shard, not per process
 
-A pool with `max_size = 8` on 4 compio threads can hold up to 32 connections. This is deliberate:
-a process-wide cap requires a cross-thread semaphore on the acquire fast path, which is exactly
-the contention thread-per-core runtimes exist to avoid. **Size your backend for
-`max_size × threads`.** If your database has a hard connection limit, this is the number you have
-to do arithmetic on, and it is the most common way to get this crate wrong.
+A pool with `max_size = 8` on 4 compio threads can hold up to 32 connections. A process-wide cap
+requires a cross-thread semaphore on the acquire fast path, which is exactly the contention
+thread-per-core runtimes exist to avoid. **Size your backend for `max_size × threads`.** If your
+database has a hard connection limit, this is the number you have to do arithmetic on, and it is
+the most common way to get this crate wrong.
+→ [decision 0002](docs/decisions/0002-per-shard-sizing.md) ·
+[sizing guide](docs/operations.md#sizing-the-arithmetic-you-have-to-do)
 
 ### `recycle` runs on acquire, not on return
 
@@ -122,19 +132,15 @@ Returning a connection happens in `Drop`, which cannot await. So validation and 
 reset (roll back an open transaction, drain a pipeline) happen at the *next* checkout. Returning
 `Err` from `recycle` discards the connection and the pool transparently tries the next idle one or
 dials a fresh connection.
+→ [decision 0003](docs/decisions/0003-recycle-on-acquire.md)
 
 ### Cancellation is the sharp edge
-
-This is the part that differs most from a readiness-based pool, and it is a genuine burden this
-crate pushes onto you.
 
 With completion-based IO, dropping a future with an operation in flight does **not** unwind the
 operation. The kernel still owns the buffer and the peer's response is still coming. compio keeps
 the *buffer* sound, but your *protocol* is now out of step: the next reader on that connection
 sees the tail of someone else's response. A connection cancelled mid-operation must be destroyed,
 never reused.
-
-Wrap each operation in a guard:
 
 ```rust
 let op = conn.begin_op();
@@ -144,6 +150,7 @@ op.complete_op();                     // …this never runs, and the conn is poi
 
 If you never cancel — no `select!`, no timeouts, no early return between submit and completion —
 you can skip it. Everyone believes that about their code right up until they add a timeout.
+→ [decision 0004](docs/decisions/0004-cancellation-destroys-the-connection.md)
 
 ### Letting connections migrate between threads
 
@@ -165,23 +172,12 @@ shared by every thread.
                                                             B's driver
 ```
 
-A shard whose free list is over `min_idle` parks the surplus; a shard whose free list is empty pops
-from the queue *before* paying for a handshake. Only idle connections take this path — a connection
-is offered only after its `Pooled` guard has been dropped, and a checkout cancelled mid-operation
-is poisoned and destroyed instead. `Detach::detach` returns `Option`, so an implementation gets to
-*check* (via `SharedFd::try_unwrap`) rather than trust that nothing is still submitted.
-
-It is opt-in because its soundness is platform-dependent:
-
-| driver | `attach` | connections may change threads |
-|---|---|---|
-| io_uring (Linux) | no-op | yes |
-| poll (Unix fallback) | no-op | yes |
-| IOCP (Windows) | `CreateIoCompletionPort`, once per handle | **no — do not implement `Detach`** |
-
-Under IOCP a handle binds to one completion port for life, so a stolen socket would keep delivering
-completions to the thread that opened it. See `examples/steal.rs` for a full `Detach` implementation
-over a real `TcpStream`.
+Only idle connections take this path, and it is opt-in because its soundness is
+platform-dependent: under IOCP a handle binds to one completion port for life, so on Windows
+**do not implement `Detach`**. See `examples/steal.rs` for a full implementation over a real
+`TcpStream`.
+→ [decision 0005](docs/decisions/0005-detach-is-opt-in.md) ·
+[decision 0006](docs/decisions/0006-lock-free-reservoir.md)
 
 ---
 
@@ -193,8 +189,7 @@ over a real `TcpStream`.
   argument, it is the only argument that matters: `bb8` and `deadpool` cannot compile against
   `compio::net::TcpStream`.
 * **The fast path is a thread-local `Vec::pop`.** No mutex, no semaphore, no atomic RMW on a
-  cache line every core is writing to. It measures in the tens of nanoseconds (see
-  [Benchmarks](#benchmarks)).
+  cache line every core is writing to. It measures in the tens of nanoseconds.
 * **Per-thread cost stays flat as cores are added.** There is nothing shared and mutable on the
   hit path to ping-pong between caches. A globally-locked pool degrades here; this is the whole
   reason thread-per-core runtimes exist.
@@ -265,57 +260,26 @@ retires every connection created before the call (credential rotation, failover)
 the pool down, and `metrics()` returns a snapshot of gauges (`live`, `idle`, `parked`) and counters
 (`created`, `closed`, `acquires`, `waits`, `timeouts`, `poisoned`, `recycle_failures`, `unparked`).
 
+Tuning these in anger, and what each metric is telling you:
+**[docs/operations.md](docs/operations.md)**.
+
 ---
 
 ## Benchmarks
 
-Figures below are from the author's machine; reproduce with `cargo bench`. Treat them as shape,
-not as numbers to quote.
+Reproduce with `cargo bench`. Figures are from the author's machine — treat them as shape, not as
+numbers to quote.
 
-**Acquire fast path** (`cargo bench --bench acquire`): ~65 ns/op with `acquire_timeout = None`,
-~127 ns/op with a timeout armed — the difference is the timer, not the pool. The benchmark also
-decomposes the cost (shard lookup, `Instant::now`, the guard allocation) and reports per-thread
-scaling at 1/2/4/8 threads.
+**Acquire fast path:** ~65 ns/op with `acquire_timeout = None`, ~127 ns/op with a timeout armed —
+the difference is the timer, not the pool.
 
-**Exchange, lock-free queue vs. the `Mutex<Vec<_>>` it replaced** (`cargo bench --bench exchange`,
-both designs compiled into one binary and alternated). The result is *not* the clean win the phrase
-"lock-free" suggests:
+**The exchange** was measured A/B against the `Mutex<Vec<_>>` it replaced, both designs compiled
+into one binary. The lock-free queue is **up to 2.1× slower on the mean** when hammered with
+nothing between operations, and **5.0× better at p99 / 5.8× better at p99.9**. The justification
+for the design is tail latency and behaviour as threads are added, not raw throughput.
 
-```
-park + unpark, mean ns/op (worst thread)
-  threads    ArrayQueue    Mutex<Vec>
-        1          28.7          30.1
-        2         183.1         157.1
-        4         556.1         403.3
-        8        1821.8         857.4
-```
-
-Hammered with nothing between operations, the mutex is up to 2.1× faster on the mean. Its latency
-distribution says why:
-
-```
-8 threads          p50     p99    p99.9       max
-  ArrayQueue      1500    5875    10834    331209
-  Mutex<Vec>        42   29291    62958    477917
-```
-
-A p50 of 42 ns against a mean of 857 ns is a bimodal, unfair distribution: a thread already holding
-the lock reacquires it while others queue behind. The queue trades median for fairness — 5.0× better
-p99, 5.8× better p99.9. Once there is real work between exchange operations, which is the actual
-workload, the queue also wins outright:
-
-```
-full acquire path, min_idle=0
-  threads    ArrayQueue    Mutex<Vec>
-        1          73.8          77.5
-        2         386.8         389.5
-        4         543.5         782.5
-        8        1907.8        2695.3
-```
-
-The justification for the lock-free design is tail latency and behaviour as threads are added, not
-raw throughput. Recorded here so the next person to look at the mean does not "optimise" it back
-to a mutex.
+Full tables, methodology and the end-to-end runs against a real server:
+**[docs/performance.md](docs/performance.md)**.
 
 ---
 
@@ -327,9 +291,38 @@ All runnable with `cargo run --example <name>`.
 |---|---|
 | `tcp` | pooling real `!Send` `TcpStream`s across several compio threads |
 | `std_tcp` | interop both ways: adopting a `std::net::TcpStream`, and borrowing a pooled one back out to std-only APIs without closing it |
+| `unix_socket` | pooling `UnixStream` over a real line protocol, with per-phase latency percentiles and counter deltas: why `recycle` has to be a round trip here and what that probe costs, a synchronous `disconnect` goodbye, and a server restart no caller sees |
 | `steal` | a full `Detach` implementation over a real socket, and four threads feeding a fifth with zero dials |
 | `ncat_bench` | the pool against a real external `ncat` server: steady state, oversubscribed, and no pool at all — including the `TIME_WAIT`/ephemeral-port exhaustion the unpooled path hits |
 | `ncat_steal_bench` | the exchange on and off against a real server: cold-start acquire, connections dialled, and what the exchange costs on the hot path |
+
+---
+
+## Testing
+
+```
+cargo test                  # unit, integration, property and limit suites
+cargo test --test fuzz      # the randomized suites on their own
+```
+
+The randomized suites are seeded, so a failure names the seed and step that produced it and
+replays exactly. They double as a soak run:
+
+```
+COMPIO_POOL_FUZZ_SEEDS=2000 COMPIO_POOL_FUZZ_STEPS=5000 cargo test --test fuzz
+```
+
+`fuzz/` holds two libFuzzer targets sharing the same invariant oracle, on nightly:
+
+```
+cargo +nightly fuzz run pool_ops
+cargo +nightly fuzz run reservoir_ops
+```
+
+The central invariant, asserted after every step of every randomized workload, is that no
+connection is ever lost: `created == closed + live + parked + taken + cleared`.
+
+Suite-by-suite breakdown, the oracle, and the CI matrix: **[docs/testing.md](docs/testing.md)**.
 
 ---
 
@@ -338,17 +331,19 @@ All runnable with `cargo run --example <name>`.
 * **Waiter fairness.** The acquire loop checks the free list before the wait queue, so a late
   arrival can barge past a parked waiter. Under sustained oversubscription this yields an unbounded
   tail rather than FIFO-fair queueing. Tracked for a follow-up; `acquire_timeout` bounds it in the
-  interim.
+  interim. → [decision 0007](docs/decisions/0007-thread-local-waiters.md)
 * **`Detach` is unsound under IOCP.** Cross-thread migration is a Unix-only capability today.
+  → [decision 0005](docs/decisions/0005-detach-is-opt-in.md)
 * **No global cap.** By design, but see the disadvantages above.
+  → [decision 0002](docs/decisions/0002-per-shard-sizing.md)
 * **Metrics gauges are lock-free sums** and can be momentarily inconsistent with each other.
-  Counters are monotonic.
+  Counters are monotonic. → [decision 0008](docs/decisions/0008-relaxed-counters.md)
 
 ---
 
 ## Requirements
 
-Rust edition 2024 (1.85+), `compio` 0.18. The library itself depends only on `compio`
+Rust edition 2024, Rust 1.88+, `compio` 0.18. The library itself depends only on `compio`
 (`runtime`, `time`) and `crossbeam-queue`. CI covers Linux, macOS and Windows on stable, plus beta
 on Linux.
 

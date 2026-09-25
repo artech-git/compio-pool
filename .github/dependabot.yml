@@ -4,6 +4,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # Its own workspace with its own lock file, so the root entry does not see it.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
   - package-ecosystem: github-actions
     directory: /
     schedule:

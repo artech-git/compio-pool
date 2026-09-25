@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "A thread-per-core connection pool for the compio runtime"
 license = "MIT OR Apache-2.0"
+# Edition 2024 alone would allow 1.85, but compio pulls in `thin-cell`, which
+# uses `cell_update` — stable since 1.88. Enforced by the `msrv` job in CI.
+rust-version = "1.88"
+# The fuzz crate is its own workspace and needs nightly; keep it out of the package.
+exclude = ["fuzz"]
 
 [dependencies]
 compio = { version = "0.18", default-features = false, features = ["runtime", "time"] }
