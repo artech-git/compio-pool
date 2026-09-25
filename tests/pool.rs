@@ -138,7 +138,7 @@ async fn dropping_an_op_guard_poisons_the_connection() {
     // Completing the op leaves the connection reusable.
     {
         let conn = pool.acquire().await.unwrap();
-        conn.begin_op().complete();
+        conn.begin_op().complete_op();
     }
     assert_eq!(pool.local_idle(), 1);
     assert_eq!(counts.disconnected.load(SeqCst), 1);

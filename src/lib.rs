@@ -95,7 +95,7 @@
 //!
 //! let op = conn.begin_op();
 //! // ... use `conn` ...
-//! op.complete();
+//! op.complete_op();
 //! # Ok(())
 //! # }
 //! ```

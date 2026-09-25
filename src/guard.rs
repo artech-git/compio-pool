@@ -34,7 +34,7 @@ use crate::{
 /// ```ignore
 /// let op = conn.begin_op();
 /// let n = conn.read(&mut buf).await?;   // if this await is cancelled…
-/// op.complete();                       // …this never runs, and the conn is dropped
+/// op.complete_op();                     // …this never runs, and the conn is dropped
 /// ```
 ///
 /// If you never cancel (no `select!`, no timeouts, no early return between
@@ -143,7 +143,7 @@ pub struct OpGuard {
 
 impl OpGuard {
     /// Disarms the guard: the operation finished, the connection is intact.
-    pub fn complete(mut self) {
+    pub fn complete_op(mut self) {
         self.armed = false;
     }
 }

@@ -90,7 +90,7 @@ let mut conn = pool.acquire().await?;
 
 let op = conn.begin_op();
 // ... use `conn` ...
-op.complete();
+op.complete_op();
 ```
 
 `Pool` is `Send + Sync` and cheap to clone, but holds no connections itself. Clone it onto every
@@ -139,7 +139,7 @@ Wrap each operation in a guard:
 ```rust
 let op = conn.begin_op();
 let n = conn.read(&mut buf).await?;   // if this await is cancelled…
-op.complete();                        // …this never runs, and the conn is poisoned on drop
+op.complete_op();                     // …this never runs, and the conn is poisoned on drop
 ```
 
 If you never cancel — no `select!`, no timeouts, no early return between submit and completion —

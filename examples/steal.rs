@@ -211,7 +211,7 @@ mod unix {
                                 let op = conn.begin_op();
                                 let msg = format!("w{worker}c{i}");
                                 assert_eq!(echo(conn, &msg).await.expect("echo"), msg);
-                                op.complete();
+                                op.complete_op();
                             }
                             // Everyone is holding their full share here, so
                             // `total` connections are live at once.
@@ -253,7 +253,7 @@ mod unix {
                             let op = conn.begin_op();
                             let msg = format!("stolen{i}");
                             assert_eq!(echo(&mut conn, &msg).await.expect("echo"), msg);
-                            op.complete();
+                            op.complete_op();
                             held.push(conn);
                         }
                         drop(held);

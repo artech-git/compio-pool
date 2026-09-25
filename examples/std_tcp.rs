@@ -200,7 +200,7 @@ fn main() -> io::Result<()> {
 
                             let BufResult(read, buf) = conn.read(vec![0u8; msg.len()]).await;
                             let n = read.expect("read");
-                            op.complete();
+                            op.complete_op();
 
                             assert_eq!(&buf[..n], &msg[..], "echo mismatch");
                         }

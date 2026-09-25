@@ -286,11 +286,11 @@ async fn pooled_task(
 
         match result {
             Ok(()) => {
-                op.complete();
+                op.complete_op();
                 s.rtt.push(t_rtt.elapsed().as_nanos() as u64);
                 s.acquire.push(acquired.as_nanos() as u64);
             }
-            // No `op.complete()`: the guard poisons the connection on drop and
+            // No `op.complete_op()`: the guard poisons the connection on drop and
             // the pool closes it instead of handing it to the next caller.
             Err(e) => {
                 s.io_err += 1;
