@@ -5,7 +5,9 @@
 //! the same machine, so the comparison does not depend on run-to-run scheduling
 //! variance the way an A/B across two builds would.
 //!
-//! Run with: `cargo bench --bench exchange`
+//! Run with: `cargo bench --bench exchange`, or
+//! `BENCH_JSON=target/bench/exchange.jsonl cargo bench --bench exchange` to also
+//! record every measurement as data. See `benches/support/report.rs`.
 
 use std::{
     hint::black_box,
@@ -17,6 +19,9 @@ use std::{
 };
 
 use compio_pool::{Config, Detach, Exchange, Manage, Parked, Pool, Reservoir, SlotMeta, Unparked};
+
+#[path = "support/report.rs"]
+mod report;
 
 /// Does as little as possible, so what we measure is the exchange.
 struct NullManager;
@@ -265,6 +270,8 @@ fn main() {
     const ITERS: u32 = 500_000;
     const CAP: usize = 256;
 
+    report::meta("exchange");
+
     println!("park + unpark round trip (ns/op, worst thread)\n");
     println!(
         "{:>8}  {:>14}  {:>14}  {:>9}",
@@ -296,6 +303,24 @@ fn main() {
             "{threads:>8}  {queue:>14.1}  {mutex:>14.1}  {:>8.2}x",
             mutex / queue
         );
+        // Best of two alternating passes each, so these are the floor rather
+        // than a distribution; recorded as scalars for that reason.
+        report::value(
+            "exchange",
+            "round trip",
+            "ArrayQueue",
+            Some(threads),
+            "ns/op",
+            queue,
+        );
+        report::value(
+            "exchange",
+            "round trip",
+            "Mutex<Vec>",
+            Some(threads),
+            "ns/op",
+            mutex,
+        );
     }
 
     println!("\npark + unpark latency distribution at 8 threads (ns)\n");
@@ -325,6 +350,17 @@ fn main() {
             pct(&samples, 0.999),
             pct(&samples, 1.0),
         );
+        // The tail is the whole argument for the lock-free queue, so this panel
+        // carries the real distribution: every round trip was timed.
+        let as_f64: Vec<f64> = samples.iter().map(|ns| *ns as f64).collect();
+        report::stat(
+            "exchange",
+            "tail latency",
+            name,
+            Some(8),
+            "ns",
+            &report::Stats::of(&as_f64),
+        );
     }
 
     println!("\nfull acquire path, min_idle=0 so every checkout crosses the exchange\n");
@@ -348,6 +384,22 @@ fn main() {
         println!(
             "{threads:>8}  {queue:>14.1}  {mutex:>14.1}  {:>8.2}x",
             mutex / queue
+        );
+        report::value(
+            "exchange",
+            "acquire path",
+            "ArrayQueue",
+            Some(threads),
+            "ns/op",
+            queue,
+        );
+        report::value(
+            "exchange",
+            "acquire path",
+            "Mutex<Vec>",
+            Some(threads),
+            "ns/op",
+            mutex,
         );
     }
 }

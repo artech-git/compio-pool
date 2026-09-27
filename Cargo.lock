@@ -165,10 +165,18 @@ dependencies = [
 
 [[package]]
 name = "compio-pool"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "compio",
  "crossbeam-queue",
+]
+
+[[package]]
+name = "compio-redis"
+version = "0.1.0"
+dependencies = [
+ "compio",
+ "compio-pool",
 ]
 
 [[package]]
