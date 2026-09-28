@@ -739,15 +739,12 @@ async fn randomized_cancellations_never_leak_shard_capacity() {
             pool.manager()
                 .set_hang_recycle(burst % 4 == 3 || rng.chance(20));
 
-            // `Op::Warm` is excluded deliberately. Unlike `acquire`, `warm` is
-            // not wrapped in the acquire timeout, so against a hung `connect` it
-            // never returns and would wedge the whole run. Both of `warm`'s
-            // cancellation problems are pinned separately below.
+            // `Op::Warm` is sampled like everything else. `run_ops` bounds it
+            // with a timeout of its own, because `warm` carries none — and a
+            // cancelled `warm` has to give its shard budget back just as a
+            // cancelled `acquire` does, which is what this run proves.
             let ops: Vec<Op> = (0..fuzz_steps() / 12 + 1)
-                .map(|_| match Op::sample(&mut rng) {
-                    Op::Warm => Op::Acquire,
-                    other => other,
-                })
+                .map(|_| Op::sample(&mut rng))
                 .collect();
             run_ops(
                 &pool,
@@ -781,14 +778,15 @@ async fn randomized_cancellations_never_leak_shard_capacity() {
     );
 }
 
-// ---- `warm` is not cancellation-safe --------------------------------------
+// ---- `warm` under a cancellation boundary ----------------------------------
 //
-// Both of these were found by the randomized cancellation suite above, which is
-// why it has to exclude `Op::Warm`. They are recorded here explicitly so the
-// behaviour is a documented fact rather than an omission.
+// `warm` has no timeout of its own, so it must be bounded by the caller. These
+// two pin the halves of that contract: the boundary is the caller's to supply,
+// and applying one is safe.
 
 /// `Pool::warm` does not honour [`Config::acquire_timeout`], so a backend whose
-/// handshake never completes hangs it indefinitely.
+/// handshake never completes hangs it indefinitely. That is why the caller has
+/// to wrap it — see the test below for why wrapping it is safe.
 #[compio::test]
 async fn warm_does_not_honour_the_acquire_timeout() {
     let pool = Pool::new(
@@ -817,14 +815,14 @@ async fn warm_does_not_honour_the_acquire_timeout() {
     );
 }
 
-/// And when `warm` *is* cancelled, the shard budget it claimed is lost for good.
+/// And when `warm` *is* cancelled, the budget it claimed comes back.
 ///
-/// `acquire` guards every await with a reservation that hands the claim back;
-/// `warm` claims with `try_reserve` and awaits `connect` unguarded, so a
-/// cancellation there is permanent. Four cancellations against `max_size` 4 wedge
-/// the shard with no connections at all.
+/// `warm` claims shard budget with `try_reserve` before awaiting `connect`, the
+/// same window `acquire` has, and guards it with the same reservation. Repeated
+/// cancellation must therefore be free: once upon a time this leaked a slot per
+/// call and wedged the shard at `max_size` holding nothing.
 #[compio::test]
-async fn a_cancelled_warm_leaks_shard_capacity_permanently() {
+async fn a_cancelled_warm_returns_the_budget_it_claimed() {
     let max_size = 4;
     let pool = Pool::new(
         LocalManager::new(),
@@ -835,25 +833,69 @@ async fn a_cancelled_warm_leaks_shard_capacity_permanently() {
     );
     pool.manager().set_hang_connect(true);
 
-    for expected in 1..=max_size {
+    // Far more cancellations than `max_size`: a per-call leak of even one slot
+    // would have the shard wedged well before this loop is out.
+    for round in 0..max_size * 3 {
         let _ = compio::time::timeout(Duration::from_millis(15), pool.warm()).await;
         assert_eq!(
             pool.local_size(),
-            expected,
-            "each cancelled warm keeps the slot it claimed"
+            0,
+            "round {round}: a cancelled warm kept the slot it claimed"
         );
     }
 
-    // The shard now believes it is full while holding nothing.
     let m = pool.metrics();
-    assert_eq!(pool.local_size(), max_size);
-    assert_eq!((m.live, m.idle, m.created), (0, 0, 0));
+    assert_eq!(
+        (m.live, m.idle, m.created, m.closed),
+        (0, 0, 0, 0),
+        "no connection ever completed, so there is nothing to account for: {m:?}"
+    );
 
+    // The shard is untouched, so it serves normally the moment the backend is.
     pool.manager().set_hang_connect(false);
     assert!(
-        matches!(pool.acquire().await, Err(Error::Timeout)),
-        "the shard is wedged at max_size with zero real connections"
+        pool.acquire().await.is_ok(),
+        "the shard did not recover: size {} of max {max_size}",
+        pool.local_size()
     );
+}
+
+/// A `warm` cancelled part-way keeps the connections it already opened, and
+/// gives back only the claim of the dial that was actually in flight.
+#[compio::test]
+async fn a_cancelled_warm_keeps_what_it_already_opened() {
+    let max_size = 4;
+    let pool = Pool::new(
+        LocalManager::new(),
+        cfg()
+            .max_size(max_size)
+            .min_idle(max_size)
+            .acquire_timeout(None),
+    );
+
+    // Two real connections in the free list, opened the ordinary way.
+    let a = pool.acquire().await.unwrap();
+    let b = pool.acquire().await.unwrap();
+    drop(a);
+    drop(b);
+    assert_eq!(pool.local_idle(), 2);
+    assert_eq!(pool.local_size(), 2);
+
+    // `min_idle` is 4, so this wants two more; the first never lands.
+    pool.manager().set_hang_connect(true);
+    let _ = compio::time::timeout(Duration::from_millis(15), pool.warm()).await;
+
+    assert_eq!(pool.local_idle(), 2, "the pair it already opened survived");
+    assert_eq!(
+        pool.local_size(),
+        2,
+        "and the in-flight dial's claim came back"
+    );
+
+    // Which means the remaining budget is still spendable.
+    pool.manager().set_hang_connect(false);
+    pool.warm().await.unwrap();
+    assert_eq!(pool.local_idle(), max_size, "warming resumes where it left off");
 }
 
 /// Closing part-way through a workload.

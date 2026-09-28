@@ -113,13 +113,57 @@ deadlock — and it needs no cross-thread wakeup. See
 `acquire` can be dropped at any await: by its own timeout, or by the caller's `select!`. Between
 `try_reserve` and the end of an await, the shard has claimed budget that no connection is backing
 yet — drop the future there and the shard permanently believes it is one connection fuller than it
-is. Repeat that and the shard sits at `max_size` holding nothing.
+is. Repeat that and the shard sits at `max_size` holding nothing, and every later `acquire` waits
+on a return that can never come. The shard is wedged, and nothing short of thread exit clears it.
 
 `Reserved` is the RAII guard that closes this. It wraps each awaited region, and on drop refunds
 the budget (and, in the `holding` case, accounts for the connection that the cancelled future is
 about to drop as `live--`, `closed++`). `disarm()` is called the moment the await completes and
 ownership has moved on. `tests/cancellation.rs` cancels at each awaited step and asserts the
 shard recovers.
+
+The guard is what makes the boundary the caller's to choose. Because the refund rides on `Drop`,
+it happens on exactly the paths where the function never gets to run cleanup code of its own, so
+`acquire` needs no cooperation from the cancelling side:
+
+```rust,ignore
+// A deadline tighter than the configured `acquire_timeout`.
+match compio::time::timeout(Duration::from_millis(50), pool.acquire()).await {
+    Ok(Ok(conn))  => { /* use it */ }
+    Ok(Err(e))    => { /* the pool itself said no */ }
+    Err(_elapsed) => { /* we gave up; the shard is already whole */ }
+}
+
+// Or raced against a shutdown signal — the losing arm is simply dropped.
+futures::select! {
+    conn = pool.acquire().fuse() => { /* won the race */ }
+    _    = shutdown.fuse()       => { /* the acquire future is dropped here */ }
+}
+```
+
+**Every claim-then-await site needs the guard, not just `acquire`.** Three places call
+`try_reserve` and then `await`: step 2 of `acquire`, `Pool::warm`, and the reaper's `min_idle`
+refill. `warm` is public and `async`, so a caller may bound it with a timeout — it carries none
+of its own, since `acquire_timeout` bounds a checkout rather than a warmup — and the reaper is a
+detached task that is dropped wholesale at runtime shutdown, possibly mid-dial. `Shard::drop`
+settles `live`/`closed` from `size`, so a claim stranded there skews the closing accounting. All
+three are guarded.
+
+### What `Reserved` does *not* cover
+
+It accounts for pool bookkeeping, not for protocol state. Cancelling `acquire` is free; cancelling
+an operation on a connection you already hold is not, because a completion-based read that was
+submitted is still going to land. That hazard belongs to `OpGuard`, and the two are independent:
+
+```rust,ignore
+let mut conn = pool.acquire().await?;        // cancel-safe on its own
+let op = conn.begin_op();                    // …but this part is not
+let n = compio::time::timeout(d, conn.read(&mut buf)).await??;
+op.complete_op();
+```
+
+If the `read` times out, `op` drops without `complete_op`, the connection is poisoned, and it is
+closed on return rather than handed to the next caller. See [the release path](#release-step-by-step).
 
 ## Release, step by step
 

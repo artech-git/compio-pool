@@ -78,8 +78,12 @@ impl<M: Manage, X: Exchange<M>> Pooled<M, X> {
 
     /// Arms cancellation protection for one operation.
     ///
+    /// NOTE: It is mandatory to call [`OpGuard::complete_op`] when the operation finishes, or the
+    /// connection will be poisoned. The guard does not borrow the connection, so it can be
+    /// dropped before the operation completes, but that will poison the connection.
+    /// 
     /// The returned guard poisons this connection when dropped, unless
-    /// [`OpGuard::complete`] runs first. It borrows nothing from `self`, so the
+    /// [`OpGuard::complete_op`] runs first. It borrows nothing from `self`, so the
     /// connection stays fully usable while the guard is alive.
     pub fn begin_op(&self) -> OpGuard {
         OpGuard {
@@ -95,6 +99,89 @@ impl<M: Manage, X: Exchange<M>> Pooled<M, X> {
         let slot = self.slot.take().expect("slot present until drop");
         self.pool.forget(&self.shard);
         slot.conn
+    }
+
+    /// Runs `func` with the connection, then returns the connection to the pool.
+    ///
+    /// A returned `Err` does *not* poison — an error is often just an error.
+    /// Call [`poison`](Pooled::poison) yourself if it means the connection is
+    /// no longer trustworthy.
+    ///
+    /// # Panics
+    ///
+    /// If `func` panics, the connection is poisoned and closed instead of
+    /// pooled, and the panic propagates to the caller unchanged. A panic
+    /// mid-protocol leaves the connection in the same unknown state a
+    /// cancellation does, so it must not be reused.
+    ///
+    /// There is deliberately no [`catch_unwind`] here. Three reasons:
+    ///
+    /// * The destructors do the job already. On unwind the [`OpGuard`] drops
+    ///   first and poisons, then `self` drops and releases the slot as
+    ///   poisoned. Catching would only re-implement that, and a catch that
+    ///   re-panics *after* releasing gets the ordering wrong — the earlier
+    ///   version of this function leaked the slot and its shard budget on every
+    ///   panic, because it re-panicked before ever calling `release`.
+    /// * Catching loses the evidence. Re-raising a caught payload replaces the
+    ///   original panic location and truncates the backtrace to this frame.
+    /// * Swallowing it would be a lie. `Result<T, M::Error>` cannot express
+    ///   "your closure blew up", so the only honest options are to propagate or
+    ///   to abort, and propagating is the caller's decision to make.
+    ///
+    /// This matters because a panic here is not necessarily fatal. `compio`
+    /// wraps spawned tasks in `catch_unwind` and parks the payload in the
+    /// `JoinHandle`, so a panicking task neither kills the runtime nor stops
+    /// the other tasks — and if the handle is detached, the panic is discarded
+    /// silently. The pool keeps serving afterwards, which is exactly why the
+    /// abandoned connection has to be poisoned rather than left to the process
+    /// dying. Under `panic = "abort"` none of this runs, but then there is no
+    /// surviving pool to corrupt.
+    ///
+    /// # Why `func` is not `Send`
+    ///
+    /// Because it never crosses a thread. `func` is called synchronously, in
+    /// this stack frame, on the thread that owns the shard. A `Send` bound
+    /// would constrain nothing and reject the ordinary callers: closures that
+    /// capture an `Rc` buffer, a thread-local registry handle, or another
+    /// `Pooled` from the same shard.
+    ///
+    /// It could not be honoured anyway. [`Manage::Connection`] is allowed to be
+    /// `!Send` — that is the point of this crate — so the `&mut M::Connection`
+    /// that `func` receives is generally `!Send`, as is [`Pooled`] itself
+    /// (`Rc<Shard<M>>`, `Rc<Cell<bool>>`). `Send` in this crate lives on the
+    /// things that genuinely move between threads: [`Manage`], [`Exchange`],
+    /// and [`Detach::Parked`](crate::manage::Detach::Parked), the stripped-down form a connection is converted
+    /// *into* to reach the cross-thread overflow pool. The connection itself is
+    /// parked and rebuilt, never sent.
+    ///
+    /// [`catch_unwind`]: std::panic::catch_unwind
+    pub fn run<T>(
+        mut self,
+        func: impl FnOnce(&mut M::Connection) -> Result<T, M::Error>,
+    ) -> Result<T, M::Error> {
+        // On unwind, `op` drops first and poisons, then `self` drops and
+        // releases the slot as poisoned. No `catch_unwind` needed.
+        let op = self.begin_op();
+        let result = func(&mut *self);
+        op.complete_op();
+        result
+    }
+
+    /// The `async` form of [`run`](Pooled::run). Identical in every respect
+    /// discussed there: no `catch_unwind`, poison-on-panic via the guards, and
+    /// no `Send` bound on `func` because the shard is single-threaded.
+    ///
+    /// Dropping this future mid-`await` poisons the connection too, by the same
+    /// two destructors — cancellation and panic are the same hazard here, and
+    /// they get the same handling for free.
+    pub async fn run_async<T>(
+        mut self,
+        func: impl AsyncFnOnce(&mut M::Connection) -> Result<T, M::Error>,
+    ) -> Result<T, M::Error> {
+        let op = self.begin_op();
+        let result = func(&mut *self).await;
+        op.complete_op();
+        result
     }
 }
 
@@ -132,7 +219,7 @@ impl<M: Manage, X: Exchange<M>> std::fmt::Debug for Pooled<M, X> {
     }
 }
 
-/// Poisons its connection unless [`complete`](OpGuard::complete) is called.
+/// Poisons its connection unless [`complete_op`](OpGuard::complete_op) is called.
 ///
 /// Created by [`Pooled::begin_op`]. See that type's docs for why this exists.
 #[must_use = "an OpGuard that is dropped immediately poisons the connection"]

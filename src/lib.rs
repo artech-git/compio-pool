@@ -58,6 +58,18 @@
 //! operation. The connection's protocol state is then unknown and it must be
 //! destroyed rather than returned. See [`Pooled::begin_op`].
 //!
+//! The two halves of this are worth keeping apart:
+//!
+//! * **Getting a connection is cancel-safe.** [`Pool::acquire`] may be dropped
+//!   at any await — a `timeout`, a losing `select!` arm, an early `?` — and the
+//!   shard is left exactly as it was found. It claims capacity before it dials,
+//!   but every awaited region is wrapped in an RAII reservation that refunds
+//!   the claim on drop, so no cooperation is needed from the cancelling side.
+//!   [`Pool::warm`] has the same property, though no timeout of its own.
+//! * **Using one is not.** An operation cancelled mid-flight leaves the
+//!   protocol out of step, which no bookkeeping can repair. That is what
+//!   [`Pooled::begin_op`] is for, and it is the part you have to think about.
+//!
 //! # Example
 //!
 //! ```no_run

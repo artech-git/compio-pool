@@ -218,6 +218,33 @@ impl<M: Manage, X: Exchange<M>> Pool<M, X> {
     ///
     /// Call this once per compio thread at startup so the first real request
     /// does not pay for a handshake.
+    ///
+    /// # Cancellation
+    ///
+    /// Unlike [`acquire`](Pool::acquire), `warm` applies **no timeout of its
+    /// own**: [`Config::acquire_timeout`] bounds a checkout, not a warmup. A
+    /// backend whose handshake never completes will hang `warm` indefinitely,
+    /// so bound it yourself at the call site:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn f(pool: &compio_pool::Pool<Noop>) {
+    /// // Warming is best-effort: a slow backend must not stall startup.
+    /// let _ = compio::time::timeout(Duration::from_secs(5), pool.warm()).await;
+    /// # }
+    /// # struct Noop;
+    /// # impl compio_pool::Manage for Noop {
+    /// #     type Connection = ();
+    /// #     type Error = std::io::Error;
+    /// #     async fn connect(&self) -> std::io::Result<()> { Ok(()) }
+    /// #     async fn recycle(&self, _: &mut (), _: &compio_pool::SlotMeta) -> std::io::Result<()> { Ok(()) }
+    /// # }
+    /// ```
+    ///
+    /// Doing so is safe: like `acquire`, every await here is wrapped in a
+    /// reservation, so a cancelled `warm` hands back the shard budget it had
+    /// claimed and keeps whatever it already opened. Dropping the future costs
+    /// you an in-flight handshake, never capacity.
     pub async fn warm(&self) -> Result<(), Error<M::Error>> {
         let shard = self.shard();
         let target = self.inner.config.effective_min_idle();
@@ -225,7 +252,14 @@ impl<M: Manage, X: Exchange<M>> Pool<M, X> {
             if !shard.try_reserve(self.inner.config.max_size) {
                 break;
             }
-            match self.inner.manager.connect().await {
+            // Guarded for the same reason as the dial in `acquire`: `warm` is a
+            // public async fn, so a caller may wrap it in a timeout or race it
+            // in a `select!`. Without this, a cancellation here would strand the
+            // claim above and the shard would lose that capacity for good.
+            let reserved = Reserved::empty(&shard, &self.inner.counters);
+            let connected = self.inner.manager.connect().await;
+            reserved.disarm();
+            match connected {
                 Ok(conn) => {
                     Counters::inc(&self.inner.counters.created);
                     Counters::inc(&self.inner.counters.live);
@@ -245,6 +279,83 @@ impl<M: Manage, X: Exchange<M>> Pool<M, X> {
     ///
     /// Must be called on a compio runtime thread. Honours
     /// [`Config::acquire_timeout`].
+    ///
+    /// # Cancellation safety
+    ///
+    /// **`acquire` is cancellation-safe.** Drop the future at any point — on a
+    /// timeout, on a losing `select!` branch, on an early `?` return — and the
+    /// shard is left exactly as it was found. Nothing needs to be cleaned up by
+    /// the caller, and no `Pooled` can be lost in the process.
+    ///
+    /// So the idiomatic form is just the obvious one:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn f(pool: &compio_pool::Pool<Noop>) {
+    /// // A deadline tighter than the configured `acquire_timeout`.
+    /// match compio::time::timeout(Duration::from_millis(50), pool.acquire()).await {
+    ///     Ok(Ok(conn)) => { /* use it */ }
+    ///     Ok(Err(e)) => { /* the pool itself said no */ }
+    ///     Err(_elapsed) => { /* we gave up; the shard is already whole */ }
+    /// }
+    /// # }
+    /// # struct Noop;
+    /// # impl compio_pool::Manage for Noop {
+    /// #     type Connection = ();
+    /// #     type Error = std::io::Error;
+    /// #     async fn connect(&self) -> std::io::Result<()> { Ok(()) }
+    /// #     async fn recycle(&self, _: &mut (), _: &compio_pool::SlotMeta) -> std::io::Result<()> { Ok(()) }
+    /// # }
+    /// ```
+    ///
+    /// Racing it against a shutdown signal is the same shape — whichever arm
+    /// loses is simply dropped:
+    ///
+    /// ```ignore
+    /// futures::select! {
+    ///     conn = pool.acquire().fuse() => { /* won the race */ }
+    ///     _ = shutdown.fuse() => { /* the acquire future is dropped here */ }
+    /// }
+    /// ```
+    ///
+    /// ## Why that is safe
+    ///
+    /// `acquire` has to claim shard budget *before* it awaits — `max_size` is
+    /// enforced by `Shard::try_reserve`, and the dial, the unpark and the
+    /// `recycle` check all happen after the claim. That leaves a window in
+    /// which the shard counts a connection that does not exist yet. Drop the
+    /// future in that window and, naively, the budget is gone: the shard
+    /// believes it is one connection fuller than it is, forever. Repeat it
+    /// `max_size` times and the shard sits at capacity holding nothing, with
+    /// every later `acquire` waiting for a return that can never come.
+    ///
+    /// Internally each awaited region is wrapped in an RAII reservation whose
+    /// `Drop` refunds the claim, and which is disarmed the instant the await
+    /// completes and ownership moves into a [`Pooled`]. Cancellation runs
+    /// destructors, so the refund happens on exactly the paths where the
+    /// function cannot run its own cleanup code. Where a real connection is
+    /// riding along — a socket popped from the free list and awaiting
+    /// `recycle` — the same guard also accounts for it as closed, since a
+    /// cancelled future has no way to await [`Manage::disconnect`].
+    ///
+    /// # What is *not* covered
+    ///
+    /// This applies to `acquire` itself, not to what you do with the connection
+    /// afterwards. Cancelling mid-operation on a checked-out connection leaves
+    /// the *protocol* out of step, which no amount of budget accounting can
+    /// repair — that hazard is [`Pooled::begin_op`]'s, and it is the one you
+    /// still have to think about:
+    ///
+    /// ```ignore
+    /// let mut conn = pool.acquire().await?;        // cancel-safe on its own
+    /// let op = conn.begin_op();                    // …but this part is not
+    /// let n = compio::time::timeout(d, conn.read(&mut buf)).await??;
+    /// op.complete_op();
+    /// ```
+    ///
+    /// If the `read` times out, `op` drops without `complete_op` and the
+    /// connection is poisoned: closed on return rather than handed to the next
+    /// caller. See [`Pooled`] for the full account.
     pub async fn acquire(&self) -> Result<Pooled<M, X>, Error<M::Error>> {
         match self.inner.config.acquire_timeout {
             Some(limit) => match compio::time::timeout(limit, self.acquire_inner()).await {
@@ -483,7 +594,14 @@ impl<M: Manage, X: Exchange<M>> Pool<M, X> {
                 if !shard.try_reserve(self.inner.config.max_size) {
                     break;
                 }
-                match self.inner.manager.connect().await {
+                // The reaper is a detached task, so it is dropped wholesale at
+                // runtime shutdown — possibly mid-dial. `Shard::drop` settles
+                // `live`/`closed` from `size`, so a stranded claim would skew
+                // the closing accounting. Guard it like every other dial.
+                let reserved = Reserved::empty(&shard, &self.inner.counters);
+                let connected = self.inner.manager.connect().await;
+                reserved.disarm();
+                match connected {
                     Ok(conn) => {
                         Counters::inc(&self.inner.counters.created);
                         Counters::inc(&self.inner.counters.live);

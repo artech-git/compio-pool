@@ -208,6 +208,34 @@ If you never cancel — no `select!`, no timeouts, no early return between submi
 you can skip it. Everyone believes that about their code right up until they add a timeout.
 → [decision 0004](docs/decisions/0004-cancellation-destroys-the-connection.md)
 
+**Getting a connection, by contrast, is cancel-safe.** `acquire()` can be dropped at any await and
+leaves the shard exactly as it found it, so a cancellation boundary around it needs no ceremony:
+
+```rust
+// A deadline tighter than the configured `acquire_timeout`.
+match compio::time::timeout(Duration::from_millis(50), pool.acquire()).await {
+    Ok(Ok(conn))  => { /* use it */ }
+    Ok(Err(e))    => { /* the pool itself said no */ }
+    Err(_elapsed) => { /* we gave up; the shard is already whole */ }
+}
+
+// Or raced against a shutdown signal — the losing arm is simply dropped.
+futures::select! {
+    conn = pool.acquire().fuse() => { /* won the race */ }
+    _    = shutdown.fuse()       => { /* the acquire future is dropped here */ }
+}
+```
+
+This is not free by accident. `max_size` is enforced by claiming shard budget *before* the dial,
+which leaves a window where the shard counts a connection that does not exist yet; drop the future
+there and, naively, that capacity is gone for good — repeat it `max_size` times and the shard sits
+at its limit holding nothing, with every later `acquire` waiting on a return that can never come.
+Internally each awaited region is wrapped in an RAII reservation that refunds the claim on `Drop`
+and is disarmed the instant ownership moves into a `Pooled`. Because the refund rides on a
+destructor, it runs on exactly the paths where the function never gets to clean up after itself.
+So the rule is: cancel `acquire()` freely, and guard what you do with the connection afterwards.
+→ [architecture.md](docs/architecture.md#every-await-is-a-cancellation-point)
+
 ### Letting connections migrate between threads
 
 Pure sharding wastes connections when load is skewed: a quiet thread holds idle sockets a busy
@@ -316,6 +344,11 @@ Other pool operations: `warm()` pre-opens up to `min_idle` on the current thread
 retires every connection created before the call (credential rotation, failover), `close()` shuts
 the pool down, and `metrics()` returns a snapshot of gauges (`live`, `idle`, `parked`) and counters
 (`created`, `closed`, `acquires`, `waits`, `timeouts`, `poisoned`, `recycle_failures`, `unparked`).
+
+Note that `warm()` carries no timeout of its own — `acquire_timeout` bounds a checkout, not a
+warmup — so wrap it in one if a slow backend must not stall startup. That is safe for the reason
+`acquire()` is: a cancelled `warm()` keeps whatever it already opened and hands back the budget of
+the dial that was still in flight.
 
 Tuning these in anger, and what each metric is telling you:
 **[docs/operations.md](docs/operations.md)**.

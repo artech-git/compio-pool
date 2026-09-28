@@ -27,7 +27,9 @@ connections *without* counting them closed, so `created` ends up ahead. The driv
 explicitly rather than pretending it does not happen, and standalone tests pin the behaviour
 directly.
 
-**Capacity.** `shard.size() <= max_size`, always, including across a cancellation.
+**Capacity.** `shard.size() <= max_size`, always, including across a cancellation — and a
+cancelled `acquire` or `warm` gives its claim *back*, so repeated cancellation cannot walk the
+shard up to `max_size` holding nothing.
 
 **Exclusivity.** No connection id is handed out twice at once.
 
@@ -53,7 +55,7 @@ command, which is how cancellation at each awaited step is reached deterministic
 | `tests/guard.rs` | `Pooled`, `OpGuard`, poisoning, `take` |
 | `tests/exchange.rs` | the reservoir, single-thread and cross-thread |
 | `tests/reaper.rs` | the background reaper |
-| `tests/cancellation.rs` | cancellation at each awaited step of `acquire` |
+| `tests/cancellation.rs` | cancellation at each awaited step of `acquire`, and `acquire` inside a caller's `timeout`/`select!` |
 | `tests/builder.rs` | the constructors and every config setter |
 | `tests/fuzz.rs` | randomized workloads against the invariants above |
 | `tests/limits.rs` | degenerate configurations — zero, one, `usize::MAX` |

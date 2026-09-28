@@ -61,7 +61,7 @@ out of the free list — so this only affects how long dead sockets linger.
 
 | call | effect |
 |---|---|
-| `warm()` | Opens connections on the **current thread** up to `min_idle`. Call once per compio thread at startup so the first real request does not pay a handshake |
+| `warm()` | Opens connections on the **current thread** up to `min_idle`. Call once per compio thread at startup so the first real request does not pay a handshake. Carries **no timeout of its own** — `acquire_timeout` bounds a checkout, not a warmup — so wrap it in one if a slow backend must not stall startup. Doing so is safe: a cancelled `warm` keeps what it already opened and hands back the budget of the dial that was in flight |
 | `invalidate()` | Bumps the generation: every connection created before the call is retired. Live checkouts keep working and are closed when returned. Use after a credential rotation or a failover |
 | `close()` | `acquire` now fails with `Error::Closed`. This thread's idle connections close immediately; other threads' close when they next touch the pool, on their reaper's next tick, or at thread exit |
 | `metrics()` | Process-wide snapshot |
