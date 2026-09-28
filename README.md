@@ -1,20 +1,35 @@
 # compio-pool
 
+[![crates.io](https://img.shields.io/crates/v/compio-pool.svg)](https://crates.io/crates/compio-pool)
+[![docs.rs](https://img.shields.io/docsrs/compio-pool)](https://docs.rs/compio-pool)
+[![downloads](https://img.shields.io/crates/d/compio-pool.svg)](https://crates.io/crates/compio-pool)
+[![dependency status](https://deps.rs/crate/compio-pool/latest/status.svg)](https://deps.rs/crate/compio-pool)
+[![CI](https://github.com/artech-git/compio-pool/actions/workflows/ci.yml/badge.svg)](https://github.com/artech-git/compio-pool/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/rustc-1.88+-blue.svg)](#requirements)
+[![license](https://img.shields.io/crates/l/compio-pool.svg)](#license)
+
 A connection pool for [`compio`](https://github.com/compio-rs/compio), the completion-based,
 thread-per-core Rust runtime.
 
 ```toml
 [dependencies]
-compio-pool = "0.1"
+compio-pool = "0.0.2"
 ```
 
 Connections live in **per-thread shards**, never behind a shared mutex. The acquire fast path
 touches no atomics and takes no lock, `Manage::Connection` is never required to be `Send`, and
 every connection is driven by the compio driver that created it.
 
-📖 **[Documentation](docs/)** — [architecture](docs/architecture.md) ·
+📖 **[API documentation on docs.rs](https://docs.rs/compio-pool)** — every public type, with
+the cancellation points marked.
+
+**Design notes** — [architecture](docs/architecture.md) ·
 [design decisions](docs/decisions/) · [operating guide](docs/operations.md) ·
 [performance](docs/performance.md) · [testing](docs/testing.md)
+
+**Companion crates** — [`compio-redis`](https://crates.io/crates/compio-redis)
+([docs](https://docs.rs/compio-redis)), a poolable Redis client living in
+[`crates/compio-redis`](crates/compio-redis).
 
 ---
 

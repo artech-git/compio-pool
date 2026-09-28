@@ -1,14 +1,27 @@
 [package]
 name = "compio-pool"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "A thread-per-core connection pool for the compio runtime"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/artech-git/compio-pool"
+documentation = "https://docs.rs/compio-pool"
+homepage = "https://github.com/artech-git/compio-pool"
+# Rendered as the crates.io front page, badges and all.
+readme = "README.md"
+keywords = ["compio", "pool", "thread-per-core", "io-uring", "async"]
+categories = ["asynchronous", "network-programming", "concurrency"]
 # Edition 2024 alone would allow 1.85, but compio pulls in `thin-cell`, which
 # uses `cell_update` — stable since 1.88. Enforced by the `msrv` job in CI.
 rust-version = "1.88"
 # The fuzz crate is its own workspace and needs nightly; keep it out of the package.
 exclude = ["fuzz"]
+
+# docs.rs builds with every feature on, and with `--cfg docsrs` so the
+# `#[doc(cfg(...))]` annotations in the source render.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 # `crates/*` are consumers of this crate that ship in the same repo. `fuzz` is
 # deliberately absent: it declares its own `[workspace]` so the parent keeps

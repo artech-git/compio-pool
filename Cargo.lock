@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "compio-pool"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "compio",
  "crossbeam-queue",
