@@ -27,9 +27,50 @@ the cancellation points marked.
 [design decisions](docs/decisions/) · [operating guide](docs/operations.md) ·
 [performance](docs/performance.md) · [testing](docs/testing.md)
 
-**Companion crates** — [`compio-redis`](https://crates.io/crates/compio-redis)
-([docs](https://docs.rs/compio-redis)), a poolable Redis client living in
-[`crates/compio-redis`](crates/compio-redis).
+**Companion crates** — [ready-made `Manage` implementations](#companion-crates) so you do not
+have to write one: [`compio-redis`](https://crates.io/crates/compio-redis).
+
+---
+
+## Companion crates
+
+`compio-pool` is protocol-agnostic: it pools whatever you teach it to build via the
+[`Manage`](https://docs.rs/compio-pool/latest/compio_pool/trait.Manage.html) trait. Implementing
+`Manage` is a `connect`, an optional `recycle` and an optional `disconnect` — small, but it is
+still a protocol you have to get right, and `recycle` in particular is easy to get subtly wrong
+(see [Situational disadvantages](#situational-disadvantages)).
+
+The crates below do that work for a specific backend, so pooling is a `Pool::builder(...)` call and
+nothing more.
+
+| Crate | Backend | Status |
+| --- | --- | --- |
+| [`compio-redis`](https://crates.io/crates/compio-redis) ([docs](https://docs.rs/compio-redis), [source](crates/compio-redis)) | Redis / RESP | **Shipped.** RESP2/RESP3 codec, a `recycle` that probes with `PING <token>` or `RESET`, and optional cross-thread migration via `Reservoir`. |
+| `compio-postgres` | PostgreSQL | *Not written.* See below. |
+| `compio-mysql` | MySQL / MariaDB | *Not written.* See below. |
+
+Only `compio-redis` exists today. `compio-postgres` and `compio-mysql` are listed because they are
+the two most-asked-for backends and because it is worth being explicit that they are **not
+available** — if you need Postgres or MySQL on compio right now, you are writing the wire protocol
+and the `Manage` impl yourself. Neither is scheduled; do not plan around them.
+
+Redis was built first deliberately: RESP is simple enough to implement correctly, which makes the
+crate a readable reference for your own `Manage` impl. If you are writing one,
+[`crates/compio-redis/src/manage.rs`](crates/compio-redis/src/manage.rs) is the file to read. Two
+decisions there generalize to any backend:
+
+* **`recycle` probes with a unique token** — `PING <token>` and an insistence on getting *that*
+  payload back, not just any `+PONG`. A bare `PING` proves the socket is open; a tokened one also
+  proves the stream is in sync, which is what catches a connection desynchronized by a cancelled
+  request.
+* **`disconnect` is deliberately not implemented.** It runs from `Drop` and from thread teardown, so
+  it is synchronous, and a graceful Redis `QUIT` needs an await. Closing the socket *is* a complete
+  disconnect. If you want the clean goodbye, it belongs in an explicit async call, not in
+  `disconnect`.
+
+Building one? A `Manage` impl that is genuinely useful to others is welcome as a PR into
+[`crates/`](crates), or keep it in your own crate — there is nothing special about living in this
+repo.
 
 ---
 
@@ -239,9 +280,10 @@ Be honest with yourself about these before adopting it.
   [Known limitations](#known-limitations).
 * **Per-thread state complicates a global view.** Gauges are summed across threads without a lock,
   so a `Metrics` snapshot can be momentarily internally inconsistent.
-* **The ecosystem is small.** There is no `compio-postgres` or `compio-redis` waiting for you.
-  `Manage` is easy to implement, but you are implementing it.
-* **Version 0.1, no published crate, one author.** Treat it accordingly.
+* **The ecosystem is small.** [`compio-redis`](#companion-crates) is the only backend that ships.
+  For anything else — Postgres, MySQL, your internal RPC — `Manage` is easy to implement, but you
+  are implementing it, wire protocol included.
+* **Version 0.0.x, one author.** The API is not settled and `0.0.z` bumps may break you. Treat it accordingly.
 
 ### Rules of thumb
 
