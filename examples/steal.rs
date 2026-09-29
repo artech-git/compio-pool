@@ -1,31 +1,39 @@
-//! The cross-thread overflow / steal pool, with real sockets.
+//! [`Detach`](compio_pool::Detach) for a real socket, moving between two real threads.
 //!
-//! [`Reservoir`] is a bounded, lock-free `ArrayQueue` shared by every compio
-//! thread. A shard whose free list has grown past `min_idle` **detaches** the
-//! surplus socket — lifting the fd out of its driver — and pushes it there. A
-//! shard whose free list is empty **pops** one and re-wraps it in its own
-//! runtime before it will consider paying for a TCP handshake.
-//!
-//! This example implements [`Detach`] for a real [`compio::net::TcpStream`],
-//! which is where the two interesting constraints live:
+//! A connection leaves one worker's free list, has its fd lifted out of that
+//! worker's driver, waits in the shared [`Reservoir`](compio_pool::Reservoir), and is rebuilt as a
+//! working stream on a *different* worker. That round trip is the subject
+//! here, and it is worth isolating because it is the part with sharp edges:
 //!
 //! * **No pending ops.** An fd may only change drivers when nothing is still
 //!   submitted against it. `compio` exposes exactly that check:
 //!   [`SharedFd::try_unwrap`](compio::driver::SharedFd::try_unwrap) succeeds
 //!   only at a strong count of one, meaning no in-flight operation holds a
-//!   reference. `detach` returns `None` otherwise.
-//! * **Re-wrapping.** The claiming thread rebuilds the stream with
-//!   [`TcpStream::from_std`], binding the socket to *its* driver. Which
-//!   constructor to use differs across compio versions — `from_std` here, a
-//!   `from_raw_fd` in others — which is why it lives behind [`Detach::attach`]
-//!   rather than inside the pool.
+//!   reference. [`Detach::detach`](compio_pool::Detach::detach) returns `None` otherwise.
+//! * **Re-wrapping.** The claiming side rebuilds the stream with
+//!   [`TcpStream::from_std`](compio::net::TcpStream::from_std), binding the socket to *its* driver. Which
+//!   constructor to use differs across compio versions, which is why this
+//!   lives behind [`Detach::attach`](compio_pool::Detach::attach) rather than inside the pool.
+//!
+//! # Getting the two halves onto two threads
+//!
+//! The pool shards per thread, so a parked socket is only interesting if some
+//! *other* thread claims it. Two dispatched tasks on a two-worker dispatcher
+//! guarantee that: with `concurrent(false)` a worker cannot take a second task
+//! while its first is still running, so the parker and the claimer cannot land
+//! on the same thread. Each reports the thread it ran on, and the run asserts
+//! the two differ.
+//!
+//! They hand off through [`Pool::metrics`](compio_pool::Pool::metrics) rather than a channel: the parker
+//! stays alive until its sockets have been claimed, and the claimer waits
+//! until they have been parked.
 //!
 //! Run with: `cargo run --example steal`
 
 #[cfg(not(unix))]
 fn main() {
     // `Detach` is unsound under IOCP: a handle binds to one completion port
-    // for life, so a stolen socket would keep delivering completions to the
+    // for life, so a claimed socket would keep delivering completions to the
     // thread that opened it. See the `Detach` docs.
     eprintln!("this example is unix-only; `Detach` is not sound on IOCP");
 }
@@ -40,40 +48,33 @@ mod unix {
     use std::{
         io,
         net::SocketAddr,
-        os::fd::{FromRawFd, IntoRawFd, OwnedFd},
-        sync::{
-            Arc,
-            atomic::{AtomicU64, Ordering::Relaxed},
-        },
-        time::Duration,
+        num::NonZeroUsize,
+        os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+        time::{Duration, Instant},
     };
 
     use compio::{
         buf::BufResult,
+        dispatcher::Dispatcher,
         driver::ToSharedFd,
         io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
     };
-    use compio_pool::{Config, Detach, Manage, Pool, Reservoir, SlotMeta};
+    use compio_pool::{Detach, Manage, Pool, Reservoir, SlotMeta};
 
-    /// How many threads park connections, and how many each opens.
-    const PARKERS: usize = 4;
-    const PER_THREAD: usize = 3;
+    /// Connections moved across. Holding them all at once is what forces the
+    /// pool to dial more than one — a checkout already returned would just be
+    /// reused.
+    const CONNS: usize = 3;
 
-    struct StealManager {
-        addr: SocketAddr,
-        dials: Arc<AtomicU64>,
-    }
+    struct Echo(SocketAddr);
 
-    impl Manage for StealManager {
+    impl Manage for Echo {
         type Connection = TcpStream;
         type Error = io::Error;
 
         async fn connect(&self) -> io::Result<TcpStream> {
-            self.dials.fetch_add(1, Relaxed);
-            let conn = TcpStream::connect(self.addr).await?;
-            conn.set_nodelay(true)?;
-            Ok(conn)
+            TcpStream::connect(self.0).await
         }
 
         async fn recycle(&self, conn: &mut TcpStream, _meta: &SlotMeta) -> io::Result<()> {
@@ -81,16 +82,16 @@ mod unix {
         }
     }
 
-    impl Detach for StealManager {
+    impl Detach for Echo {
         /// `OwnedFd` is `Send` and owns the descriptor — everything the socket
-        /// needs to exist between two drivers. A protocol client would carry
-        /// its `Send` session state alongside it here.
+        /// needs in order to exist in between two drivers. A protocol client
+        /// would carry its `Send` session state alongside it here.
         type Parked = OwnedFd;
 
         fn detach(conn: TcpStream) -> Option<OwnedFd> {
             // `to_shared_fd` hands out a *clone* of the handle, so drop our
             // stream first. `try_unwrap` then succeeds exactly when nothing
-            // else holds a reference — which is the "no operation in flight"
+            // else holds a reference — the "no operation in flight"
             // precondition for moving an fd between drivers. If a submission
             // is still outstanding it fails, `shared` drops, and the socket
             // closes once that operation completes.
@@ -99,195 +100,164 @@ mod unix {
             let socket = shared.try_unwrap().ok()?;
             // SAFETY: `try_unwrap` gave us sole ownership, and `into_raw_fd`
             // gives up the socket's claim on the descriptor, so the `OwnedFd`
-            // below is its only owner.
+            // is its only owner.
             Some(unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) })
         }
 
         async fn attach(fd: OwnedFd) -> io::Result<TcpStream> {
-            // Runs on the claiming thread, so the socket is registered with
-            // *that* thread's driver. Under io_uring and poll this is
-            // bookkeeping; the fd table is process-wide.
+            // Runs on the claiming worker, so the socket registers with *that*
+            // driver. Under io_uring and poll this is bookkeeping: the fd table
+            // is process-wide and the descriptor number does not change, which
+            // is what makes the fds printed below a usable identity.
             TcpStream::from_std(std::net::TcpStream::from(fd))
         }
     }
 
-    /// One echo round trip, to prove a stolen socket is still a live socket.
-    async fn echo(conn: &mut TcpStream, msg: &str) -> io::Result<String> {
-        let BufResult(written, _) = conn.write_all(msg.as_bytes().to_vec()).await;
+    /// One echo round trip, to prove a re-attached socket is still a live
+    /// socket rather than just a number.
+    async fn echo(conn: &mut TcpStream, msg: &str) -> io::Result<()> {
+        let BufResult(written, msg) = conn.write_all(msg.as_bytes().to_vec()).await;
         written?;
         let BufResult(read, buf) = conn.read_exact(vec![0u8; msg.len()]).await;
         read?;
-        Ok(String::from_utf8_lossy(&buf).into_owned())
+        assert_eq!(buf, msg, "echo mismatch");
+        Ok(())
     }
 
-    fn spawn_echo_server() -> io::Result<SocketAddr> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            compio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(async move {
-                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    tx.send(listener.local_addr().unwrap()).unwrap();
+    /// Waits for the other worker without blocking this one's driver.
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Starts an echo server as a task on the current runtime, and returns the
+    /// address it bound.
+    async fn serve() -> io::Result<SocketAddr> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        compio::runtime::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                compio::runtime::spawn(async move {
                     loop {
-                        let Ok((mut stream, _)) = listener.accept().await else {
+                        let BufResult(read, buf) = stream.read(vec![0u8; 64]).await;
+                        let Ok(n @ 1..) = read else { return };
+                        let BufResult(written, _) = stream.write_all(buf[..n].to_vec()).await;
+                        if written.is_err() {
                             return;
-                        };
-                        compio::runtime::spawn(async move {
-                            loop {
-                                let BufResult(read, buf) = stream.read(vec![0u8; 64]).await;
-                                match read {
-                                    Ok(0) | Err(_) => return,
-                                    Ok(n) => {
-                                        let BufResult(w, _) =
-                                            stream.write_all(buf[..n].to_vec()).await;
-                                        if w.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        })
-                        .detach();
+                        }
                     }
                 })
-        });
-        Ok(rx.recv().unwrap())
-    }
-
-    /// Runs `f` on its own compio thread and waits for it.
-    fn on_compio_thread<T: Send + 'static>(
-        f: impl FnOnce(Pool<StealManager, Reservoir<StealManager>>) -> T + Send + 'static,
-        pool: &Pool<StealManager, Reservoir<StealManager>>,
-    ) -> T {
-        let pool = pool.clone();
-        std::thread::spawn(move || f(pool)).join().unwrap()
-    }
-
-    pub fn run() -> io::Result<()> {
-        let addr = spawn_echo_server()?;
-        let dials = Arc::new(AtomicU64::new(0));
-
-        let total = PARKERS * PER_THREAD;
-        let pool = Pool::builder(StealManager {
-            addr,
-            dials: dials.clone(),
+                .detach();
+            }
         })
-        .config(
-            Config::new()
-                .max_size(PER_THREAD)
-                // Keep nothing locally: every returned connection is surplus,
-                // so it all goes to the shared queue where any thread can take
-                // it. A real service sets this to its steady-state per-thread
-                // concurrency and shares only the overflow.
-                .min_idle(0)
-                .acquire_timeout(Duration::from_secs(5))
-                .idle_timeout(None)
-                .max_lifetime(None),
-        )
-        .exchange(Reservoir::new(total))
-        .build();
+        .detach();
+        Ok(addr)
+    }
 
-        println!("echo server on {addr}");
-        println!("reservoir capacity {total}\n");
+    fn thread_name() -> String {
+        std::thread::current().name().unwrap_or("?").to_owned()
+    }
 
-        // Stage 1: `PARKERS` threads each open `PER_THREAD` connections and
-        // all hold them at the same time, so every one of them has to be
-        // dialled — nobody can steal from a thread that is still using its
-        // sockets. They are released only after the barrier.
-        let barrier = Arc::new(std::sync::Barrier::new(PARKERS));
-        let parkers: Vec<_> = (0..PARKERS)
-            .map(|worker| {
+    #[compio::main]
+    pub async fn run() -> io::Result<()> {
+        let addr = serve().await?;
+
+        let pool = Pool::builder(Echo(addr))
+            .max_size(CONNS)
+            // `min_idle` defaults to 0, so every returned connection is surplus
+            // and gets offered to the reservoir rather than kept locally.
+            .exchange(Reservoir::new(CONNS))
+            .build();
+
+        let dispatcher = Dispatcher::builder()
+            .worker_threads(NonZeroUsize::new(2).unwrap())
+            .concurrent(false)
+            .thread_names(|i| format!("worker-{i}"))
+            .build()?;
+
+        // Dials `CONNS` sockets, uses them, then drops them so the shard hands
+        // each to the reservoir.
+        let park = dispatcher
+            .dispatch({
                 let pool = pool.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    compio::runtime::Runtime::new()
-                        .unwrap()
-                        .block_on(async move {
-                            let mut held = Vec::new();
-                            for _ in 0..PER_THREAD {
-                                held.push(pool.acquire().await.expect("acquire"));
-                            }
-                            for (i, conn) in held.iter_mut().enumerate() {
-                                let op = conn.begin_op();
-                                let msg = format!("w{worker}c{i}");
-                                assert_eq!(echo(conn, &msg).await.expect("echo"), msg);
-                                op.complete_op();
-                            }
-                            // Everyone is holding their full share here, so
-                            // `total` connections are live at once.
-                            barrier.wait();
-                            // Dropping them parks them: over min_idle, no
-                            // waiters, so the shard offers each to the queue
-                            // instead of closing it at thread exit.
-                            drop(held);
-                        })
-                })
+                move || async move {
+                    let mut held = Vec::new();
+                    for i in 0..CONNS {
+                        let mut conn = pool.acquire().await.expect("acquire");
+                        // Arms cancellation protection: a checkout cancelled
+                        // mid-operation is poisoned, and a poisoned connection
+                        // is destroyed rather than parked. Nothing with unknown
+                        // protocol state is ever handed to another driver.
+                        let op = conn.begin_op();
+                        echo(&mut conn, &format!("hello {i}")).await.expect("echo");
+                        op.complete_op();
+                        held.push(conn);
+                    }
+                    let fds: Vec<RawFd> = held.iter().map(|c| c.as_raw_fd()).collect();
+
+                    // Over `min_idle`, nobody waiting: each one is detached out
+                    // of this worker's driver and pushed to the reservoir.
+                    drop(held);
+
+                    // Stay on this thread until they have been claimed, so the
+                    // claim cannot be this thread doing it.
+                    wait_until("the claim", || pool.metrics().unparked as usize == CONNS).await;
+                    (thread_name(), fds)
+                }
             })
-            .collect();
-        for p in parkers {
-            p.join().unwrap();
-        }
+            .expect("dispatch");
 
-        let after_park = pool.metrics();
-        println!("after {PARKERS} threads parked their connections:");
-        println!("  dials    {}", dials.load(Relaxed));
-        println!("  parked   {}", after_park.parked);
+        // Claims them back. This worker's free list is empty, so every checkout
+        // pops from the reservoir and re-attaches rather than dialling.
+        let claim = dispatcher
+            .dispatch({
+                let pool = pool.clone();
+                move || async move {
+                    wait_until("the park", || pool.metrics().parked as usize == CONNS).await;
+
+                    let mut claimed = Vec::new();
+                    let mut fds = Vec::new();
+                    for i in 0..CONNS {
+                        let mut conn = pool.acquire().await.expect("acquire");
+                        fds.push(conn.as_raw_fd());
+                        let op = conn.begin_op();
+                        echo(&mut conn, &format!("again {i}")).await.expect("echo");
+                        op.complete_op();
+                        claimed.push(conn);
+                    }
+                    (thread_name(), fds)
+                }
+            })
+            .expect("dispatch");
+
+        let (parker, dialled) = park.await.expect("parker panicked");
+        let (claimer, claimed) = claim.await.expect("claimer panicked");
+
+        println!("{parker} dialled fds {dialled:?}");
+        println!("{claimer} claimed fds {claimed:?}");
+
+        let m = pool.metrics();
         println!(
-            "  live     {}  (a parked connection belongs to no shard)\n",
-            after_park.live
-        );
-        assert_eq!(after_park.parked as usize, total, "all should be parked");
-        assert_eq!(after_park.live, 0);
-
-        // Stage 2: a thread that has never dialled anything. Its free list is
-        // empty, so every checkout pops from the shared queue and re-wraps the
-        // socket here rather than opening a new one.
-        let dials_before = dials.load(Relaxed);
-        on_compio_thread(
-            |pool| {
-                compio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(async move {
-                        let mut held = Vec::new();
-                        for i in 0..PER_THREAD {
-                            let mut conn = pool.acquire().await.expect("acquire");
-                            // A stolen socket has to still work: same fd, new
-                            // driver, mid-stream.
-                            let op = conn.begin_op();
-                            let msg = format!("stolen{i}");
-                            assert_eq!(echo(&mut conn, &msg).await.expect("echo"), msg);
-                            op.complete_op();
-                            held.push(conn);
-                        }
-                        drop(held);
-                    })
-            },
-            &pool,
+            "created {}, parked {}, unparked {}",
+            m.created, m.parked, m.unparked
         );
 
-        let after_steal = pool.metrics();
-        println!("after a fresh thread served {PER_THREAD} requests:");
-        println!(
-            "  dials    {}  (+{} — it stole instead of dialling)",
-            dials.load(Relaxed),
-            dials.load(Relaxed) - dials_before,
-        );
-        println!("  unparked {}", after_steal.unparked);
-        println!("  parked   {}\n", after_steal.parked);
+        assert_ne!(parker, claimer, "the two halves must be different threads");
+        assert_eq!(m.created as usize, CONNS, "a claim must not cost a dial");
+        assert_eq!(m.unparked as usize, CONNS);
+        // The reservoir is FIFO, so they come back in the order they were
+        // parked — and `attach` keeps the descriptor, so these are provably the
+        // same sockets, not replacements.
+        assert_eq!(claimed, dialled, "same sockets, same order, re-attached");
 
-        assert_eq!(
-            dials.load(Relaxed),
-            dials_before,
-            "a thread with an empty free list must drain the queue before dialling"
-        );
-        assert_eq!(after_steal.unparked as usize, PER_THREAD);
-
-        println!("metrics: {:#?}", pool.metrics());
-        println!(
-            "\nOK: {total} connections opened by {PARKERS} threads, \
-             {PER_THREAD} of them later served requests on a thread that never dialled."
-        );
+        dispatcher.join().await?;
         pool.close();
+        assert_eq!(pool.metrics().parked, 0, "close empties the reservoir");
+
+        println!("\nOK: {CONNS} sockets detached on {parker}, re-attached on {claimer}.");
         Ok(())
     }
 }

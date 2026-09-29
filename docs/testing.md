@@ -127,7 +127,8 @@ turn every open PR red for a reason no PR caused — so those legs report failur
 The Windows leg matters beyond portability: it is what keeps the IOCP constraint in
 [decision 0005](decisions/0005-detach-is-opt-in.md) honest, since the crate must build and pass
 there without `Detach` being implementable. It also checks the `#[cfg(unix)]` gates on
-`examples/unix_socket.rs` and `examples/steal.rs` are actually right rather than merely present.
+`examples/unix_socket.rs`, `examples/steal.rs`, `examples/custom_exchange.rs` and
+`examples/ncat_steal_bench.rs` are actually right rather than merely present.
 
 `miri` is the one that earns its keep on the lock-free paths. The randomized suites only ever
 observe the interleaving they happen to get; Miri checks the orderings themselves, which is what

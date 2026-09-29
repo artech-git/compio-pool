@@ -551,8 +551,8 @@ pub async fn run_ops<M, X>(
                 // exactly what its docs tell users to do. Bounding it here is
                 // what lets the randomized cancellation suite sample `Warm`
                 // against a backend whose handshake never completes.
-                let _ = compio::time::timeout(std::time::Duration::from_millis(5), pool.warm())
-                    .await;
+                let _ =
+                    compio::time::timeout(std::time::Duration::from_millis(5), pool.warm()).await;
             }
             Op::Close => {
                 tally.cleared += pool.metrics().parked;

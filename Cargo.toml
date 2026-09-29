@@ -27,7 +27,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 # deliberately absent: it declares its own `[workspace]` so the parent keeps
 # building on stable.
 [workspace]
-members = ["crates/compio-redis"]
+members = ["crates/compio-redis", "crates/deadpool-baseline", "crates/fs-bench"]
 
 [dependencies]
 compio = { version = "0.18", default-features = false, features = ["runtime", "time"] }
@@ -35,7 +35,9 @@ compio = { version = "0.18", default-features = false, features = ["runtime", "t
 crossbeam-queue = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-compio = { version = "0.18", features = ["runtime", "time", "macros", "net", "io"] }
+# The examples all drive their load through `compio::dispatcher::Dispatcher`,
+# which is where their per-thread shards come from.
+compio = { version = "0.18", features = ["runtime", "time", "macros", "net", "io", "dispatcher"] }
 
 [[bench]]
 name = "acquire"
@@ -44,3 +46,19 @@ harness = false
 [[bench]]
 name = "exchange"
 harness = false
+
+# The profile the filesystem comparison in `crates/fs-bench` is built with.
+# `release` would do, but a three-way comparison of dispatch overhead is exactly
+# the case where cross-crate inlining and a single codegen unit change the
+# answer, so the run that produced `docs/fs-performance.md` pinned them here
+# rather than leaving them to whatever `release` happened to mean.
+[profile.maxopt]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Left unwinding: `Pooled`'s drop poisons a connection when its scope unwinds,
+# and building the pool with `panic = "abort"` would measure a pool that cannot
+# do that.
+panic = "unwind"
+debug = false

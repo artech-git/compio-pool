@@ -345,14 +345,21 @@ async fn a_panicking_closure_poisons_the_connection_and_frees_the_budget() {
         "and it must be the original payload, not a re-raised copy"
     );
 
-    assert_eq!(pool.local_idle(), 0, "a panicked connection is never pooled");
+    assert_eq!(
+        pool.local_idle(),
+        0,
+        "a panicked connection is never pooled"
+    );
     assert_eq!(counts.disconnected(), 1, "it was closed instead");
     assert_eq!(pool.metrics().poisoned, 1);
     assert_eq!(pool.local_size(), 0, "and its budget came back");
 
     // The proof that the budget really is free.
     let replacement = pool.acquire().await.unwrap();
-    assert_eq!(replacement.id, 1, "a fresh connection, not the poisoned one");
+    assert_eq!(
+        replacement.id, 1,
+        "a fresh connection, not the poisoned one"
+    );
 }
 
 /// A panic *after* the connection was already touched is the dangerous case:
@@ -374,7 +381,10 @@ async fn a_panic_midway_through_the_closure_still_discards_the_connection() {
     assert!(caught.is_err());
 
     let fresh = pool.acquire().await.unwrap();
-    assert_ne!(fresh.id, 4242, "nobody ever sees the half-written connection");
+    assert_ne!(
+        fresh.id, 4242,
+        "nobody ever sees the half-written connection"
+    );
 }
 
 /// `run` takes no `Send` bound, so a closure capturing thread-local state

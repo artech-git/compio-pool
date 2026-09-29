@@ -350,7 +350,11 @@ async fn a_won_race_whose_result_is_discarded_returns_the_connection() {
     // A `select!` arm that runs and then falls out of scope.
     drop(winner);
 
-    assert_eq!(pool.local_idle(), 1, "the connection was pooled, not leaked");
+    assert_eq!(
+        pool.local_idle(),
+        1,
+        "the connection was pooled, not leaked"
+    );
     assert_eq!(pool.local_size(), 1);
     let m = pool.metrics();
     assert_eq!((m.created, m.closed, m.live), (1, 0, 1), "{m:?}");
@@ -376,7 +380,11 @@ async fn a_cancelled_operation_poisons_but_does_not_cost_the_shard_its_budget() 
     assert_eq!(m.closed, 1);
     assert_eq!(counts.disconnected(), 1, "and closed through the manager");
     assert_eq!(pool.local_idle(), 0, "it must not be handed out again");
-    assert_eq!(pool.local_size(), 0, "but the budget is free for a successor");
+    assert_eq!(
+        pool.local_size(),
+        0,
+        "but the budget is free for a successor"
+    );
 
     assert!(pool.acquire().await.is_ok());
 }

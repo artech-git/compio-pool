@@ -895,7 +895,11 @@ async fn a_cancelled_warm_keeps_what_it_already_opened() {
     // Which means the remaining budget is still spendable.
     pool.manager().set_hang_connect(false);
     pool.warm().await.unwrap();
-    assert_eq!(pool.local_idle(), max_size, "warming resumes where it left off");
+    assert_eq!(
+        pool.local_idle(),
+        max_size,
+        "warming resumes where it left off"
+    );
 }
 
 /// Closing part-way through a workload.

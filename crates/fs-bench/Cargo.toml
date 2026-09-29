@@ -1,0 +1,32 @@
+[package]
+name = "fs-bench"
+version = "0.0.0"
+edition = "2024"
+description = "Filesystem-only three-way comparison: tokio::fs, tokio + deadpool, compio + compio-pool"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/artech-git/compio-pool"
+rust-version = "1.88"
+# A yardstick, like `deadpool-baseline`. Nothing here is meant to be released.
+publish = false
+
+[dependencies]
+# `getrusage` and `/proc` are how the CPU and context-switch columns are filled;
+# a latency table alone cannot say *why* an arm is slower.
+libc = "0.2"
+# The three arms, in one workspace so they build against one lockfile.
+# `io-uring` is in compio's defaults, and turning defaults off drops it: without
+# it the driver is the stub, which supports no operations at all. Named
+# explicitly so a future features edit cannot silently benchmark the stub.
+compio = { version = "0.18", default-features = false, features = [
+    "runtime",
+    "fs",
+    "io",
+    "time",
+    "io-uring",
+] }
+compio-pool = { path = "../.." }
+deadpool = { version = "0.13", features = ["rt_tokio_1"] }
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "sync", "time"] }
+# `join_all` is the whole of the dependency: it is what gives each worker its
+# queue depth.
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }

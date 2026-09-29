@@ -11,6 +11,8 @@ reproduce with `cargo bench`. Treat them as shape, not as numbers to quote.
 | `benches/exchange.rs` | Lock-free queue or mutex for the exchange? |
 | `examples/ncat_bench.rs` | What does pooling buy over dialling per request, against a real server? |
 | `examples/ncat_steal_bench.rs` | Given a pool, what does cross-thread migration buy and cost? |
+| `crates/deadpool-baseline/examples/ncat_steal_bench.rs` | What does the same workload look like on tokio + deadpool? |
+| `crates/fs-bench` | On *files* rather than sockets, what does the thread handoff under `tokio::fs` cost? |
 
 The two `ncat` examples are end-to-end against an external process, not microbenchmarks: `ncat`
 forks `/bin/cat` per connection, so every round trip crosses the kernel twice and every dial costs
@@ -99,15 +101,88 @@ cargo run --release --example ncat_bench
 cargo run --release --example ncat_steal_bench
 ```
 
-**`ncat_bench`** runs 45 connections in flight over 5 compio threads — 5 shards of 9, because
-`max_size` is per shard — in three phases: steady state, oversubscribed, and no pool at all. The
-third phase is the point: the unpooled path hits `TIME_WAIT` accumulation and ephemeral-port
-exhaustion, which is the failure mode a pool exists to prevent and which no microbenchmark will
-ever show you.
+**`ncat_bench`** runs two arms over a `Dispatcher` — one shard per worker thread, because
+`max_size` is per shard — pooled against unpooled. The unpooled arm is the point: it dials per
+request, so it hits `TIME_WAIT` accumulation and ephemeral-port exhaustion, the failure mode a pool
+exists to prevent and the one no microbenchmark will ever show you. It runs far fewer requests for
+exactly that reason.
 
-**`ncat_steal_bench`** runs two arms against one server in one process, exchange on and off, and
-reports cold-start acquire latency, connections actually dialled, and what the exchange costs on
-the hot path.
+**`ncat_steal_bench`** runs two arms against one server in one process, exchange on and off. Each
+arm has two dispatchers: a warm half that populates the shards, then a cold half whose shards are
+empty while the warm threads stay alive and idle. It reports cold-start acquire latency,
+connections actually dialled in the cold phase, and what the exchange costs the warm phase.
+
+## Against tokio + deadpool
+
+```sh
+cargo run --release -p deadpool-baseline --example ncat_steal_bench
+```
+
+`crates/deadpool-baseline` is a yardstick, not a product: it ports `ncat_steal_bench` to tokio and
+deadpool so the shape above can be checked against the incumbent on the same machine, against the
+same server, instead of against numbers quoted from someone else's run.
+
+deadpool has no shards — one `Vec` behind one `Mutex`, and a tokio `TcpStream` is `Send` — so there
+is no exchange to toggle. The arms change the topology instead: a pool per half (nothing to share),
+one pool across two runtimes (everything shared), and one runtime with the whole thread budget,
+which is the shape a tokio service actually has and the honest throughput baseline.
+
+Cross-thread migration is therefore free there, and the cold-start numbers show it. What it is
+anchored to is the finding worth recording: a tokio `TcpStream` is `Send`, but its fd stays
+registered with the reactor of the runtime that dialled it. A shared pool across runtimes works
+only while the dialling runtime is alive and driving; once it shuts down, every socket it registered
+fails with `A Tokio 1.x context was found, but it is being shutdown.` — and deadpool keeps handing
+them out, because `recycle` sees an open socket with a peer address. The example reproduces that
+failure rather than describing it.
+
+Both examples keep their warm half alive through the cold phase for reasons that only look alike. In
+this crate it is a choice about where idle sockets should sit, and `Detach::attach` re-registers the
+fd with whichever driver claims it. There it is a requirement, and there is no hook to re-register
+anything.
+
+## On files, against tokio + deadpool
+
+```sh
+cargo build --profile maxopt -p fs-bench --bins
+crates/fs-bench/run.sh results.jsonl
+crates/fs-bench/summarize.py results.jsonl --json summary.json
+```
+
+`crates/fs-bench` asks the socket question again with a file on the other end, where the two
+designs differ more sharply than they do over TCP. `tokio::fs` is not asynchronous — every call
+is `spawn_blocking` around the blocking syscall — while `compio::fs` submits one SQE on the
+calling thread, so the comparison is mostly a measurement of the handoff.
+
+Three arms, because two would be a strawman: plain `tokio::fs` (what the documented API gives
+you, two dispatches for a random read), tokio + deadpool (pooled descriptor, one `pread`, one
+dispatch), and compio + compio-pool (no dispatch). Seven cases from `stat` to
+`write_4k_fsync`, swept over threads and over queue depth, on ext4 and on tmpfs.
+
+`fs_floor` measures the two constants the rest divides by — the bare syscall, and an empty
+`spawn_blocking` round trip. On the author's machine those were **~500 ns** and **~30.8 µs**,
+and that ratio predicts nearly every other number in the suite.
+
+What the run found, on one VM and one kernel:
+
+* The tokio arms' throughput does not respond to worker threads at all. Both sit near 66–79k
+  ops/s from one thread to twelve on every read and metadata case; compio goes from 1.3M to
+  9.4M on the same read. The blocking pool, not the worker count, is the ceiling.
+* Voluntary context switches per operation are 0.00, 3.00 and 5.96 — the tokio figure is
+  exactly twice deadpool's, because its random read is a seek and then a read. That counter is
+  the explanation of the latency gap, in the units of the thing causing it.
+* On `write_4k_fsync` over ext4 the three converge and the order inverts (14k / 15k / 19k at
+  12 threads): once every operation waits for the journal, 30 µs of handoff is noise. The
+  tmpfs control is what proves the convergence is the device — with it removed, the same case
+  separates by 69×.
+* compio loses two cases. `write_1m_buffered` below 8 threads, because a pinned ring does its
+  own copying on one core while tokio's blocking pool spreads over all twelve; and
+  `open_close`, which is the one read-side case that gets *worse* as threads are added, as
+  twelve rings contend on one directory's dentry locks.
+
+The caveats are recorded with the figures rather than under them: reads are page-cache warm on
+purpose, the handoff cost is inflated by nested virtualisation, and `threads` does not mean the
+same thing to a pinned ring as it does to a runtime with a 4096-thread blocking pool. Only the
+12-thread row gives all three arms the same hardware.
 
 ## Methodology notes
 

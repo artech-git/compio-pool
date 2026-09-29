@@ -62,7 +62,10 @@ impl Stats {
     /// If `samples` is empty; a measurement with no samples is a bug in the
     /// bench, not a case to paper over with zeroes.
     pub fn of(samples: &[f64]) -> Self {
-        assert!(!samples.is_empty(), "a measurement needs at least one sample");
+        assert!(
+            !samples.is_empty(),
+            "a measurement needs at least one sample"
+        );
         let mut sorted = samples.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a duration"));
         Self {
@@ -88,14 +91,7 @@ pub fn percentile(sorted: &[f64], p: f64) -> f64 {
 /// `suite` is the binary, `panel` groups cases that belong on one chart, `case`
 /// is the series within it, and `threads` is set only where the case is a point
 /// on a concurrency curve.
-pub fn stat(
-    suite: &str,
-    panel: &str,
-    case: &str,
-    threads: Option<usize>,
-    unit: &str,
-    s: &Stats,
-) {
+pub fn stat(suite: &str, panel: &str, case: &str, threads: Option<usize>, unit: &str, s: &Stats) {
     let threads = match threads {
         Some(t) => format!(r#","threads":{t}"#),
         None => String::new(),
@@ -139,7 +135,11 @@ pub fn meta(suite: &str) {
     line(&format!(
         r#"{{"kind":"meta","suite":"{}","profile":"{}","os":"{}","arch":"{}","cores":{}}}"#,
         escape(suite),
-        if cfg!(debug_assertions) { "debug" } else { "release" },
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
         std::env::consts::OS,
         std::env::consts::ARCH,
         std::thread::available_parallelism()

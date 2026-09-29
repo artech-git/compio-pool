@@ -81,7 +81,7 @@ impl<M: Manage, X: Exchange<M>> Pooled<M, X> {
     /// NOTE: It is mandatory to call [`OpGuard::complete_op`] when the operation finishes, or the
     /// connection will be poisoned. The guard does not borrow the connection, so it can be
     /// dropped before the operation completes, but that will poison the connection.
-    /// 
+    ///
     /// The returned guard poisons this connection when dropped, unless
     /// [`OpGuard::complete_op`] runs first. It borrows nothing from `self`, so the
     /// connection stays fully usable while the guard is alive.

@@ -1,5 +1,7 @@
 # compio-pool
 
+## [ NOTE: This crate is not production ready yet and under active development ]
+
 [![crates.io](https://img.shields.io/crates/v/compio-pool.svg)](https://crates.io/crates/compio-pool)
 [![docs.rs](https://img.shields.io/docsrs/compio-pool)](https://docs.rs/compio-pool)
 [![downloads](https://img.shields.io/crates/d/compio-pool.svg)](https://crates.io/crates/compio-pool)
@@ -377,13 +379,19 @@ Full tables, methodology and the end-to-end runs against a real server:
 
 All runnable with `cargo run --example <name>`.
 
+Every example gets its threads from `compio::dispatcher::Dispatcher`, built with
+`concurrent(false)` so that dispatching *n* tasks to *n* workers puts one task — and therefore one
+shard — on each thread. The peer they talk to is a task on the main runtime, so there is no channel
+to hand an address back. `tcp` is the one to read first; the rest assume its shape.
+
 | Example | What it shows |
 |---|---|
-| `tcp` | pooling real `!Send` `TcpStream`s across several compio threads |
-| `std_tcp` | interop both ways: adopting a `std::net::TcpStream`, and borrowing a pooled one back out to std-only APIs without closing it |
-| `unix_socket` | pooling `UnixStream` over a real line protocol, with per-phase latency percentiles and counter deltas: why `recycle` has to be a round trip here and what that probe costs, a synchronous `disconnect` goodbye, and a server restart no caller sees |
-| `steal` | a full `Detach` implementation over a real socket, and four threads feeding a fifth with zero dials |
-| `ncat_bench` | the pool against a real external `ncat` server: steady state, oversubscribed, and no pool at all — including the `TIME_WAIT`/ephemeral-port exhaustion the unpooled path hits |
+| `tcp` | the shape all the others use: pooling real `!Send` `TcpStream`s across dispatcher threads, one shard each |
+| `std_tcp` | interop both ways — adopting a `std::net::TcpStream` dialled on the blocking pool, and borrowing a pooled one back out to std-only APIs without closing it |
+| `unix_socket` | pooling `UnixStream` over a real line protocol: why `recycle` has to be a round trip here, a synchronous `disconnect` goodbye, and a server restart that kills every pooled connection and that no caller sees |
+| `steal` | a full `Detach` implementation over a real socket, crossing two real threads: parked on one worker, detached, claimed and re-attached on the other, proved by fd and by thread name |
+| `custom_exchange` | implementing the `Exchange` trait yourself: a LIFO stack with a parking deadline and its own counters, in place of the built-in `Reservoir` — the run prints the sockets coming back newest-first |
+| `ncat_bench` | the pool against a real external `ncat` server, pooled against unpooled — including the `TIME_WAIT`/ephemeral-port exhaustion the unpooled path hits |
 | `ncat_steal_bench` | the exchange on and off against a real server: cold-start acquire, connections dialled, and what the exchange costs on the hot path |
 
 ---
