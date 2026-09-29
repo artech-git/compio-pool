@@ -31,13 +31,20 @@ members = ["crates/compio-redis", "crates/deadpool-baseline", "crates/fs-bench"]
 
 [dependencies]
 compio = { version = "0.18", default-features = false, features = ["runtime", "time"] }
-# Lock-free bounded MPMC queue backing the cross-thread overflow pool.
-crossbeam-queue = { version = "0.3", default-features = false, features = ["std"] }
+# The lock behind the cross-thread overflow pool. Its `Mutex`, not its
+# `FairMutex`: a strict handoff costs an OS wakeup per unlock, which measured
+# 19-39us/op against ~400-1100ns for everything else. See
+# docs/decisions/0010-mutex-reservoir.md.
+parking_lot = "0.12"
 
 [dev-dependencies]
 # The examples all drive their load through `compio::dispatcher::Dispatcher`,
 # which is where their per-thread shards come from.
 compio = { version = "0.18", features = ["runtime", "time", "macros", "net", "io", "dispatcher"] }
+# Not a dependency of the crate any more — `benches/exchange.rs` keeps the
+# `ArrayQueue` design compiled in as the arm to beat, so the comparison in
+# docs/performance.md can be re-run rather than taken on faith.
+crossbeam-queue = { version = "0.3", default-features = false, features = ["std"] }
 
 [[bench]]
 name = "acquire"

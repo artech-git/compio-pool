@@ -227,25 +227,32 @@ works — expiry is then enforced at checkout instead. See
 Optional, off by default, and requires `Detach`.
 
 ```text
-  thread A                  shared ArrayQueue              thread B
-  --------                  -----------------              --------
+  thread A                shared Mutex<VecDeque>            thread B
+  --------                ----------------------            --------
   free list over min_idle
-       │  admit() reserves a slot (CAS)
-       │  Detach::detach — fd out of A's driver
-       └──── push (cannot fail) ──► [ e, e, e ] ──┐
-                                                   │ pop, readmit()
-                                                   │ Detach::attach
-                                                   └─► re-wrapped in B's driver
+       │  ┌─ lock ──────────────────────────────┐
+       │  │  full? → refuse, conn still whole   │
+       │  │  Detach::detach — fd out of A       │
+       └──┤  push_back (cannot fail)  ──► [ e, e, e ] ──┐
+          └─ unlock ────────────────────────────┘       │ lock, pop_front, unlock
+                                                        │ Detach::attach (no lock held)
+                                                        └─► re-wrapped in B's driver
 ```
 
-The `admitted` counter is not decoration. `ArrayQueue::push` can fail when full, but by then the
-connection has already been detached and there is no synchronous way to rebuild it. So a slot is
-claimed with a CAS *before* detaching: a full reservoir refuses the offer while the connection is
-still whole, and the push that follows cannot fail. The count is released on pop, and on the two
-failure paths.
+One critical section covers the capacity check, the `detach` and the push, which is what makes the
+push infallible: there is no window in which a connection has been detached but has nowhere to go.
+A full reservoir refuses while the connection is still whole, so the offer costs the shard nothing.
+That is the whole bookkeeping — no admission counter, no CAS, no failure path that has to hand a
+slot back.
 
-The queue is FIFO, not LIFO, on purpose — see
-[decision 0006](decisions/0006-lock-free-reservoir.md#why-fifo).
+`attach` is the one async step, and it runs after the guard is dropped. The lock is never held
+across an await; if it were, one thread's reattach would stall every other thread's exchange.
+
+The lock is `parking_lot`'s `Mutex` and the queue is FIFO, not LIFO. Both on purpose, and the first
+one costs real tail latency — see [decision 0010](decisions/0010-mutex-reservoir.md).
+
+`parked()` reads a `len` mirror written under the lock rather than taking it, so metrics polling
+cannot convoy behind the threads doing real work.
 
 ## The invariants
 

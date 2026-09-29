@@ -6,20 +6,20 @@
 //! sitting unused until it ages out.
 //!
 //! [`NoExchange`] (the default) is a zero-sized no-op — pure thread-per-core,
-//! no atomics, no lock. [`Reservoir`] is the real implementation: a bounded,
-//! lock-free [`ArrayQueue`] that every thread shares.
+//! no atomics, no lock. [`Reservoir`] is the real implementation: a bounded
+//! `VecDeque` behind a [`parking_lot::Mutex`] that every thread shares.
 //!
 //! # How a connection crosses a thread
 //!
 //! ```text
-//!   thread A                  shared ArrayQueue              thread B
-//!   --------                  -----------------              --------
+//!   thread A                 shared Mutex<VecDeque>            thread B
+//!   --------                 ----------------------            --------
 //!   local free list
 //!   over min_idle
 //!        |
-//!        |  Detach::detach      push (never blocks)
+//!        |  Detach::detach      push_back (under the lock)
 //!        +--- fd out of ------------> [ fd, fd, fd ] ---+
-//!             A's driver                                |  pop, then
+//!             A's driver                                |  pop_front, then
 //!                                                       |  Detach::attach
 //!                                                       +---> re-wrapped in
 //!                                                             B's driver
@@ -34,24 +34,45 @@
 //! A thread dips into the queue only when its own free list is empty, and
 //! *before* it dials: stealing a warm socket beats a handshake.
 //!
+//! # Why a lock, and why this one
+//!
+//! The critical section is a length check and one `push_back`/`pop_front` —
+//! tens of nanoseconds, no allocation, no syscall, and never an await. Holding
+//! a lock across all of it is what makes the park path *correct* without
+//! further machinery: the capacity check, [`Detach::detach`] and the push
+//! happen together, so the push cannot fail and there is no window in which a
+//! detached socket exists with nowhere to go. A fallible push needs an atomic
+//! admission counter to close that window; this does not.
+//!
+//! [`parking_lot::Mutex`] specifically, and *not* its `FairMutex`. A strict
+//! handoff wakes the next waiter through the OS on every unlock, which is a
+//! reasonable trade for a critical section measured in microseconds and a
+//! catastrophic one here: it charges a ~20µs thread park/unpark for ~25ns of
+//! work, and measured 19–39µs per operation at 4–8 threads against roughly
+//! 400–1100ns for every alternative.
+//!
+//! What that costs is the tail. This lock barges — the thread that just
+//! unlocked can reacquire ahead of everyone queued — so the median flatters it
+//! and the unlucky caller pays: roughly 6.6× worse p99 than the lock-free ring
+//! this replaced. That trade is the whole subject of
+//! `docs/decisions/0010-mutex-reservoir.md`, which carries the numbers.
+//!
 //! # Why a queue and not a stack
 //!
-//! [`ArrayQueue`] is FIFO, so the connection that has been parked longest is
-//! claimed first. That is the right bias for an overflow pool: residency is
-//! bounded, so a parked connection cannot sit at the bottom of a stack going
-//! stale while newer arrivals churn above it. The cost is a little cache
-//! warmth, which matters far less than a socket the far end has quietly
+//! The deque is drained from the front, so the connection that has been parked
+//! longest is claimed first. That is the right bias for an overflow pool:
+//! residency is bounded, so a parked connection cannot sit at the bottom of a
+//! stack going stale while newer arrivals churn above it. The cost is a little
+//! cache warmth, which matters far less than a socket the far end has quietly
 //! dropped.
 
 use std::{
+    collections::VecDeque,
     future::Future,
-    sync::atomic::{
-        AtomicUsize,
-        Ordering::{AcqRel, Acquire},
-    },
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
 };
 
-use crossbeam_queue::ArrayQueue;
+use parking_lot::Mutex;
 
 use crate::{
     manage::{Detach, Manage},
@@ -121,13 +142,25 @@ struct Entry<P> {
     meta: SlotMeta,
 }
 
-/// A bounded, lock-free pool of detached connections shared by every thread.
+/// A bounded pool of detached connections shared by every thread.
 ///
 /// Idle connections beyond a shard's [`min_idle`](crate::Config::min_idle) are
-/// detached into this queue, where any thread may claim them. Both ends are
-/// wait-free in the common case: [`ArrayQueue`] is a fixed-size ring, so
-/// parking and stealing never allocate and never take a lock. The only async
-/// step, [`Detach::attach`], runs after the entry is already out of the queue.
+/// detached into this queue, where any thread may claim them. Both ends take a
+/// [`Mutex`] for a handful of instructions — a length check and one
+/// `push_back` or `pop_front`, neither of which allocates, because the deque is
+/// built at capacity and never grows. The only async step,
+/// [`Detach::attach`], runs *after* the guard has been dropped: the lock is
+/// never held across an await.
+///
+/// # What this costs under contention
+///
+/// The lock barges, so a thread hammering the exchange reacquires ahead of the
+/// threads queued behind it. Throughput is good and the median is excellent;
+/// the tail is not. Against the lock-free ring this replaced, measured at eight
+/// threads with nothing between operations, p99 is about 6.6× worse. If your
+/// shards cross connections constantly, that is the number to size against —
+/// and it is worth asking whether `min_idle` is low enough to be pushing
+/// traffic through here that should be staying local.
 ///
 /// # Platform support
 ///
@@ -135,13 +168,17 @@ struct Entry<P> {
 /// treat `attach` as a no-op, so fds move freely. Under IOCP a handle is bound
 /// to one completion port for life. See [`Detach`] for the details.
 pub struct Reservoir<M: Detach> {
-    queue: ArrayQueue<Entry<M::Parked>>,
-    /// Slots claimed: entries in the queue, plus those in flight between the
-    /// admission check and the push. Capped at the queue's capacity, which is
-    /// what makes the push below infallible — without it, a queue that filled
-    /// up between `detach` and `push` would leave us holding a detached
-    /// connection with no way to rebuild it synchronously.
-    admitted: AtomicUsize,
+    queue: Mutex<VecDeque<Entry<M::Parked>>>,
+    /// Fixed at construction. The deque is never allowed past it, so it is also
+    /// the deque's allocated capacity and `push_back` never reallocates.
+    capacity: usize,
+    /// The deque's length, mirrored out from under the lock so that
+    /// [`parked`](Exchange::parked) — which metrics poll — never contends with
+    /// the threads doing the actual work. Written under the lock, so it is
+    /// exact whenever the lock is free, and at worst one operation stale while
+    /// it is held. That is the same latitude every other gauge in
+    /// [`Metrics`](crate::Metrics) has; see `docs/decisions/0008-relaxed-counters.md`.
+    len: AtomicU64,
 }
 
 impl<M: Detach> Reservoir<M> {
@@ -149,38 +186,25 @@ impl<M: Detach> Reservoir<M> {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "reservoir capacity must be greater than zero");
         Self {
-            queue: ArrayQueue::new(capacity),
-            admitted: AtomicUsize::new(0),
+            queue: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+            len: AtomicU64::new(0),
         }
     }
 
     /// The most connections this reservoir will hold.
     pub fn capacity(&self) -> usize {
-        self.queue.capacity()
+        self.capacity
     }
 
     /// Connections currently parked and claimable.
     pub fn len(&self) -> usize {
-        self.queue.len()
+        self.len.load(Relaxed) as usize
     }
 
     /// True when nothing is parked.
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
-    /// Claims one slot, unless the reservoir is already full.
-    fn admit(&self) -> bool {
-        self.admitted
-            .fetch_update(AcqRel, Acquire, |n| {
-                (n < self.queue.capacity()).then_some(n + 1)
-            })
-            .is_ok()
-    }
-
-    /// Gives a claimed slot back.
-    fn readmit(&self) {
-        self.admitted.fetch_sub(1, AcqRel);
+        self.len() == 0
     }
 }
 
@@ -192,48 +216,54 @@ impl<M: Detach> Default for Reservoir<M> {
 
 impl<M: Detach> std::fmt::Debug for Reservoir<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately reads the mirror rather than locking: a `Debug` printed
+        // from a log line or a debugger must not be able to stall the exchange.
         f.debug_struct("Reservoir")
-            .field("capacity", &self.queue.capacity())
-            .field("len", &self.queue.len())
+            .field("capacity", &self.capacity)
+            .field("len", &self.len())
             .finish()
     }
 }
 
 impl<M: Detach> Exchange<M> for Reservoir<M> {
     fn park(&self, conn: M::Connection, meta: SlotMeta) -> Parked<M> {
-        // Reserve before detaching, so the connection is still whole if the
-        // reservoir turns out to be full.
-        if !self.admit() {
+        let mut queue = self.queue.lock();
+
+        if queue.len() == self.capacity {
+            // Checked *before* `detach`, which consumes the connection and
+            // cannot be undone. A full reservoir therefore costs the shard
+            // nothing: it gets the connection back whole and keeps it locally.
             return Parked::Refused(conn, meta);
         }
 
         let Some(parked) = M::detach(conn) else {
             // An operation was still in flight, so `detach` consumed and
-            // dropped it. Nothing to push.
-            self.readmit();
+            // dropped it. Nothing to push, and no capacity was spent.
             return Parked::Destroyed;
         };
 
-        if self.queue.push(Entry { parked, meta }).is_err() {
-            // Unreachable: `admitted` never exceeds capacity, and every
-            // admitted slot is either pushed or handed back. Handled rather
-            // than asserted, because the alternative is losing a live socket
-            // without telling the pool about it.
-            self.readmit();
-            return Parked::Destroyed;
-        }
+        // Under the lock, so it cannot fail and cannot race the check above.
+        // `detach` is synchronous and does no IO — it unwraps an fd — which is
+        // what makes it acceptable inside the critical section.
+        queue.push_back(Entry { parked, meta });
+        self.len.store(queue.len() as u64, Relaxed);
         Parked::Accepted
     }
 
     async fn unpark(&self) -> Unparked<M> {
-        let Some(entry) = self.queue.pop() else {
-            return Unparked::Empty;
+        let entry = {
+            let mut queue = self.queue.lock();
+            let Some(entry) = queue.pop_front() else {
+                return Unparked::Empty;
+            };
+            self.len.store(queue.len() as u64, Relaxed);
+            entry
         };
-        self.readmit();
-
-        // Nothing is held across this await — the queue is lock-free and the
-        // entry is already ours. `attach` re-wraps the socket in the calling
-        // thread's runtime, which is why it must run here and not at push time.
+        // The guard is gone before the await: holding it here would park every
+        // other thread's exchange behind this one's `attach`. The entry is
+        // already ours, so nothing needs the lock anyway. `attach` re-wraps the
+        // socket in the *calling* thread's runtime, which is why it runs here
+        // and not at park time.
         match M::attach(entry.parked).await {
             Ok(conn) => Unparked::Claimed(conn, entry.meta),
             Err(_) => Unparked::Lost,
@@ -241,16 +271,16 @@ impl<M: Detach> Exchange<M> for Reservoir<M> {
     }
 
     fn parked(&self) -> u64 {
-        self.queue.len() as u64
+        self.len.load(Relaxed)
     }
 
     fn clear(&self) {
-        // A `park` caught mid-flight (admitted, not yet pushed) leaves its slot
-        // claimed. That is harmless: `clear` runs from `Pool::close`, after
-        // which nothing parks again.
-        while self.queue.pop().is_some() {
-            self.readmit();
-        }
+        let mut queue = self.queue.lock();
+        // Dropping each `Parked` closes its socket. `clear` runs from
+        // `Pool::close` and `Pool::invalidate`; the pool accounts for the
+        // connections it drops here — see `docs/decisions/0008-relaxed-counters.md`.
+        queue.clear();
+        self.len.store(0, Relaxed);
     }
 }
 
@@ -266,8 +296,9 @@ mod tests {
     use crate::test_support::{CAN_ATTACH, CAN_DETACH, MovableConn, MovableManager, detach_lock};
 
     /// Both `unpark` implementations, and the test `attach`, complete without
-    /// ever yielding — the queue is lock-free and the entry is already ours. One
-    /// poll is therefore enough, and asserting that keeps the claim honest.
+    /// ever yielding: the lock is released before the await and the entry is
+    /// already ours. One poll is therefore enough, and asserting that keeps the
+    /// claim honest — an exchange that yielded would be holding up a shard.
     fn drive<F: Future>(fut: F) -> F::Output {
         let mut fut = pin!(fut);
         match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
@@ -386,7 +417,7 @@ mod tests {
         r.park(MovableConn::new(0), meta(0, 0));
         r.park(MovableConn::new(1), meta(0, 0));
 
-        // The third offer must come back whole: admission is checked *before*
+        // The third offer must come back whole: capacity is checked *before*
         // `detach`, so a full reservoir cannot cost the shard a connection.
         match r.park(MovableConn::new(2), meta(9, 4)) {
             Parked::Refused(conn, meta) => {
@@ -413,8 +444,8 @@ mod tests {
         ));
         assert_eq!(r.len(), 0, "nothing was queued");
 
-        // The admission slot must have been handed back, or the reservoir would
-        // leak capacity on every failed detach.
+        // A failed detach must not have consumed capacity, or the reservoir
+        // would shrink a little on every connection it could not park.
         CAN_DETACH.store(true, SeqCst);
         r.park(MovableConn::new(1), meta(0, 0));
         r.park(MovableConn::new(2), meta(0, 0));
@@ -483,8 +514,8 @@ mod tests {
         assert!(r.is_empty(), "it was popped, not left behind");
     }
 
-    /// Claiming frees the admission slot as well as the queue slot; otherwise a
-    /// reservoir would accept only `capacity` parks over its whole lifetime.
+    /// Capacity is occupancy, not a lifetime budget: a claim must make room for
+    /// the next park, or a reservoir would accept only `capacity` parks ever.
     #[test]
     fn claiming_frees_capacity_for_a_later_park() {
         let _lock = detach_lock();
@@ -556,10 +587,10 @@ mod tests {
         assert!(r.is_empty());
     }
 
-    /// Admission is the invariant that makes the push in `park` infallible, so
-    /// exercise it right at the boundary.
+    /// The capacity check and the push share one critical section, which is
+    /// what makes the push infallible — so exercise it right at the boundary.
     #[test]
-    fn admission_never_exceeds_capacity() {
+    fn occupancy_never_exceeds_capacity() {
         let _lock = detach_lock();
         let r = reservoir(3);
         for id in 0..3 {

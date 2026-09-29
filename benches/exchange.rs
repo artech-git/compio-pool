@@ -1,7 +1,16 @@
-//! Cost of the cross-thread exchange: lock-free `ArrayQueue` against the
-//! `Mutex<Vec<_>>` it replaced.
+//! Cost of the cross-thread exchange, across all three designs it has had.
 //!
-//! Both designs are compiled into this one binary and measured back to back on
+//! * **Mutex** — the current [`Reservoir`]: a FIFO `VecDeque` behind a
+//!   `parking_lot::Mutex`, which barges.
+//! * **FairMutex** — the same structure behind `parking_lot::FairMutex`, which
+//!   hands off to the longest waiter on every unlock. The arm that shows why
+//!   the obvious fix for the tail is not one.
+//! * **ArrayQueue** — the lock-free ring it replaced, with the atomic admission
+//!   counter that a fallible push needs. Kept compiled in (crossbeam-queue is a
+//!   dev-dependency now) so this stays a measurement rather than a memory.
+//! * **Mutex<Vec>** — the original: a LIFO stack behind a `std::sync::Mutex`.
+//!
+//! All three are compiled into this one binary and measured back to back on
 //! the same machine, so the comparison does not depend on run-to-run scheduling
 //! variance the way an A/B across two builds would.
 //!
@@ -13,10 +22,16 @@ use std::{
     hint::black_box,
     sync::{
         Arc, Barrier, Mutex,
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{
+            AtomicU64, AtomicUsize,
+            Ordering::{AcqRel, Acquire, Relaxed},
+        },
     },
     time::{Duration, Instant},
 };
+
+use crossbeam_queue::ArrayQueue;
+use parking_lot::FairMutex;
 
 use compio_pool::{Config, Detach, Exchange, Manage, Parked, Pool, Reservoir, SlotMeta, Unparked};
 
@@ -51,14 +66,157 @@ impl Detach for NullManager {
     }
 }
 
-// ------------------------------------------------- the design being replaced
+// --------------------------------- the current design, with the other lock
+
+use std::collections::VecDeque;
+
+/// Structurally identical to the crate's [`Reservoir`] — same FIFO `VecDeque`,
+/// same single critical section — differing *only* in which parking_lot lock
+/// it takes. `FairMutex` hands the lock to the longest waiter on every unlock;
+/// the `Mutex` the crate ships barges instead.
+///
+/// This arm exists to isolate that one choice, and it is kept because the
+/// answer is so lopsided: a strict handoff wakes a thread through the OS per
+/// unlock, so a ~25ns critical section buys a ~20µs park/unpark. It is the arm
+/// that stops anyone "fixing" the tail by reaching for the obvious lock.
+struct FairReservoir<M: Detach> {
+    queue: FairMutex<VecDeque<Entry<M::Parked>>>,
+    capacity: usize,
+    len: AtomicU64,
+}
+
+impl<M: Detach> FairReservoir<M> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            queue: FairMutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+            len: AtomicU64::new(0),
+        }
+    }
+}
+
+impl<M: Detach> Exchange<M> for FairReservoir<M> {
+    fn park(&self, conn: M::Connection, meta: SlotMeta) -> Parked<M> {
+        let mut queue = self.queue.lock();
+        if queue.len() == self.capacity {
+            return Parked::Refused(conn, meta);
+        }
+        let Some(parked) = M::detach(conn) else {
+            return Parked::Destroyed;
+        };
+        queue.push_back(Entry { parked, meta });
+        self.len.store(queue.len() as u64, Relaxed);
+        Parked::Accepted
+    }
+
+    async fn unpark(&self) -> Unparked<M> {
+        let entry = {
+            let mut queue = self.queue.lock();
+            let Some(entry) = queue.pop_front() else {
+                return Unparked::Empty;
+            };
+            self.len.store(queue.len() as u64, Relaxed);
+            entry
+        };
+        match M::attach(entry.parked).await {
+            Ok(conn) => Unparked::Claimed(conn, entry.meta),
+            Err(_) => Unparked::Lost,
+        }
+    }
+
+    fn parked(&self) -> u64 {
+        self.len.load(Relaxed)
+    }
+
+    fn clear(&self) {
+        let mut queue = self.queue.lock();
+        queue.clear();
+        self.len.store(0, Relaxed);
+    }
+}
+
+// ------------------------------------------------------ the previous design
 
 struct Entry<P> {
     parked: P,
     meta: SlotMeta,
 }
 
-/// The previous `Reservoir`: a LIFO stack behind a `Mutex`, with the length
+/// The `Reservoir` as it stood between the `Mutex<Vec>` and the `FairMutex`: a
+/// lock-free bounded ring.
+///
+/// `ArrayQueue::push` is fallible, and by the time it runs the connection has
+/// already been detached with no synchronous way to rebuild it — so a slot has
+/// to be claimed with a CAS *before* detaching. That `admitted` counter is the
+/// price of not having a critical section, and reproducing it faithfully here
+/// is the point: it is what the current design deletes.
+struct QueueReservoir<M: Detach> {
+    queue: ArrayQueue<Entry<M::Parked>>,
+    admitted: AtomicUsize,
+}
+
+impl<M: Detach> QueueReservoir<M> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            queue: ArrayQueue::new(capacity),
+            admitted: AtomicUsize::new(0),
+        }
+    }
+
+    fn admit(&self) -> bool {
+        self.admitted
+            .fetch_update(AcqRel, Acquire, |n| {
+                (n < self.queue.capacity()).then_some(n + 1)
+            })
+            .is_ok()
+    }
+
+    fn readmit(&self) {
+        self.admitted.fetch_sub(1, AcqRel);
+    }
+}
+
+impl<M: Detach> Exchange<M> for QueueReservoir<M> {
+    fn park(&self, conn: M::Connection, meta: SlotMeta) -> Parked<M> {
+        if !self.admit() {
+            return Parked::Refused(conn, meta);
+        }
+        let Some(parked) = M::detach(conn) else {
+            self.readmit();
+            return Parked::Destroyed;
+        };
+        if self.queue.push(Entry { parked, meta }).is_err() {
+            self.readmit();
+            return Parked::Destroyed;
+        }
+        Parked::Accepted
+    }
+
+    async fn unpark(&self) -> Unparked<M> {
+        let Some(entry) = self.queue.pop() else {
+            return Unparked::Empty;
+        };
+        self.readmit();
+        match M::attach(entry.parked).await {
+            Ok(conn) => Unparked::Claimed(conn, entry.meta),
+            Err(_) => Unparked::Lost,
+        }
+    }
+
+    fn parked(&self) -> u64 {
+        self.queue.len() as u64
+    }
+
+    fn clear(&self) {
+        while self.queue.pop().is_some() {
+            self.readmit();
+        }
+    }
+}
+
+// ------------------------------------------------------ the original design
+
+/// The first `Reservoir`: a LIFO stack behind a barging `Mutex`, with the length
 /// mirrored into an atomic so `parked()` does not have to take the lock.
 struct MutexReservoir<M: Detach> {
     capacity: usize,
@@ -225,10 +383,10 @@ fn through_pool<X: Exchange<NullManager>>(exchange: X, threads: usize, iters: u3
     worst.as_nanos() as f64 / iters as f64
 }
 
-/// Per-operation latency distribution, which is the real argument for a
-/// lock-free structure: a mutex under contention convoys, so the unlucky
-/// caller waits behind everyone else, while a queue that never blocks
-/// degrades more evenly.
+/// Per-operation latency distribution, which is the real argument for a *fair*
+/// lock: a barging mutex under contention lets the incumbent reacquire while
+/// everyone else queues, so the median flatters it and the unlucky caller pays
+/// for all of it. Sorting every sample is the only way to see that.
 fn latency_profile<X: Exchange<NullManager>>(
     exchange: Arc<X>,
     threads: usize,
@@ -272,55 +430,38 @@ fn main() {
 
     report::meta("exchange");
 
-    println!("park + unpark round trip (ns/op, worst thread)\n");
-    println!(
-        "{:>8}  {:>14}  {:>14}  {:>9}",
-        "threads", "ArrayQueue", "Mutex<Vec>", "change"
-    );
-
-    for threads in [1usize, 2, 4, 8] {
-        // Interleave the two so a thermal or scheduling drift during the run
-        // hits both designs rather than whichever went second.
-        // Best of two each, alternating, so neither design is charged for a
-        // drift that happened while the other was running.
-        let queue = contended(Arc::new(Reservoir::<NullManager>::new(CAP)), threads, ITERS);
-        let mutex = contended(
-            Arc::new(MutexReservoir::<NullManager>::new(CAP)),
-            threads,
-            ITERS,
-        );
-        let queue = queue.min(contended(
-            Arc::new(Reservoir::<NullManager>::new(CAP)),
-            threads,
-            ITERS,
-        ));
-        let mutex = mutex.min(contended(
-            Arc::new(MutexReservoir::<NullManager>::new(CAP)),
-            threads,
-            ITERS,
-        ));
+    let hdr = || {
         println!(
-            "{threads:>8}  {queue:>14.1}  {mutex:>14.1}  {:>8.2}x",
-            mutex / queue
+            "{:>8}  {:>10}  {:>10}  {:>10}  {:>10}",
+            "threads", "Mutex", "FairMutex", "ArrayQueue", "Mutex<Vec>"
+        )
+    };
+
+    println!("park + unpark round trip (ns/op, worst thread)\n");
+    hdr();
+    for threads in [1usize, 2, 4, 8] {
+        // Interleave the arms so a thermal or scheduling drift during the run
+        // hits every design rather than whichever went last. Best of two
+        // alternating passes each, so these are the floor.
+        let mut r = [f64::MAX; 4];
+        for _ in 0..2 {
+            let pass = [
+                contended(Arc::new(Reservoir::<NullManager>::new(CAP)), threads, ITERS),
+                contended(Arc::new(FairReservoir::<NullManager>::new(CAP)), threads, ITERS),
+                contended(Arc::new(QueueReservoir::<NullManager>::new(CAP)), threads, ITERS),
+                contended(Arc::new(MutexReservoir::<NullManager>::new(CAP)), threads, ITERS),
+            ];
+            for (slot, v) in r.iter_mut().zip(pass) {
+                *slot = slot.min(v);
+            }
+        }
+        println!(
+            "{threads:>8}  {:>10.1}  {:>10.1}  {:>10.1}  {:>10.1}",
+            r[0], r[1], r[2], r[3]
         );
-        // Best of two alternating passes each, so these are the floor rather
-        // than a distribution; recorded as scalars for that reason.
-        report::value(
-            "exchange",
-            "round trip",
-            "ArrayQueue",
-            Some(threads),
-            "ns/op",
-            queue,
-        );
-        report::value(
-            "exchange",
-            "round trip",
-            "Mutex<Vec>",
-            Some(threads),
-            "ns/op",
-            mutex,
-        );
+        for (name, v) in ARMS.iter().zip(r) {
+            report::value("exchange", "round trip", name, Some(threads), "ns/op", v);
+        }
     }
 
     println!("\npark + unpark latency distribution at 8 threads (ns)\n");
@@ -329,18 +470,10 @@ fn main() {
         "", "p50", "p90", "p99", "p99.9", "max"
     );
     for (name, samples) in [
-        (
-            "ArrayQueue",
-            latency_profile(Arc::new(Reservoir::<NullManager>::new(CAP)), 8, 100_000),
-        ),
-        (
-            "Mutex<Vec>",
-            latency_profile(
-                Arc::new(MutexReservoir::<NullManager>::new(CAP)),
-                8,
-                100_000,
-            ),
-        ),
+        ("Mutex", latency_profile(Arc::new(Reservoir::<NullManager>::new(CAP)), 8, 100_000)),
+        ("FairMutex", latency_profile(Arc::new(FairReservoir::<NullManager>::new(CAP)), 8, 100_000)),
+        ("ArrayQueue", latency_profile(Arc::new(QueueReservoir::<NullManager>::new(CAP)), 8, 100_000)),
+        ("Mutex<Vec>", latency_profile(Arc::new(MutexReservoir::<NullManager>::new(CAP)), 8, 100_000)),
     ] {
         println!(
             "{name:>12}  {:>8} {:>8} {:>8} {:>10} {:>10}",
@@ -350,56 +483,35 @@ fn main() {
             pct(&samples, 0.999),
             pct(&samples, 1.0),
         );
-        // The tail is the whole argument for the lock-free queue, so this panel
-        // carries the real distribution: every round trip was timed.
         let as_f64: Vec<f64> = samples.iter().map(|ns| *ns as f64).collect();
-        report::stat(
-            "exchange",
-            "tail latency",
-            name,
-            Some(8),
-            "ns",
-            &report::Stats::of(&as_f64),
-        );
+        report::stat("exchange", "tail latency", name, Some(8), "ns", &report::Stats::of(&as_f64));
     }
 
     println!("\nfull acquire path, min_idle=0 so every checkout crosses the exchange\n");
-    println!(
-        "{:>8}  {:>14}  {:>14}  {:>9}",
-        "threads", "ArrayQueue", "Mutex<Vec>", "change"
-    );
+    hdr();
     for threads in [1usize, 2, 4, 8] {
-        let queue = through_pool(Reservoir::<NullManager>::new(CAP), threads, 200_000);
-        let mutex = through_pool(MutexReservoir::<NullManager>::new(CAP), threads, 200_000);
-        let queue = queue.min(through_pool(
-            Reservoir::<NullManager>::new(CAP),
-            threads,
-            200_000,
-        ));
-        let mutex = mutex.min(through_pool(
-            MutexReservoir::<NullManager>::new(CAP),
-            threads,
-            200_000,
-        ));
+        const PITERS: u32 = 200_000;
+        let mut r = [f64::MAX; 4];
+        for _ in 0..2 {
+            let pass = [
+                through_pool(Reservoir::<NullManager>::new(CAP), threads, PITERS),
+                through_pool(FairReservoir::<NullManager>::new(CAP), threads, PITERS),
+                through_pool(QueueReservoir::<NullManager>::new(CAP), threads, PITERS),
+                through_pool(MutexReservoir::<NullManager>::new(CAP), threads, PITERS),
+            ];
+            for (slot, v) in r.iter_mut().zip(pass) {
+                *slot = slot.min(v);
+            }
+        }
         println!(
-            "{threads:>8}  {queue:>14.1}  {mutex:>14.1}  {:>8.2}x",
-            mutex / queue
+            "{threads:>8}  {:>10.1}  {:>10.1}  {:>10.1}  {:>10.1}",
+            r[0], r[1], r[2], r[3]
         );
-        report::value(
-            "exchange",
-            "acquire path",
-            "ArrayQueue",
-            Some(threads),
-            "ns/op",
-            queue,
-        );
-        report::value(
-            "exchange",
-            "acquire path",
-            "Mutex<Vec>",
-            Some(threads),
-            "ns/op",
-            mutex,
-        );
+        for (name, v) in ARMS.iter().zip(r) {
+            report::value("exchange", "acquire path", name, Some(threads), "ns/op", v);
+        }
     }
 }
+
+/// Column order, shared by the tables and the recorded data.
+const ARMS: [&str; 4] = ["Mutex", "FairMutex", "ArrayQueue", "Mutex<Vec>"];

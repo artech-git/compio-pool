@@ -241,22 +241,32 @@ So the rule is: cancel `acquire()` freely, and guard what you do with the connec
 ### Letting connections migrate between threads
 
 Pure sharding wastes connections when load is skewed: a quiet thread holds idle sockets a busy
-thread could use. The optional `Reservoir` fixes that with a bounded, lock-free `ArrayQueue`
-shared by every thread.
+thread could use. The optional `Reservoir` fixes that with a bounded `VecDeque` behind a
+`parking_lot::Mutex`, shared by every thread.
 
 ```text
-  thread A                  shared ArrayQueue              thread B
-  --------                  -----------------              --------
+  thread A                 shared Mutex<VecDeque>           thread B
+  --------                 ----------------------           --------
   local free list
   over min_idle
        |
-       |  Detach::detach      push (never blocks)
+       |  Detach::detach      push_back (under the lock)
        +--- fd out of ------------> [ fd, fd, fd ] ---+
-            A's driver                                |  pop, then
+            A's driver                                |  pop_front, then
                                                       |  Detach::attach
                                                       +---> re-wrapped in
                                                             B's driver
 ```
+
+One lock covers the capacity check, the `detach` and the push, which is what makes the push
+infallible: a connection is never detached with nowhere to go. The critical section is a length
+check and one `push_back`/`pop_front` — no allocation, no syscall, and never an await, since
+`attach` runs after the guard is dropped.
+
+It is `parking_lot`'s barging `Mutex`, not its `FairMutex` — a strict handoff costs an OS wakeup
+per unlock, which is ruinous for a 25ns critical section. The price of barging is the tail: **~6.6×
+worse p99 than the lock-free ring this replaced**. See
+[decision 0010](docs/decisions/0010-mutex-reservoir.md).
 
 Only idle connections take this path, and it is opt-in because its soundness is
 platform-dependent: under IOCP a handle binds to one completion port for life, so on Windows
@@ -365,10 +375,13 @@ numbers to quote.
 **Acquire fast path:** ~65 ns/op with `acquire_timeout = None`, ~127 ns/op with a timeout armed —
 the difference is the timer, not the pool.
 
-**The exchange** was measured A/B against the `Mutex<Vec<_>>` it replaced, both designs compiled
-into one binary. The lock-free queue is **up to 2.1× slower on the mean** when hammered with
-nothing between operations, and **5.0× better at p99 / 5.8× better at p99.9**. The justification
-for the design is tail latency and behaviour as threads are added, not raw throughput.
+**The exchange** is measured against every design it has had — `parking_lot::Mutex` (what ships),
+`FairMutex`, the lock-free `ArrayQueue` it replaced, and the original `std` `Mutex<Vec>` — all four
+compiled into one binary and alternated. The shipping mutex is **1.6× faster than the queue at
+eight threads** and **6.5× worse at p99**; that trade buys one less concurrency invariant, and is
+the subject of [decision 0010](docs/decisions/0010-mutex-reservoir.md). The `FairMutex` arm is kept
+because it is 19–39µs/op under contention: fair handoff wakes a thread through the OS per unlock,
+which is ruinous for a 25ns critical section.
 
 Full tables, methodology and the end-to-end runs against a real server:
 **[docs/performance.md](docs/performance.md)**.
@@ -442,7 +455,7 @@ Suite-by-suite breakdown, the oracle, and the CI matrix: **[docs/testing.md](doc
 ## Requirements
 
 Rust edition 2024, Rust 1.88+, `compio` 0.18. The library itself depends only on `compio`
-(`runtime`, `time`) and `crossbeam-queue`. CI covers Linux, macOS and Windows on stable, plus beta
+(`runtime`, `time`) and `parking_lot`. CI covers Linux, macOS and Windows on stable, plus beta
 on Linux.
 
 ## License

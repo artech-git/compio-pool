@@ -40,57 +40,79 @@ across runs of a *single* binary. It is there to show that per-thread cost does 
 cores are added, not to resolve small differences — which is precisely why it could not be used to
 evaluate the exchange change below.
 
-## The exchange: queue vs. mutex
+## The exchange: four designs, one binary
 
 `cargo bench --bench exchange`
 
 Neither pre-existing benchmark could see this change at all: `benches/acquire` and
 `examples/ncat_bench` both drive the pool with `NoExchange`, whose park path is a plain move. So
-`benches/exchange.rs` compiles **both** designs — the `ArrayQueue` reservoir and the `Mutex<Vec>`
-it replaced — into one binary and alternates them, so the comparison does not ride on run-to-run
-scheduling variance.
+`benches/exchange.rs` compiles **every design the exchange has had** into one binary and alternates
+them, so the comparison does not ride on run-to-run scheduling variance:
 
-The result is not the clean win the phrase "lock-free" suggests.
+* **Mutex** — what ships today: a FIFO `VecDeque` behind a `parking_lot::Mutex`, which barges.
+* **FairMutex** — the same structure behind `parking_lot::FairMutex`, which hands the lock to the
+  longest waiter on every unlock.
+* **ArrayQueue** — the lock-free bounded ring of
+  [decision 0006](decisions/0006-lock-free-reservoir.md), with the atomic admission counter a
+  fallible push needs.
+* **Mutex<Vec>** — the original: a LIFO stack behind a `std::sync::Mutex`.
 
-```text
-park + unpark, mean ns/op (worst thread)
-  threads    ArrayQueue    Mutex<Vec>
-        1          28.7          30.1
-        2         183.1         157.1
-        4         556.1         403.3
-        8        1821.8         857.4
-```
-
-Hammered with nothing between operations, the mutex is up to 2.1× faster on the mean. The latency
-distribution says why:
+Best of two alternating passes each, so these are the floor rather than a distribution.
 
 ```text
-8 threads          p50     p99    p99.9       max
-  ArrayQueue      1500    5875    10834    331209
-  Mutex<Vec>        42   29291    62958    477917
+park + unpark round trip, ns/op (worst thread)
+ threads       Mutex   FairMutex  ArrayQueue  Mutex<Vec>
+       1        26.8        25.3        22.1        26.8
+       2       120.7       145.8       179.6       130.6
+       4       361.8     19434.5       422.9       417.7
+       8      1116.8     39488.5      1814.5       945.2
 ```
 
-A p50 of 42 ns against a mean of 857 ns is a bimodal, unfair distribution: a thread that already
-holds the lock reacquires it while others queue behind. (It is the same barging pattern the
-acquire waiter queue shows — see [decision 0007](decisions/0007-thread-local-waiters.md).) The
-queue trades median for fairness: **5.0× better p99, 5.8× better p99.9.**
-
-Once there is real work between exchange operations, which is the actual workload, the queue also
-wins outright:
+Two things to read here. The first is that the shipping `Mutex` is the fastest of the sane arms at
+eight threads — 1.6× the ring. The second is `FairMutex`, and it is not a typo.
 
 ```text
-full acquire path, min_idle=0
-  threads    ArrayQueue    Mutex<Vec>
-        1          73.8          77.5
-        2         386.8         389.5
-        4         543.5         782.5
-        8        1907.8        2695.3
+latency distribution at 8 threads, ns
+                   p50      p90      p99      p99.9        max
+       Mutex       250     5792    37375      68917     164667
+   FairMutex     39625    44625    49416      59500     143750
+  ArrayQueue      1541     3167     5750       8917     132833
+  Mutex<Vec>        42     3000    29417      57541     305667
 ```
 
-The justification for the lock-free design is tail latency and behaviour as threads are added, not
-raw throughput. Recorded here, and in
-[decision 0006](decisions/0006-lock-free-reservoir.md), so the next person to look at the mean
-does not "optimise" it back to a mutex.
+**The mutex trades tail for throughput: 6.5× worse p99 and 7.7× worse p99.9 than the ring.** A p50
+of 250 ns against a mean of 1117 ns is a bimodal, unfair distribution — the thread that just
+unlocked reacquires while the others queue. (It is the same barging pattern the acquire waiter
+queue shows; see [decision 0007](decisions/0007-thread-local-waiters.md).) That trade is deliberate
+and it is the subject of [decision 0010](decisions/0010-mutex-reservoir.md).
+
+**`FairMutex` is not the fix, and that is the most useful number on this page.** Its distribution
+is *tight* — p50 39.6µs to p99.9 59.5µs — and uniformly catastrophic. Fair handoff wakes the next
+waiter through the OS on every unlock, so a ~25 ns critical section pays a ~20µs thread
+park/unpark. Fairness is not what costs; waking a thread is. The arm stays compiled in so nobody
+reaches for the obvious lock twice.
+
+Once there is real work between exchange operations, which is the actual workload, the ring keeps
+its lead at the top end:
+
+```text
+full acquire path, min_idle=0, ns/op
+ threads       Mutex   FairMutex  ArrayQueue  Mutex<Vec>
+       1        80.0        79.5        81.4        82.9
+       2       294.4       304.4       304.8       356.5
+       4       666.1     18983.3       552.6       841.1
+       8      4095.8     40727.4      1784.2      2751.3
+```
+
+So the exchange is not lock-free because it is faster — it is not. It takes a lock because one
+critical section around the capacity check, the `detach` and the push makes the push infallible,
+which deletes the atomic admission counter that a fallible push needs. Recorded here, and in
+[decision 0010](decisions/0010-mutex-reservoir.md), so the next person to look at the p99 knows it
+was bought on purpose.
+
+Measured on macOS (Darwin 25.3). `FairMutex`'s absolute numbers would be smaller on Linux, where
+futex wakeups are cheaper; an OS wakeup per unlock is orders of magnitude above a 25 ns critical
+section on any platform, so the shape holds.
 
 ## End to end, against a real server
 

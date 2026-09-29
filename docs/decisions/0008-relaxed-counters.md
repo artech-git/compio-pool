@@ -16,8 +16,9 @@ One `Arc<Counters>` of `AtomicU64`s shared by every shard, updated with `Orderin
 
 `Metrics` separates two kinds of number:
 
-**Gauges** — `live`, `idle`, `parked` — go up and down. `parked` is read from the exchange
-(`ArrayQueue::len`), the other two from the counters. They are summed across threads without a
+**Gauges** — `live`, `idle`, `parked` — go up and down. `parked` is read from the exchange (a
+`len` mirror the `Reservoir` writes under its lock and publishes `Relaxed`, so polling metrics
+never queues behind the threads doing real work), the other two from the counters. They are summed across threads without a
 lock, so a snapshot can be momentarily internally inconsistent: `idle` may be read after a pop
 that `live` was read before.
 
@@ -26,7 +27,7 @@ that `live` was read before.
 
 `Relaxed` is sufficient because nothing is published through these values. They order no memory and
 guard no data; they are observability. The real synchronisation is the thread-local boundary and
-the exchange's own queue.
+the exchange's own lock.
 
 ## Consequences
 

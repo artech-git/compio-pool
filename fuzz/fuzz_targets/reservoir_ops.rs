@@ -3,9 +3,16 @@
 //!
 //! Drives [`Exchange`] directly, with `detach` and `attach` failing under the
 //! input's control, against a model of what should be resident. The property
-//! that matters is that admission never leaks: whatever sequence of parks,
+//! that matters is that capacity never leaks: whatever sequence of parks,
 //! claims, failed detaches, failed attaches and clears happens, it must still be
 //! possible to fill the reservoir to exactly `capacity`.
+//!
+//! Holding the deque's lock across the capacity check, the `detach` and the
+//! push is what makes that true by construction — there is no longer an atomic
+//! admission counter that could drift out of step with the queue. This target
+//! predates that and is kept anyway: the `len` mirror that `parked()` reads is
+//! written under the lock but read outside it, and every failure path still has
+//! to leave occupancy where it found it.
 //!
 //! libFuzzer runs one input at a time per process, so the `CAN_DETACH` /
 //! `CAN_ATTACH` globals need no lock here.
@@ -134,7 +141,8 @@ fuzz_target!(|data: &[u8]| {
             );
         }
 
-        // Every admission slot must have come back.
+        // Every slot spent on a failed detach, a failed attach or a clear must
+        // have come back.
         common::CAN_DETACH.store(true, SeqCst);
         common::CAN_ATTACH.store(true, SeqCst);
         Exchange::<MovableManager>::clear(&reservoir);
@@ -143,7 +151,7 @@ fuzz_target!(|data: &[u8]| {
             let meta = harness.proto.clone();
             assert!(
                 matches!(reservoir.park(MovableConn::new(id), meta), Parked::Accepted),
-                "admission leaked: only {i} of {capacity} slots usable after churn"
+                "capacity leaked: only {i} of {capacity} slots usable after churn"
             );
         }
     });

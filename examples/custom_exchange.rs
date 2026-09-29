@@ -101,12 +101,14 @@ mod unix {
 
     /// A bounded LIFO exchange with a parking deadline.
     ///
-    /// A plain `Mutex<Vec<_>>` rather than the lock-free `ArrayQueue` behind
-    /// [`Reservoir`](compio_pool::Reservoir). Under contention a mutex is what
-    /// the reservoir's design exists to avoid, but it buys this implementation
-    /// its whole simplicity: the capacity check and the push happen under one
-    /// lock, so the push cannot fail and no admission counter is needed to keep
-    /// a detached socket from being left with nowhere to go.
+    /// A LIFO `Mutex<Vec<_>>`, where [`Reservoir`](compio_pool::Reservoir) is a
+    /// FIFO `VecDeque` behind a `parking_lot::FairMutex`. The shape is the
+    /// same — the capacity check, the `detach` and the push share one critical
+    /// section, so the push cannot fail — and the differences are the two
+    /// policy knobs an exchange actually owns: claim order, and whether the
+    /// lock hands off fairly or lets the incumbent barge. A `std` mutex barges,
+    /// which is fine here and deliberately not fine for the reservoir; see
+    /// `docs/decisions/0010-fair-mutex-reservoir.md`.
     struct WarmStack<M: Detach> {
         stack: Mutex<Vec<Entry<M::Parked>>>,
         capacity: usize,

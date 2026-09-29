@@ -38,10 +38,11 @@
 //!
 //! Pure sharding wastes connections when load is skewed: a quiet thread holds
 //! idle sockets a busy thread could use. The optional [`Reservoir`] fixes that
-//! with a bounded, lock-free `ArrayQueue` shared by every thread: a shard whose
-//! free list is over `min_idle` detaches the surplus into it, and a shard whose
-//! free list is empty pops from it before paying for a handshake. The claiming
-//! thread re-wraps the socket in its own runtime via [`Detach::attach`].
+//! with a bounded `VecDeque` behind a `parking_lot::Mutex`, shared by every
+//! thread: a shard over `min_idle` detaches the surplus into it, and one whose
+//! free list is empty pops from it before paying for a handshake.
+//! The claiming thread re-wraps the socket in its own runtime via
+//! [`Detach::attach`].
 //!
 //! It requires [`Detach`], which is **platform-dependent and deliberately
 //! opt-in**:

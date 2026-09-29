@@ -130,10 +130,12 @@ there without `Detach` being implementable. It also checks the `#[cfg(unix)]` ga
 `examples/unix_socket.rs`, `examples/steal.rs`, `examples/custom_exchange.rs` and
 `examples/ncat_steal_bench.rs` are actually right rather than merely present.
 
-`miri` is the one that earns its keep on the lock-free paths. The randomized suites only ever
+`miri` is the one that earns its keep on the unsynchronised paths. The randomized suites only ever
 observe the interleaving they happen to get; Miri checks the orderings themselves, which is what
-the CAS-before-detach admission of [decision 0006](decisions/0006-lock-free-reservoir.md) and the
-relaxed counters of [decision 0008](decisions/0008-relaxed-counters.md) rest on.
+the relaxed counters of [decision 0008](decisions/0008-relaxed-counters.md) rest on — including
+the reservoir's `len` mirror, written under the lock but read outside it. The exchange's own
+bookkeeping stopped needing that scrutiny when [decision 0010](decisions/0010-fair-mutex-reservoir.md)
+replaced the CAS-before-detach admission counter with a single critical section.
 
 ### The nightly soak
 

@@ -141,4 +141,4 @@ and Windows on stable, plus beta on Linux.
 ## Requirements
 
 Rust edition 2024, Rust 1.88+, and `compio` 0.18. The library depends only on `compio` (`runtime`,
-`time`) and `crossbeam-queue`.
+`time`) and `parking_lot`.

@@ -24,7 +24,7 @@
 //! * **plain** — [`NoExchange`](compio_pool::NoExchange), the default. Phase A's connections stay in
 //!   the warm shards forever, so phase B has to dial its own set: a TCP
 //!   handshake plus a `fork`/`exec` of `/bin/cat`, per connection.
-//! * **reservoir** — [`Reservoir`](compio_pool::Reservoir), a lock-free `ArrayQueue`. A shard whose
+//! * **reservoir** — [`Reservoir`](compio_pool::Reservoir), a `VecDeque` behind a fair mutex. A shard whose
 //!   free list is over `min_idle` parks the surplus there, and phase B claims
 //!   those instead of dialling. [`Detach::attach`](compio_pool::Detach::attach) re-wraps each one in the
 //!   claiming thread's driver.

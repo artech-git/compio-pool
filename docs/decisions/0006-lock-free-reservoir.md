@@ -1,5 +1,11 @@
 # 0006 — The exchange is a lock-free `ArrayQueue`
 
+> **Superseded by [0010](0010-mutex-reservoir.md).** The exchange is a
+> `parking_lot::Mutex<VecDeque>` now. The measurements below were not overturned — 0010 reproduced
+> them against a different mutex and accepted the worse tail anyway, to delete the admission
+> counter this record introduces. Kept because the reasoning is still the reasoning, and because
+> the numbers are what 0010 had to argue against.
+
 ## Context
 
 The cross-thread exchange ([0005](0005-detach-is-opt-in.md)) was first built as a
