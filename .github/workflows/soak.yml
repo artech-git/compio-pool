@@ -88,7 +88,7 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
       - name: Upload crash reproducer
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/
