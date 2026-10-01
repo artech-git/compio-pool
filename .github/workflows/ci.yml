@@ -79,7 +79,7 @@ jobs:
       # Not 1.85, which edition 2024 alone would allow: `compio` pulls in
       # `thin-cell`, which uses `cell_update`, stable since 1.88. Keep this in
       # step with `rust-version` in Cargo.toml and the note in README.md.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       # `--lib` only: dev-dependencies do not bind downstream users, and pinning
       # the test-only deps to the MSRV would just make this job a maintenance tax.
