@@ -1,71 +1,46 @@
 [package]
 name = "compio-pool"
-version = "0.0.2"
+version = "0.1.0"
 edition = "2024"
-description = "A thread-per-core connection pool for the compio runtime"
+description = "Thread-per-core io_uring accept server for compio: one SO_REUSEPORT listener per pinned core, a thread-local resource pool, and lock-free fd handoff for overflow"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/artech-git/compio-pool"
 documentation = "https://docs.rs/compio-pool"
 homepage = "https://github.com/artech-git/compio-pool"
-# Rendered as the crates.io front page, badges and all.
 readme = "README.md"
-keywords = ["compio", "pool", "thread-per-core", "io-uring", "async"]
+keywords = ["compio", "io-uring", "thread-per-core", "reuseport", "server"]
 categories = ["asynchronous", "network-programming", "concurrency"]
-# Edition 2024 alone would allow 1.85, but compio pulls in `thin-cell`, which
-# uses `cell_update` — stable since 1.88. Enforced by the `msrv` job in CI.
-rust-version = "1.88"
-# The fuzz crate is its own workspace and needs nightly; keep it out of the package.
-exclude = ["fuzz"]
+# Bisected, not guessed: compio 0.19's executor uses `cfg_select!`, stable
+# since 1.95. 1.88 through 1.94 fail to build the dependency tree. Enforced by
+# the `msrv` job in CI.
+rust-version = "1.95"
 
-# docs.rs builds with every feature on, and with `--cfg docsrs` so the
-# `#[doc(cfg(...))]` annotations in the source render.
+# docs.rs builds with `--cfg docsrs` so `#[doc(cfg(...))]` renders. The crate
+# only supports Linux, so only Linux targets are built there.
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
-# `crates/*` are consumers of this crate that ship in the same repo. `fuzz` is
-# deliberately absent: it declares its own `[workspace]` so the parent keeps
-# building on stable.
 [workspace]
-members = ["crates/compio-redis", "crates/deadpool-baseline", "crates/fs-bench"]
+members = []
+# A nested repository with its own history. It targets the previous API and is
+# not part of this build.
+exclude = ["crates/compio-redis"]
 
 [dependencies]
-compio = { version = "0.18", default-features = false, features = ["runtime", "time"] }
-# The lock behind the cross-thread overflow pool. Its `Mutex`, not its
-# `FairMutex`: a strict handoff costs an OS wakeup per unlock, which measured
-# 19-39us/op against ~400-1100ns for everything else. See
-# docs/decisions/0010-mutex-reservoir.md.
-parking_lot = "0.12"
-
-[dev-dependencies]
-# The examples all drive their load through `compio::dispatcher::Dispatcher`,
-# which is where their per-thread shards come from.
-compio = { version = "0.18", features = ["runtime", "time", "macros", "net", "io", "dispatcher"] }
-# Not a dependency of the crate any more — `benches/exchange.rs` keeps the
-# `ArrayQueue` design compiled in as the arm to beat, so the comparison in
-# docs/performance.md can be re-run rather than taken on faith.
-crossbeam-queue = { version = "0.3", default-features = false, features = ["std"] }
-
-[[bench]]
-name = "acquire"
-harness = false
-
-[[bench]]
-name = "exchange"
-harness = false
-
-# The profile the filesystem comparison in `crates/fs-bench` is built with.
-# `release` would do, but a three-way comparison of dispatch overhead is exactly
-# the case where cross-crate inlining and a single codegen unit change the
-# answer, so the run that produced `docs/fs-performance.md` pinned them here
-# rather than leaving them to whatever `release` happened to mean.
-[profile.maxopt]
-inherits = "release"
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-# Left unwinding: `Pooled`'s drop poisons a connection when its scope unwinds,
-# and building the pool with `panic = "abort"` would measure a pool that cannot
-# do that.
-panic = "unwind"
-debug = false
+# `default-features = false` drops `io-uring`, which is the whole point, so it
+# is named explicitly. `time` is for the drain timeout and accept back-off,
+# `io` for the AsyncRead/AsyncWrite traits the examples and tests use.
+compio = { version = "0.19.2", default-features = false, features = [
+    "runtime",
+    "net",
+    "io",
+    "time",
+    "io-uring",
+] }
+# `all` is what gates `Socket::set_cpu_affinity` (SO_INCOMING_CPU) on Linux.
+socket2 = { version = "0.6.5", features = ["all"] }
+core_affinity = "0.8.3"
+# Only the async API is used; `select` and `eventual-fairness` are not.
+flume = { version = "0.12.0", default-features = false, features = ["async"] }

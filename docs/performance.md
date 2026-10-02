@@ -1,218 +1,101 @@
 # Performance
 
-What is measured, how, and what it says. Every figure below is from the author's machine —
-reproduce with `cargo bench`. Treat them as shape, not as numbers to quote.
+What was measured, how, and what the numbers say. Everything here comes from the two shipped
+examples: [`echo`](../examples/echo.rs) is the server, [`load`](../examples/load.rs) the
+client. Both are release builds, and the commands next to each table reproduce it; nothing
+else is needed.
 
-## What exists
+## The machine
 
-| target | question it answers |
-|---|---|
-| `benches/acquire.rs` | What does the acquire fast path cost, and what is it made of? |
-| `benches/exchange.rs` | Lock-free queue or mutex for the exchange? |
-| `examples/ncat_bench.rs` | What does pooling buy over dialling per request, against a real server? |
-| `examples/ncat_steal_bench.rs` | Given a pool, what does cross-thread migration buy and cost? |
-| `crates/deadpool-baseline/examples/ncat_steal_bench.rs` | What does the same workload look like on tokio + deadpool? |
-| `crates/fs-bench` | On *files* rather than sockets, what does the thread handoff under `tokio::fs` cost? |
+A `limactl` VM on an Apple Silicon host: Ubuntu 25.04, kernel 6.14, 12 vCPUs, 20 GiB, Apple
+Virtualization framework, `virtio_net` with a single combined queue and receive hashing fixed
+off. Traffic is loopback. **The load generator's 64 client threads run on the same 12 vCPUs as
+the 12 workers**, so every number below includes contention with the thing measuring it. Treat
+them as relative; absolute throughput on dedicated hardware will differ.
 
-The two `ncat` examples are end-to-end against an external process, not microbenchmarks: `ncat`
-forks `/bin/cat` per connection, so every round trip crosses the kernel twice and every dial costs
-a real handshake plus a `fork`/`exec`.
+No NIC tuning was applied in the VM (it cannot be: see
+[operations.md](operations.md#what-the-script-does-on-hardware-it-cannot-tune)), so
+`incoming_cpu` was off throughout.
 
-## The acquire fast path
+## Scaling with workers
 
-`cargo bench --bench acquire`
-
-```text
-~65 ns/op    acquire_timeout = None
-~127 ns/op   acquire_timeout armed
-```
-
-The difference is the timer, not the pool. The benchmark also decomposes the cost — shard lookup,
-`Instant::now`, the guard allocation — and reports per-thread scaling at 1/2/4/8 threads.
-
-What is actually happening in those 65 ns: a thread-local map lookup, a `Vec::pop` out of a
-`RefCell`, a `recycle` call (a no-op in this benchmark, by design — the manager does as little as
-possible so what is measured is the pool), and one `Rc` allocation for the guard. No lock, no
-atomic RMW, no cache line shared with another core.
-
-**Read the multi-thread numbers with care.** The 4-thread figure swings between 362 and 837 ns/op
-across runs of a *single* binary. It is there to show that per-thread cost does not degrade as
-cores are added, not to resolve small differences — which is precisely why it could not be used to
-evaluate the exchange change below.
-
-## The exchange: four designs, one binary
-
-`cargo bench --bench exchange`
-
-Neither pre-existing benchmark could see this change at all: `benches/acquire` and
-`examples/ncat_bench` both drive the pool with `NoExchange`, whose park path is a plain move. So
-`benches/exchange.rs` compiles **every design the exchange has had** into one binary and alternates
-them, so the comparison does not ride on run-to-run scheduling variance:
-
-* **Mutex** — what ships today: a FIFO `VecDeque` behind a `parking_lot::Mutex`, which barges.
-* **FairMutex** — the same structure behind `parking_lot::FairMutex`, which hands the lock to the
-  longest waiter on every unlock.
-* **ArrayQueue** — the lock-free bounded ring of
-  [decision 0006](decisions/0006-lock-free-reservoir.md), with the atomic admission counter a
-  fallible push needs.
-* **Mutex<Vec>** — the original: a LIFO stack behind a `std::sync::Mutex`.
-
-Best of two alternating passes each, so these are the floor rather than a distribution.
-
-```text
-park + unpark round trip, ns/op (worst thread)
- threads       Mutex   FairMutex  ArrayQueue  Mutex<Vec>
-       1        26.8        25.3        22.1        26.8
-       2       120.7       145.8       179.6       130.6
-       4       361.8     19434.5       422.9       417.7
-       8      1116.8     39488.5      1814.5       945.2
-```
-
-Two things to read here. The first is that the shipping `Mutex` is the fastest of the sane arms at
-eight threads — 1.6× the ring. The second is `FairMutex`, and it is not a typo.
-
-```text
-latency distribution at 8 threads, ns
-                   p50      p90      p99      p99.9        max
-       Mutex       250     5792    37375      68917     164667
-   FairMutex     39625    44625    49416      59500     143750
-  ArrayQueue      1541     3167     5750       8917     132833
-  Mutex<Vec>        42     3000    29417      57541     305667
-```
-
-**The mutex trades tail for throughput: 6.5× worse p99 and 7.7× worse p99.9 than the ring.** A p50
-of 250 ns against a mean of 1117 ns is a bimodal, unfair distribution — the thread that just
-unlocked reacquires while the others queue. (It is the same barging pattern the acquire waiter
-queue shows; see [decision 0007](decisions/0007-thread-local-waiters.md).) That trade is deliberate
-and it is the subject of [decision 0010](decisions/0010-mutex-reservoir.md).
-
-**`FairMutex` is not the fix, and that is the most useful number on this page.** Its distribution
-is *tight* — p50 39.6µs to p99.9 59.5µs — and uniformly catastrophic. Fair handoff wakes the next
-waiter through the OS on every unlock, so a ~25 ns critical section pays a ~20µs thread
-park/unpark. Fairness is not what costs; waking a thread is. The arm stays compiled in so nobody
-reaches for the obvious lock twice.
-
-Once there is real work between exchange operations, which is the actual workload, the ring keeps
-its lead at the top end:
-
-```text
-full acquire path, min_idle=0, ns/op
- threads       Mutex   FairMutex  ArrayQueue  Mutex<Vec>
-       1        80.0        79.5        81.4        82.9
-       2       294.4       304.4       304.8       356.5
-       4       666.1     18983.3       552.6       841.1
-       8      4095.8     40727.4      1784.2      2751.3
-```
-
-So the exchange is not lock-free because it is faster — it is not. It takes a lock because one
-critical section around the capacity check, the `detach` and the push makes the push infallible,
-which deletes the atomic admission counter that a fallible push needs. Recorded here, and in
-[decision 0010](decisions/0010-mutex-reservoir.md), so the next person to look at the p99 knows it
-was bought on purpose.
-
-Measured on macOS (Darwin 25.3). `FairMutex`'s absolute numbers would be smaller on Linux, where
-futex wakeups are cheaper; an OS wakeup per unlock is orders of magnitude above a 25 ns critical
-section on any platform, so the shape holds.
-
-## End to end, against a real server
-
-Both need `ncat` (`nmap-ncat`) on `PATH`.
+64 persistent connections, 512-byte echo, 5 seconds. Nothing overflows: capacity 1024 per
+worker, so every connection is accepted and served on one core and the handoff path is idle.
 
 ```sh
-cargo run --release --example ncat_bench
-cargo run --release --example ncat_steal_bench
+cargo run --release --example echo -- 127.0.0.1:7100 1024 W
+cargo run --release --example load -- 127.0.0.1:7100 --conns 64 --seconds 5 --bytes 512
 ```
 
-**`ncat_bench`** runs two arms over a `Dispatcher` — one shard per worker thread, because
-`max_size` is per shard — pooled against unpooled. The unpooled arm is the point: it dials per
-request, so it hits `TIME_WAIT` accumulation and ephemeral-port exhaustion, the failure mode a pool
-exists to prevent and the one no microbenchmark will ever show you. It runs far fewer requests for
-exactly that reason.
+| workers | req/s | p50 µs | p90 µs | p99 µs | p99.9 µs |
+|---|---|---|---|---|---|
+| 1 | 157,360 | 387.9 | 484.9 | 520.9 | 735.5 |
+| 2 | 178,194 | 348.0 | 451.7 | 620.7 | 2,895.2 |
+| 4 | 458,624 | 106.2 | 223.0 | 734.6 | 3,019.2 |
+| 8 | 1,406,218 | 34.1 | 76.8 | 221.7 | 586.5 |
+| 12 | 1,210,525 | 29.6 | 90.9 | 461.0 | 1,651.7 |
 
-**`ncat_steal_bench`** runs two arms against one server in one process, exchange on and off. Each
-arm has two dispatchers: a warm half that populates the shards, then a cold half whose shards are
-empty while the warm threads stay alive and idle. It reports cold-start acquire latency,
-connections actually dialled in the cold phase, and what the exchange costs the warm phase.
+Throughput scales close to linearly to 8 workers. At 12 it drops: 12 workers plus 64 client
+threads on 12 vCPUs is oversubscribed, and the workers are pinned while the clients are not.
+On a host where the clients live elsewhere, expect the curve to keep going.
 
-## Against tokio + deadpool
+## The cost of a handoff
+
+To put every connection through the overflow path, the server runs with capacity 1 or 2 per
+worker and the client opens a fresh connection for every request (`--reconnect 1`). Each request
+then includes connect, the kernel's hash to a listener, `accept`, and — for every connection but
+the one each core is already serving — detach, channel, attach on another core. 64 clients, 5
+seconds.
 
 ```sh
-cargo run --release -p deadpool-baseline --example ncat_steal_bench
+cargo run --release --example load -- 127.0.0.1:7100 --conns 64 --seconds 5 --bytes 512 --reconnect 1
 ```
 
-`crates/deadpool-baseline` is a yardstick, not a product: it ports `ncat_steal_bench` to tokio and
-deadpool so the shape above can be checked against the incumbent on the same machine, against the
-same server, instead of against numbers quoted from someone else's run.
+| server | conn/s | p50 µs | p90 µs | p99 µs | served local | handed off | claimed | bounced | rejected |
+|---|---|---|---|---|---|---|---|---|---|
+| 12 workers, capacity 1024 | 15,566 | 270.6 | 9,886 | 61,426 | 77,892 | 0 | 0 | 0 | 0 |
+| 12 workers, capacity 2 | 15,857 | 419.8 | 17,372 | 45,810 | 8,117 | 71,232 | 71,232 | 6 | 0 |
+| 12 workers, capacity 1 | 16,744 | 698.0 | 17,666 | 28,084 | 10,544 | 73,241 | 73,241 | 4 | 0 |
+| 4 workers, capacity 1 | 16,068 | 1,386.9 | 21,605 | 26,816 | 9,560 | 70,843 | 70,843 | 2 | 0 |
 
-deadpool has no shards — one `Vec` behind one `Mutex`, and a tokio `TcpStream` is `Send` — so there
-is no exchange to toggle. The arms change the topology instead: a pool per half (nothing to share),
-one pool across two runtimes (everything shared), and one runtime with the whole thread budget,
-which is the shape a tokio service actually has and the honest throughput baseline.
+Three things to read off this:
 
-Cross-thread migration is therefore free there, and the cold-start numbers show it. What it is
-anchored to is the finding worth recording: a tokio `TcpStream` is `Send`, but its fd stays
-registered with the reactor of the runtime that dialled it. A shared pool across runtimes works
-only while the dialling runtime is alive and driving; once it shuts down, every socket it registered
-fails with `A Tokio 1.x context was found, but it is being shutdown.` — and deadpool keeps handing
-them out, because `recycle` sees an open socket with a peer address. The example reproduces that
-failure rather than describing it.
+* **Connection rate is unchanged.** ~16k connections/s whether 0% or 90% of them go through the
+  channel. The ceiling here is connection setup on loopback in a VM with 64 contending threads
+  (the p90 and p99 columns are `connect()` latency, present in every row), not the handoff.
+* **The median moves by the queue wait, not the mechanism.** 271 µs with room everywhere, 420 µs
+  with 24 slots process-wide, 698 µs with 12. With 64 clients and 12 slots, a connection
+  arriving at a full core *has* to wait for one of 12 handlers to finish; that wait is the
+  difference. The detach + `try_send` + `recv_async` + `from_std` sequence itself is a few
+  reference-count moves and one task wake.
+* **Bounces are rare.** 4–6 in ~72,000 handoffs. The race in
+  [decision 0004](decisions/0004-claim-without-holding-a-slot.md) is real and small.
 
-Both examples keep their warm half alive through the cold phase for reasons that only look alike. In
-this crate it is a choice about where idle sockets should sit, and `Detach::attach` re-registers the
-fd with whichever driver claims it. There it is a requirement, and there is no hook to re-register
-anything.
+Everything handed off was claimed; nothing was rejected or served over capacity, because the
+channel (4096) never filled.
 
-## On files, against tokio + deadpool
+## Saturation with long-lived connections
 
-```sh
-cargo build --profile maxopt -p fs-bench --bins
-crates/fs-bench/run.sh results.jsonl
-crates/fs-bench/summarize.py results.jsonl --json summary.json
-```
+64 persistent connections against 12 workers of capacity 2 (24 slots). The 40 surplus
+connections are accepted, parked in the channel, and wait for a slot that only frees when a
+served connection *ends* — which, with persistent clients, is the end of the run.
 
-`crates/fs-bench` asks the socket question again with a file on the other end, where the two
-designs differ more sharply than they do over TCP. `tokio::fs` is not asynchronous — every call
-is `spawn_blocking` around the blocking syscall — while `compio::fs` submits one SQE on the
-calling thread, so the comparison is mostly a measurement of the handoff.
+| req/s | p50 µs | p99 µs | max | served local | handed off | claimed | bounced |
+|---|---|---|---|---|---|---|---|
+| 1,796,032 | 9.6 | 55.4 | 4.99 s | 17 | 47 | 47 | 8 |
 
-Three arms, because two would be a strawman: plain `tokio::fs` (what the documented API gives
-you, two dispatches for a random read), tokio + deadpool (pooled descriptor, one `pread`, one
-dispatch), and compio + compio-pool (no dispatch). Seven cases from `stat` to
-`write_4k_fsync`, swept over threads and over queue depth, on ext4 and on tmpfs.
+Higher throughput and far lower latency than the unconstrained 12-worker run, because only 24
+connections are active instead of 64 and the cores stop thrashing. The 4.99 s maximum is a
+parked connection's first request: it waited the whole run. That is what "at capacity" means in
+this design — admission is per core, and a parked connection is a deliberate queue, not a
+dropped one. If that is not acceptable, `capacity` is too small, or `OverflowPolicy::Reject`
+turns the wait into a fast failure.
 
-`fs_floor` measures the two constants the rest divides by — the bare syscall, and an empty
-`spawn_blocking` round trip. On the author's machine those were **~500 ns** and **~30.8 µs**,
-and that ratio predicts nearly every other number in the suite.
+## What is not measured
 
-What the run found, on one VM and one kernel:
-
-* The tokio arms' throughput does not respond to worker threads at all. Both sit near 66–79k
-  ops/s from one thread to twelve on every read and metadata case; compio goes from 1.3M to
-  9.4M on the same read. The blocking pool, not the worker count, is the ceiling.
-* Voluntary context switches per operation are 0.00, 3.00 and 5.96 — the tokio figure is
-  exactly twice deadpool's, because its random read is a seek and then a read. That counter is
-  the explanation of the latency gap, in the units of the thing causing it.
-* On `write_4k_fsync` over ext4 the three converge and the order inverts (14k / 15k / 19k at
-  12 threads): once every operation waits for the journal, 30 µs of handoff is noise. The
-  tmpfs control is what proves the convergence is the device — with it removed, the same case
-  separates by 69×.
-* compio loses two cases. `write_1m_buffered` below 8 threads, because a pinned ring does its
-  own copying on one core while tokio's blocking pool spreads over all twelve; and
-  `open_close`, which is the one read-side case that gets *worse* as threads are added, as
-  twelve rings contend on one directory's dentry locks.
-
-The caveats are recorded with the figures rather than under them: reads are page-cache warm on
-purpose, the handoff cost is inflated by nested virtualisation, and `threads` does not mean the
-same thing to a pinned ring as it does to a runtime with a 4096-thread blocking pool. Only the
-12-thread row gives all three arms the same hardware.
-
-## Methodology notes
-
-* Benchmarks warm up before timing, so first-touch shard creation is not counted.
-* The microbenchmark manager does nothing — `connect` returns a `u64`, `recycle` returns `Ok`. A
-  real manager's `connect` and `recycle` will dominate any of these numbers.
-* Multi-threaded figures report the **worst** thread, not the mean across threads. A pool that is
-  fast on average and terrible on one thread is a pool with a latency problem.
-* Percentiles matter more than means everywhere in this crate. The two places where the design
-  takes a deliberate loss — the exchange, and waiter fairness — are both invisible in a mean and
-  obvious in a p99.9.
+* Real NIC steering (steps 1–4). The VM has one queue. The recipe's cache-locality gain —
+  interrupt, accept and I/O on one core — is unmeasured here and is the point of running the
+  script on real hardware.
+* `defer_taskrun` and `sqpoll`. Defaults only.
+* Anything but echo. The handler is the cheapest possible one so that the server's own cost
+  shows.

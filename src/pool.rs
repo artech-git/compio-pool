@@ -1,125 +1,112 @@
-//! The pool handle, the acquire path, and the per-shard reaper.
+//! The strictly thread-local resource pool (recipe step 11).
+//!
+//! A [`LocalPool`] is an `Rc` around `Cell`s and `RefCell`s. It is never sent
+//! anywhere, so it needs no lock and no atomic: the only thread that can touch
+//! it is the one whose ring the connections live on.
+//!
+//! Capacity is reserved before a resource is produced. [`LocalPool::try_reserve`]
+//! hands out a [`Permit`] synchronously — that is the check the accept loop makes
+//! the moment a connection arrives (step 13) — and the permit is later turned
+//! into a [`Lease`] by popping an idle resource or creating one. Dropping either
+//! gives the slot back.
 
 use std::{
-    any::Any,
-    cell::RefCell,
-    collections::HashMap,
-    rc::{Rc, Weak},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
-    },
-    time::Instant,
+    cell::{Cell, RefCell},
+    future::Future,
+    io,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    rc::Rc,
+    task::{Context, Poll, Waker},
 };
 
-use crate::{
-    config::Config,
-    error::Error,
-    exchange::{Exchange, NoExchange, Parked, Unparked},
-    guard::Pooled,
-    manage::Manage,
-    metrics::{Counters, Metrics},
-    shard::Shard,
-    slot::Slot,
-};
+use crate::worker::WorkerContext;
 
-static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(0);
-
-/// Holds a shard's capacity claim across an `await`, giving it back if the
-/// `acquire` future is cancelled.
+/// Something a worker keeps a bounded number of and lends to one connection at
+/// a time: a buffer, a parser, a connection to a backend.
 ///
-/// `acquire` claims budget with `Shard::try_reserve` *before* awaiting
-/// `Manage::connect`, `Exchange::unpark` or `Manage::recycle`, and `acquire`
-/// is itself cancellable - by the acquire timeout, or by the caller's own
-/// `select!`. Without this guard, a cancellation between the claim and the end
-/// of the await would leak that capacity permanently, and a shard would
-/// eventually sit at `max_size` holding no connections at all.
-struct Reserved<'a, M: Manage> {
-    shard: &'a Rc<Shard<M>>,
-    counters: &'a Counters,
-    /// True when a real connection is riding along, counted in `live`.
-    holds_conn: bool,
-    armed: bool,
-}
+/// Resources are created, used and dropped on one thread, so there is no `Send`
+/// bound anywhere.
+pub trait Resource: Sized + 'static {
+    /// Build one resource on the worker that will own it. Runs on the pinned
+    /// worker thread, inside its runtime, so it may do I/O.
+    fn create(cx: &WorkerContext) -> impl Future<Output = io::Result<Self>>;
 
-impl<'a, M: Manage> Reserved<'a, M> {
-    /// Budget claimed, no connection behind it yet.
-    fn empty(shard: &'a Rc<Shard<M>>, counters: &'a Counters) -> Self {
-        Self {
-            shard,
-            counters,
-            holds_conn: false,
-            armed: true,
-        }
-    }
-
-    /// Budget claimed and a live connection is out of the free list.
-    fn holding(shard: &'a Rc<Shard<M>>, counters: &'a Counters) -> Self {
-        Self {
-            shard,
-            counters,
-            holds_conn: true,
-            armed: true,
-        }
-    }
-
-    /// The await completed; ownership has passed on.
-    fn disarm(mut self) {
-        self.armed = false;
+    /// Called when a lease ends, before the resource goes back on the idle
+    /// list. Return `false` to drop it instead — for a backend connection that
+    /// is no longer usable, say. The default keeps everything.
+    fn recycle(&mut self) -> bool {
+        true
     }
 }
 
-impl<M: Manage> Drop for Reserved<'_, M> {
-    fn drop(&mut self) {
-        if !self.armed {
+/// Wakers of futures waiting on one condition. Each waiting future owns an id,
+/// so it can take its waker out again when it is dropped before the condition
+/// holds; nothing stale is ever woken.
+#[derive(Default)]
+struct Waiters {
+    next_id: Cell<u64>,
+    entries: RefCell<Vec<(u64, Waker)>>,
+}
+
+impl Waiters {
+    fn register(&self, id: &mut Option<u64>, waker: &Waker) {
+        let mut entries = self.entries.borrow_mut();
+        if let Some(id) = *id
+            && let Some(entry) = entries.iter_mut().find(|(i, _)| *i == id)
+        {
+            if !entry.1.will_wake(waker) {
+                entry.1 = waker.clone();
+            }
             return;
         }
-        if self.holds_conn {
-            // The connection is dropped by the cancelled future without a
-            // graceful `Manage::disconnect`; there is no way to await one here.
-            Counters::dec(&self.counters.live);
-            Counters::inc(&self.counters.closed);
+        let new_id = self.next_id.get();
+        self.next_id.set(new_id.wrapping_add(1));
+        entries.push((new_id, waker.clone()));
+        *id = Some(new_id);
+    }
+
+    fn unregister(&self, id: Option<u64>) {
+        if let Some(id) = id {
+            self.entries.borrow_mut().retain(|(i, _)| *i != id);
         }
-        self.shard.release();
+    }
+
+    /// Wake everyone. The borrow is released before any waker runs, so a waker
+    /// that polls something inline can register again without a double borrow.
+    fn wake_all(&self) {
+        let wakers: Vec<Waker> = self
+            .entries
+            .borrow_mut()
+            .drain(..)
+            .map(|(_, w)| w)
+            .collect();
+        for waker in wakers {
+            waker.wake();
+        }
     }
 }
 
-thread_local! {
-    /// Every pool's shard for *this* thread, keyed by pool id.
-    ///
-    /// This is what makes `Pool` `Send + Sync` while `M::Connection` is not:
-    /// the `Arc<Inner>` holds no connections at all. They live here, and a
-    /// value in a thread-local is by construction only reachable from its own
-    /// thread. At thread exit the map drops, closing that thread's connections
-    /// on the thread whose compio driver owns them.
-    static SHARDS: RefCell<HashMap<u64, Box<dyn Any>>> = RefCell::new(HashMap::new());
+struct Inner<R> {
+    cx: WorkerContext,
+    capacity: usize,
+    idle: RefCell<Vec<R>>,
+    /// Permits plus leases outstanding. May exceed `capacity` only through
+    /// [`LocalPool::reserve_unbounded`].
+    taken: Cell<usize>,
+    created: Cell<u64>,
+    /// Waiting for `taken < capacity`.
+    capacity_waiters: Waiters,
+    /// Waiting for `taken == 0`.
+    drain_waiters: Waiters,
 }
 
-struct Inner<M: Manage, X: Exchange<M>> {
-    id: u64,
-    manager: Arc<M>,
-    config: Config,
-    exchange: X,
-    counters: Arc<Counters>,
-    generation: AtomicU64,
-    closed: AtomicBool,
+/// A bounded, thread-local pool of [`Resource`]s. Cloning shares the pool.
+pub struct LocalPool<R> {
+    inner: Rc<Inner<R>>,
 }
 
-/// A sharded connection pool for `compio`.
-///
-/// Cheap to clone and `Send + Sync`: clone it onto every compio thread. Each
-/// thread transparently gets its own shard, so the acquire fast path touches no
-/// atomics and no locks.
-///
-/// The `X` parameter selects the cross-thread strategy. The default,
-/// [`NoExchange`], keeps threads fully independent. Swap in a
-/// [`Reservoir`](crate::Reservoir) — which requires [`Detach`](crate::Detach) —
-/// to let idle connections migrate to whichever thread needs them.
-pub struct Pool<M: Manage, X: Exchange<M> = NoExchange> {
-    inner: Arc<Inner<M, X>>,
-}
-
-impl<M: Manage, X: Exchange<M>> Clone for Pool<M, X> {
+impl<R> Clone for LocalPool<R> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -127,745 +114,314 @@ impl<M: Manage, X: Exchange<M>> Clone for Pool<M, X> {
     }
 }
 
-impl<M: Manage> Pool<M> {
-    /// Builds a pool with no cross-thread sharing.
-    pub fn new(manager: M, config: Config) -> Self {
-        Self::with_exchange(manager, config, NoExchange)
+impl<R> std::fmt::Debug for LocalPool<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalPool")
+            .field("capacity", &self.inner.capacity)
+            .field("taken", &self.inner.taken.get())
+            .field("idle", &self.inner.idle.borrow().len())
+            .finish()
+    }
+}
+
+impl<R> LocalPool<R> {
+    /// The worker this pool belongs to.
+    pub fn context(&self) -> &WorkerContext {
+        &self.inner.cx
     }
 
-    /// Starts a [`Builder`].
-    pub fn builder(manager: M) -> Builder<M, NoExchange> {
-        Builder {
-            manager,
-            config: Config::default(),
-            exchange: NoExchange,
+    /// Slots in total.
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity
+    }
+
+    /// Permits and leases outstanding.
+    pub fn taken(&self) -> usize {
+        self.inner.taken.get()
+    }
+
+    /// Resources sitting on the idle list.
+    pub fn idle(&self) -> usize {
+        self.inner.idle.borrow().len()
+    }
+
+    /// `capacity - taken`, saturating.
+    pub fn available(&self) -> usize {
+        self.inner.capacity.saturating_sub(self.inner.taken.get())
+    }
+
+    /// Whether [`try_reserve`](Self::try_reserve) would succeed right now.
+    pub fn has_capacity(&self) -> bool {
+        self.inner.taken.get() < self.inner.capacity
+    }
+
+    /// Resources created so far, including ones since dropped.
+    pub fn created(&self) -> u64 {
+        self.inner.created.get()
+    }
+
+    /// Take a slot if one is free. Synchronous and never blocks: this is the
+    /// capacity check at accept time.
+    pub fn try_reserve(&self) -> Option<Permit<R>> {
+        if self.has_capacity() {
+            Some(self.reserve_unbounded())
+        } else {
+            None
+        }
+    }
+
+    /// Take a slot whether or not one is free. The pool goes over capacity by
+    /// one until the permit or its lease is dropped. This is how
+    /// [`OverflowPolicy::ServeLocally`](crate::OverflowPolicy::ServeLocally)
+    /// admits a connection that nobody else can take.
+    pub fn reserve_unbounded(&self) -> Permit<R> {
+        self.inner.taken.set(self.inner.taken.get() + 1);
+        Permit {
+            pool: self.clone(),
+            live: true,
+        }
+    }
+
+    /// Wait for a slot and take it.
+    pub fn reserve(&self) -> impl Future<Output = Permit<R>> + '_ {
+        Wait {
+            pool: self,
+            kind: Kind::Capacity,
+            ready: |pool: &LocalPool<R>| pool.try_reserve(),
+            id: None,
+        }
+    }
+
+    /// Resolve as soon as a slot is free, without taking it. The claim loop
+    /// waits on this before it offers to take a connection off the channel.
+    pub fn wait_available(&self) -> impl Future<Output = ()> + '_ {
+        Wait {
+            pool: self,
+            kind: Kind::Capacity,
+            ready: |pool: &LocalPool<R>| pool.has_capacity().then_some(()),
+            id: None,
+        }
+    }
+
+    /// Resolve when nothing is outstanding. Used to drain on shutdown.
+    pub fn drained(&self) -> impl Future<Output = ()> + '_ {
+        Wait {
+            pool: self,
+            kind: Kind::Drain,
+            ready: |pool: &LocalPool<R>| (pool.taken() == 0).then_some(()),
+            id: None,
+        }
+    }
+
+    fn waiters(&self, kind: Kind) -> &Waiters {
+        match kind {
+            Kind::Capacity => &self.inner.capacity_waiters,
+            Kind::Drain => &self.inner.drain_waiters,
+        }
+    }
+
+    fn release(&self) {
+        let inner = &self.inner;
+        let taken = inner.taken.get().saturating_sub(1);
+        inner.taken.set(taken);
+        // Wake every capacity waiter, not just one. A `wait_available` waiter
+        // does not consume the slot it was woken for, so waking one could leave
+        // a `reserve` waiter asleep while a slot is free. There are only ever a
+        // couple of waiters per worker, so this costs nothing measurable.
+        if taken < inner.capacity {
+            inner.capacity_waiters.wake_all();
+        }
+        if taken == 0 {
+            inner.drain_waiters.wake_all();
         }
     }
 }
 
-impl<M: Manage, X: Exchange<M>> Pool<M, X> {
-    /// Builds a pool with an explicit cross-thread [`Exchange`].
-    pub fn with_exchange(manager: M, config: Config, exchange: X) -> Self {
+impl<R: Resource> LocalPool<R> {
+    /// An empty pool with `capacity` slots for worker `cx`.
+    pub fn new(cx: WorkerContext, capacity: usize) -> Self {
         Self {
-            inner: Arc::new(Inner {
-                id: NEXT_POOL_ID.fetch_add(1, Relaxed),
-                manager: Arc::new(manager),
-                config,
-                exchange,
-                counters: Arc::new(Counters::default()),
-                generation: AtomicU64::new(0),
-                closed: AtomicBool::new(false),
+            inner: Rc::new(Inner {
+                cx,
+                capacity,
+                idle: RefCell::new(Vec::with_capacity(capacity.min(1024))),
+                taken: Cell::new(0),
+                created: Cell::new(0),
+                capacity_waiters: Waiters::default(),
+                drain_waiters: Waiters::default(),
             }),
         }
     }
 
-    /// The manager, for callers that need to reach configuration through it.
-    pub fn manager(&self) -> &M {
-        self.inner.manager.as_ref()
-    }
-
-    /// The configuration this pool was built with.
-    pub fn config(&self) -> &Config {
-        &self.inner.config
-    }
-
-    /// Connections owned by *this thread's* shard, idle plus checked out.
-    pub fn local_size(&self) -> usize {
-        self.shard().size()
-    }
-
-    /// Idle connections sitting in *this thread's* shard.
-    pub fn local_idle(&self) -> usize {
-        self.shard().idle_len()
-    }
-
-    /// A snapshot of pool activity.
-    pub fn metrics(&self) -> Metrics {
-        self.inner.counters.snapshot(self.inner.exchange.parked())
-    }
-
-    /// Retires every connection created before this call.
-    ///
-    /// Live checkouts keep working and are closed when returned. Use after a
-    /// credential rotation or a failover, where existing sockets point at the
-    /// wrong place but the pool itself is still wanted.
-    pub fn invalidate(&self) {
-        self.inner.generation.fetch_add(1, Relaxed);
-        self.inner.exchange.clear();
-    }
-
-    /// Closes the pool.
-    ///
-    /// Subsequent [`acquire`](Pool::acquire) calls fail with
-    /// [`Error::Closed`]. This thread's idle connections are closed
-    /// immediately; other threads' are closed when they next touch the pool or
-    /// when their thread exits.
-    pub fn close(&self) {
-        self.inner.closed.store(true, Relaxed);
-        self.inner.exchange.clear();
-        let shard = self.shard();
-        for slot in shard.drain_all() {
-            self.destroy(&shard, slot);
+    /// Create up to `n` idle resources ahead of demand, never more than fit.
+    /// Returns how many were created.
+    pub async fn prewarm(&self, n: usize) -> io::Result<usize> {
+        let room = self
+            .inner
+            .capacity
+            .saturating_sub(self.inner.taken.get() + self.idle());
+        let n = n.min(room);
+        for _ in 0..n {
+            let resource = R::create(&self.inner.cx).await?;
+            self.inner.created.set(self.inner.created.get() + 1);
+            self.inner.idle.borrow_mut().push(resource);
         }
-    }
-
-    /// Whether [`close`](Pool::close) has been called.
-    pub fn is_closed(&self) -> bool {
-        self.inner.closed.load(Relaxed)
-    }
-
-    /// Opens connections on the current thread up to `min_idle`.
-    ///
-    /// Call this once per compio thread at startup so the first real request
-    /// does not pay for a handshake.
-    ///
-    /// # Cancellation
-    ///
-    /// Unlike [`acquire`](Pool::acquire), `warm` applies **no timeout of its
-    /// own**: [`Config::acquire_timeout`] bounds a checkout, not a warmup. A
-    /// backend whose handshake never completes will hang `warm` indefinitely,
-    /// so bound it yourself at the call site:
-    ///
-    /// ```no_run
-    /// # use std::time::Duration;
-    /// # async fn f(pool: &compio_pool::Pool<Noop>) {
-    /// // Warming is best-effort: a slow backend must not stall startup.
-    /// let _ = compio::time::timeout(Duration::from_secs(5), pool.warm()).await;
-    /// # }
-    /// # struct Noop;
-    /// # impl compio_pool::Manage for Noop {
-    /// #     type Connection = ();
-    /// #     type Error = std::io::Error;
-    /// #     async fn connect(&self) -> std::io::Result<()> { Ok(()) }
-    /// #     async fn recycle(&self, _: &mut (), _: &compio_pool::SlotMeta) -> std::io::Result<()> { Ok(()) }
-    /// # }
-    /// ```
-    ///
-    /// Doing so is safe: like `acquire`, every await here is wrapped in a
-    /// reservation, so a cancelled `warm` hands back the shard budget it had
-    /// claimed and keeps whatever it already opened. Dropping the future costs
-    /// you an in-flight handshake, never capacity.
-    pub async fn warm(&self) -> Result<(), Error<M::Error>> {
-        let shard = self.shard();
-        let target = self.inner.config.effective_min_idle();
-        while shard.idle_len() < target {
-            if !shard.try_reserve(self.inner.config.max_size) {
-                break;
-            }
-            // Guarded for the same reason as the dial in `acquire`: `warm` is a
-            // public async fn, so a caller may wrap it in a timeout or race it
-            // in a `select!`. Without this, a cancellation here would strand the
-            // claim above and the shard would lose that capacity for good.
-            let reserved = Reserved::empty(&shard, &self.inner.counters);
-            let connected = self.inner.manager.connect().await;
-            reserved.disarm();
-            match connected {
-                Ok(conn) => {
-                    Counters::inc(&self.inner.counters.created);
-                    Counters::inc(&self.inner.counters.live);
-                    let generation = self.inner.generation.load(Relaxed);
-                    shard.push_idle(Slot::new(conn, generation));
-                }
-                Err(e) => {
-                    shard.release();
-                    return Err(Error::Backend(e));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Checks out a connection, waiting if the shard is at `max_size`.
-    ///
-    /// Must be called on a compio runtime thread. Honours
-    /// [`Config::acquire_timeout`].
-    ///
-    /// # Cancellation safety
-    ///
-    /// **`acquire` is cancellation-safe.** Drop the future at any point — on a
-    /// timeout, on a losing `select!` branch, on an early `?` return — and the
-    /// shard is left exactly as it was found. Nothing needs to be cleaned up by
-    /// the caller, and no `Pooled` can be lost in the process.
-    ///
-    /// So the idiomatic form is just the obvious one:
-    ///
-    /// ```no_run
-    /// # use std::time::Duration;
-    /// # async fn f(pool: &compio_pool::Pool<Noop>) {
-    /// // A deadline tighter than the configured `acquire_timeout`.
-    /// match compio::time::timeout(Duration::from_millis(50), pool.acquire()).await {
-    ///     Ok(Ok(conn)) => { /* use it */ }
-    ///     Ok(Err(e)) => { /* the pool itself said no */ }
-    ///     Err(_elapsed) => { /* we gave up; the shard is already whole */ }
-    /// }
-    /// # }
-    /// # struct Noop;
-    /// # impl compio_pool::Manage for Noop {
-    /// #     type Connection = ();
-    /// #     type Error = std::io::Error;
-    /// #     async fn connect(&self) -> std::io::Result<()> { Ok(()) }
-    /// #     async fn recycle(&self, _: &mut (), _: &compio_pool::SlotMeta) -> std::io::Result<()> { Ok(()) }
-    /// # }
-    /// ```
-    ///
-    /// Racing it against a shutdown signal is the same shape — whichever arm
-    /// loses is simply dropped:
-    ///
-    /// ```ignore
-    /// futures::select! {
-    ///     conn = pool.acquire().fuse() => { /* won the race */ }
-    ///     _ = shutdown.fuse() => { /* the acquire future is dropped here */ }
-    /// }
-    /// ```
-    ///
-    /// ## Why that is safe
-    ///
-    /// `acquire` has to claim shard budget *before* it awaits — `max_size` is
-    /// enforced by `Shard::try_reserve`, and the dial, the unpark and the
-    /// `recycle` check all happen after the claim. That leaves a window in
-    /// which the shard counts a connection that does not exist yet. Drop the
-    /// future in that window and, naively, the budget is gone: the shard
-    /// believes it is one connection fuller than it is, forever. Repeat it
-    /// `max_size` times and the shard sits at capacity holding nothing, with
-    /// every later `acquire` waiting for a return that can never come.
-    ///
-    /// Internally each awaited region is wrapped in an RAII reservation whose
-    /// `Drop` refunds the claim, and which is disarmed the instant the await
-    /// completes and ownership moves into a [`Pooled`]. Cancellation runs
-    /// destructors, so the refund happens on exactly the paths where the
-    /// function cannot run its own cleanup code. Where a real connection is
-    /// riding along — a socket popped from the free list and awaiting
-    /// `recycle` — the same guard also accounts for it as closed, since a
-    /// cancelled future has no way to await [`Manage::disconnect`].
-    ///
-    /// # What is *not* covered
-    ///
-    /// This applies to `acquire` itself, not to what you do with the connection
-    /// afterwards. Cancelling mid-operation on a checked-out connection leaves
-    /// the *protocol* out of step, which no amount of budget accounting can
-    /// repair — that hazard is [`Pooled::begin_op`]'s, and it is the one you
-    /// still have to think about:
-    ///
-    /// ```ignore
-    /// let mut conn = pool.acquire().await?;        // cancel-safe on its own
-    /// let op = conn.begin_op();                    // …but this part is not
-    /// let n = compio::time::timeout(d, conn.read(&mut buf)).await??;
-    /// op.complete_op();
-    /// ```
-    ///
-    /// If the `read` times out, `op` drops without `complete_op` and the
-    /// connection is poisoned: closed on return rather than handed to the next
-    /// caller. See [`Pooled`] for the full account.
-    pub async fn acquire(&self) -> Result<Pooled<M, X>, Error<M::Error>> {
-        match self.inner.config.acquire_timeout {
-            Some(limit) => match compio::time::timeout(limit, self.acquire_inner()).await {
-                Ok(result) => result,
-                Err(_elapsed) => {
-                    Counters::inc(&self.inner.counters.timeouts);
-                    Err(Error::Timeout)
-                }
-            },
-            None => self.acquire_inner().await,
-        }
-    }
-
-    async fn acquire_inner(&self) -> Result<Pooled<M, X>, Error<M::Error>> {
-        let shard = self.shard();
-        loop {
-            if self.inner.closed.load(Relaxed) {
-                return Err(Error::Closed);
-            }
-            let generation = self.inner.generation.load(Relaxed);
-
-            // 1. Warmest idle connection on this thread. No atomics, no lock.
-            while let Some(slot) = shard.pop_idle() {
-                if slot.is_expired(&self.inner.config, generation) {
-                    self.destroy(&shard, slot);
-                    continue;
-                }
-                let Slot { mut conn, meta } = slot;
-                // The connection is now out of the free list but not yet in a
-                // guard: if this await is cancelled, `reserved` accounts for it.
-                let reserved = Reserved::holding(&shard, &self.inner.counters);
-                let recycled = self.inner.manager.recycle(&mut conn, &meta).await;
-                reserved.disarm();
-                match recycled {
-                    Ok(()) => {
-                        Counters::inc(&self.inner.counters.acquires);
-                        return Ok(Pooled::new(Slot { conn, meta }, shard, self.clone()));
-                    }
-                    Err(_) => {
-                        Counters::inc(&self.inner.counters.recycle_failures);
-                        self.destroy_conn(&shard, conn);
-                    }
-                }
-            }
-
-            // 2. Room for one more on this thread? Claim the budget first, so
-            //    that unpark and connect are both covered by one reservation.
-            if shard.try_reserve(self.inner.config.max_size) {
-                // Both awaits below are cancellable; `reserved` hands the
-                // budget back if either is dropped part-way through.
-                let reserved = Reserved::empty(&shard, &self.inner.counters);
-                let unparked = self.inner.exchange.unpark().await;
-                reserved.disarm();
-
-                match unparked {
-                    // Someone else's idle socket, re-wrapped in this thread's
-                    // runtime. Cheaper than a handshake, so it is tried first.
-                    Unparked::Claimed(conn, meta) => {
-                        Counters::inc(&self.inner.counters.unparked);
-                        Counters::inc(&self.inner.counters.live);
-                        Counters::inc(&self.inner.counters.acquires);
-                        return Ok(Pooled::new(Slot { conn, meta }, shard, self.clone()));
-                    }
-                    // It was popped but could not be reattached, so it is gone.
-                    // Parking already decremented `live`; balance `created`
-                    // here and fall through to dialling a replacement.
-                    Unparked::Lost => Counters::inc(&self.inner.counters.closed),
-                    Unparked::Empty => {}
-                }
-                let reserved = Reserved::empty(&shard, &self.inner.counters);
-                let connected = self.inner.manager.connect().await;
-                reserved.disarm();
-                return match connected {
-                    Ok(conn) => {
-                        Counters::inc(&self.inner.counters.created);
-                        Counters::inc(&self.inner.counters.live);
-                        Counters::inc(&self.inner.counters.acquires);
-                        Ok(Pooled::new(
-                            Slot::new(conn, generation),
-                            shard,
-                            self.clone(),
-                        ))
-                    }
-                    Err(e) => {
-                        shard.release();
-                        Err(Error::Backend(e))
-                    }
-                };
-            }
-
-            // 3. At capacity. Wait for one of *this thread's* checkouts to come
-            //    back; they always will, so this cannot deadlock.
-            Counters::inc(&self.inner.counters.waits);
-            shard.wait().await;
-        }
-    }
-
-    /// Return path for [`Pooled::drop`].
-    pub(crate) fn release(
-        &self,
-        shard: &Rc<Shard<M>>,
-        mut slot: Slot<M::Connection>,
-        poisoned: bool,
-    ) {
-        slot.meta.uses += 1;
-        slot.meta.last_used = Instant::now();
-
-        if poisoned {
-            Counters::inc(&self.inner.counters.poisoned);
-            return self.destroy(shard, slot);
-        }
-        if self.inner.closed.load(Relaxed) {
-            return self.destroy(shard, slot);
-        }
-        let generation = self.inner.generation.load(Relaxed);
-        if slot.is_expired(&self.inner.config, generation) {
-            return self.destroy(shard, slot);
-        }
-
-        // Surplus idle connections are offered to other threads rather than
-        // held here until they age out. Only surplus: keep `min_idle` local,
-        // and never give one away while someone on this thread is waiting.
-        if !shard.has_waiters() && shard.idle_len() >= self.inner.config.effective_min_idle() {
-            let Slot { conn, meta } = slot;
-            match self.inner.exchange.park(conn, meta) {
-                Parked::Accepted => {
-                    // The reservoir took it; it is no longer this shard's.
-                    Counters::dec(&self.inner.counters.live);
-                    shard.release();
-                    return;
-                }
-                // `detach` found an operation still in flight and dropped it
-                // rather than hand a busy handle to another driver.
-                Parked::Destroyed => {
-                    Counters::dec(&self.inner.counters.live);
-                    Counters::inc(&self.inner.counters.closed);
-                    shard.release();
-                    return;
-                }
-                Parked::Refused(conn, meta) => slot = Slot { conn, meta },
-            }
-        }
-
-        shard.push_idle(slot);
-    }
-
-    /// Drops a connection out of the pool without closing it, for
-    /// [`Pooled::take`].
-    pub(crate) fn forget(&self, shard: &Rc<Shard<M>>) {
-        Counters::dec(&self.inner.counters.live);
-        shard.release();
-    }
-
-    fn destroy(&self, shard: &Rc<Shard<M>>, slot: Slot<M::Connection>) {
-        self.destroy_conn(shard, slot.conn);
-    }
-
-    fn destroy_conn(&self, shard: &Rc<Shard<M>>, conn: M::Connection) {
-        self.inner.manager.disconnect(conn);
-        Counters::dec(&self.inner.counters.live);
-        Counters::inc(&self.inner.counters.closed);
-        shard.release();
-    }
-
-    /// This thread's shard, creating it (and its reaper) on first touch.
-    fn shard(&self) -> Rc<Shard<M>> {
-        let id = self.inner.id;
-
-        let (shard, created) = SHARDS.with(|shards| {
-            let mut shards = shards.borrow_mut();
-            match shards.get(&id) {
-                Some(any) => (
-                    any.downcast_ref::<Rc<Shard<M>>>()
-                        .expect("pool id uniquely determines shard type")
-                        .clone(),
-                    false,
-                ),
-                None => {
-                    // Cloned here, not above: these are `Arc`s shared by every
-                    // thread, and bumping their refcounts on the hit path would
-                    // put two atomic RMWs on a contended cache line into every
-                    // single checkout.
-                    let shard = Rc::new(Shard::<M>::new(
-                        self.inner.counters.clone(),
-                        self.inner.manager.clone(),
-                    ));
-                    shards.insert(id, Box::new(shard.clone()));
-                    (shard, true)
-                }
-            }
-        });
-
-        // Spawn outside the `with` closure: the thread-local is no longer
-        // borrowed, so the reaper is free to reach for its own shard.
-        if created && self.inner.config.needs_reaper() {
-            self.spawn_reaper(&shard);
-        }
-        shard
-    }
-
-    fn spawn_reaper(&self, shard: &Rc<Shard<M>>) {
-        // Outside a compio runtime there is nothing to spawn onto. The pool
-        // still works; expired connections are then caught on acquire instead.
-        if compio::runtime::Runtime::try_with_current(|_| ()).is_err() {
-            return;
-        }
-        let pool = self.clone();
-        let shard = Rc::downgrade(shard);
-        compio::runtime::spawn(async move { pool.reap_loop(shard).await }).detach();
-    }
-
-    /// Enforces idle/lifetime limits and refills `min_idle` on one thread.
-    ///
-    /// Holds only a `Weak` to the shard, so it stops on its own once the
-    /// thread's shard is gone.
-    async fn reap_loop(self, shard: Weak<Shard<M>>) {
-        let interval = self.inner.config.reap_interval;
-        loop {
-            compio::time::sleep(interval).await;
-
-            let Some(shard) = shard.upgrade() else { return };
-            if self.inner.closed.load(Relaxed) {
-                for slot in shard.drain_all() {
-                    self.destroy(&shard, slot);
-                }
-                return;
-            }
-
-            let generation = self.inner.generation.load(Relaxed);
-            for slot in shard.drain_expired(&self.inner.config, generation) {
-                self.destroy(&shard, slot);
-            }
-
-            let target = self.inner.config.effective_min_idle();
-            while shard.idle_len() < target && !shard.has_waiters() {
-                if !shard.try_reserve(self.inner.config.max_size) {
-                    break;
-                }
-                // The reaper is a detached task, so it is dropped wholesale at
-                // runtime shutdown — possibly mid-dial. `Shard::drop` settles
-                // `live`/`closed` from `size`, so a stranded claim would skew
-                // the closing accounting. Guard it like every other dial.
-                let reserved = Reserved::empty(&shard, &self.inner.counters);
-                let connected = self.inner.manager.connect().await;
-                reserved.disarm();
-                match connected {
-                    Ok(conn) => {
-                        Counters::inc(&self.inner.counters.created);
-                        Counters::inc(&self.inner.counters.live);
-                        shard.push_idle(Slot::new(conn, generation));
-                    }
-                    Err(_) => {
-                        shard.release();
-                        break;
-                    }
-                }
-            }
-        }
+        Ok(n)
     }
 }
 
-impl<M: Manage, X: Exchange<M>> std::fmt::Debug for Pool<M, X> {
+#[derive(Clone, Copy)]
+enum Kind {
+    Capacity,
+    Drain,
+}
+
+/// A future that polls `ready` and, while it says no, keeps exactly one waker
+/// registered with the pool — removed again if the future is dropped first.
+struct Wait<'a, R, F> {
+    pool: &'a LocalPool<R>,
+    kind: Kind,
+    ready: F,
+    id: Option<u64>,
+}
+
+impl<R, T, F: FnMut(&LocalPool<R>) -> Option<T> + Unpin> Future for Wait<'_, R, F> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        let this = self.get_mut();
+        if let Some(value) = (this.ready)(this.pool) {
+            this.pool.waiters(this.kind).unregister(this.id.take());
+            return Poll::Ready(value);
+        }
+        this.pool
+            .waiters(this.kind)
+            .register(&mut this.id, cx.waker());
+        Poll::Pending
+    }
+}
+
+impl<R, F> Drop for Wait<'_, R, F> {
+    fn drop(&mut self) {
+        self.pool.waiters(self.kind).unregister(self.id.take());
+    }
+}
+
+/// A reserved slot that has not been given a resource yet.
+///
+/// Dropping it unreserves the slot. Turn it into a [`Lease`] with
+/// [`acquire`](Self::acquire).
+pub struct Permit<R> {
+    pool: LocalPool<R>,
+    live: bool,
+}
+
+impl<R> std::fmt::Debug for Permit<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pool")
-            .field("id", &self.inner.id)
-            .field("closed", &self.inner.closed.load(Relaxed))
-            .field("metrics", &self.metrics())
-            .finish_non_exhaustive()
+        f.debug_struct("Permit")
+            .field("live", &self.live)
+            .field("pool", &self.pool)
+            .finish()
     }
 }
 
-/// Fluent constructor for [`Pool`].
-pub struct Builder<M: Manage, X: Exchange<M>> {
-    manager: M,
-    config: Config,
-    exchange: X,
+impl<R> Permit<R> {
+    /// The pool the slot belongs to.
+    pub fn pool(&self) -> &LocalPool<R> {
+        &self.pool
+    }
 }
 
-impl<M: Manage, X: Exchange<M>> Builder<M, X> {
-    /// Replaces the whole configuration.
-    pub fn config(mut self, config: Config) -> Self {
-        self.config = config;
-        self
+impl<R: Resource> Permit<R> {
+    /// Pop an idle resource, or create one, and lease it against this slot.
+    ///
+    /// If creation fails the slot is released and the error returned.
+    pub async fn acquire(mut self) -> io::Result<Lease<R>> {
+        let idle = self.pool.inner.idle.borrow_mut().pop();
+        let resource = match idle {
+            Some(resource) => resource,
+            None => {
+                let resource = R::create(&self.pool.inner.cx).await?;
+                self.pool
+                    .inner
+                    .created
+                    .set(self.pool.inner.created.get() + 1);
+                resource
+            }
+        };
+        self.live = false;
+        Ok(Lease {
+            pool: self.pool.clone(),
+            resource: Some(resource),
+        })
     }
+}
 
-    /// Maximum live connections per runtime thread.
-    pub fn max_size(mut self, n: usize) -> Self {
-        self.config = self.config.clone().max_size(n);
-        self
-    }
-
-    /// Idle connections each shard keeps warm.
-    pub fn min_idle(mut self, n: usize) -> Self {
-        self.config = self.config.clone().min_idle(n);
-        self
-    }
-
-    /// How long `acquire` waits before giving up.
-    pub fn acquire_timeout(mut self, t: impl Into<Option<std::time::Duration>>) -> Self {
-        self.config = self.config.clone().acquire_timeout(t);
-        self
-    }
-
-    /// Hard age cap on a connection.
-    pub fn max_lifetime(mut self, t: impl Into<Option<std::time::Duration>>) -> Self {
-        self.config = self.config.clone().max_lifetime(t);
-        self
-    }
-
-    /// How long a connection may sit idle before being reaped.
-    pub fn idle_timeout(mut self, t: impl Into<Option<std::time::Duration>>) -> Self {
-        self.config = self.config.clone().idle_timeout(t);
-        self
-    }
-
-    /// Retire a connection after this many checkouts.
-    pub fn max_uses(mut self, n: impl Into<Option<u64>>) -> Self {
-        self.config = self.config.clone().max_uses(n);
-        self
-    }
-
-    /// Installs a cross-thread [`Exchange`], changing the pool's type.
-    pub fn exchange<Y: Exchange<M>>(self, exchange: Y) -> Builder<M, Y> {
-        Builder {
-            manager: self.manager,
-            config: self.config,
-            exchange,
+impl<R> Drop for Permit<R> {
+    fn drop(&mut self) {
+        if self.live {
+            self.pool.release();
         }
     }
+}
 
-    /// Builds the pool.
-    pub fn build(self) -> Pool<M, X> {
-        Pool::with_exchange(self.manager, self.config, self.exchange)
+/// A resource checked out of its pool. Derefs to the resource; dropping it
+/// recycles the resource and frees the slot.
+pub struct Lease<R: Resource> {
+    pool: LocalPool<R>,
+    resource: Option<R>,
+}
+
+impl<R: Resource> std::fmt::Debug for Lease<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lease")
+            .field("held", &self.resource.is_some())
+            .field("pool", &self.pool)
+            .finish()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestManager;
-
-    fn untimed() -> Config {
-        Config::new().max_lifetime(None).idle_timeout(None)
+impl<R: Resource> Lease<R> {
+    /// The pool the resource came from.
+    pub fn pool(&self) -> &LocalPool<R> {
+        &self.pool
     }
 
-    fn pool() -> Pool<TestManager> {
-        Pool::new(TestManager::new(), untimed())
+    /// End the lease and drop the resource instead of recycling it.
+    pub fn discard(mut self) {
+        drop(self.resource.take());
     }
+}
 
-    // ---- Reserved: the cancellation-safety guard ----------------------------
-    //
-    // `acquire` claims shard budget before awaiting, and `acquire` is itself
-    // cancellable. These four cases are the whole contract.
+impl<R: Resource> Deref for Lease<R> {
+    type Target = R;
 
-    /// A guard for a claim that has already been converted into a real checkout
-    /// must not touch anything when it goes out of scope.
-    #[test]
-    fn a_disarmed_empty_reservation_returns_nothing() {
-        let p = pool();
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-
-        Reserved::empty(&shard, &p.inner.counters).disarm();
-
-        assert_eq!(shard.size(), 1, "the budget stayed claimed");
-        assert_eq!(p.metrics().closed, 0);
+    fn deref(&self) -> &R {
+        self.resource
+            .as_ref()
+            .expect("lease resource present until drop")
     }
+}
 
-    /// The point of the guard: a cancelled dial hands its budget back, or the
-    /// shard silently loses capacity until it sits at `max_size` holding nothing.
-    #[test]
-    fn a_dropped_empty_reservation_returns_the_budget() {
-        let p = pool();
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-
-        drop(Reserved::empty(&shard, &p.inner.counters));
-
-        assert_eq!(shard.size(), 0);
-        let m = p.metrics();
-        assert_eq!(m.closed, 0, "there was no connection to close");
-        assert_eq!(m.live, 0);
+impl<R: Resource> DerefMut for Lease<R> {
+    fn deref_mut(&mut self) -> &mut R {
+        self.resource
+            .as_mut()
+            .expect("lease resource present until drop")
     }
+}
 
-    #[test]
-    fn a_disarmed_holding_reservation_leaves_the_connection_counted() {
-        let p = pool();
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-        Counters::inc(&p.inner.counters.live);
-
-        Reserved::holding(&shard, &p.inner.counters).disarm();
-
-        let m = p.metrics();
-        assert_eq!(m.live, 1, "the connection is still ours");
-        assert_eq!(m.closed, 0);
-        assert_eq!(shard.size(), 1);
-    }
-
-    /// A connection out of the free list but not yet in a guard is dropped by
-    /// the cancelled future, with no chance to await `disconnect`. It still has
-    /// to be accounted for.
-    #[test]
-    fn a_dropped_holding_reservation_counts_the_connection_closed() {
-        let p = pool();
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-        Counters::inc(&p.inner.counters.live);
-
-        drop(Reserved::holding(&shard, &p.inner.counters));
-
-        let m = p.metrics();
-        assert_eq!(m.live, 0);
-        assert_eq!(m.closed, 1);
-        assert_eq!(shard.size(), 0, "and the budget comes back too");
-    }
-
-    // ---- The thread-local shard map -----------------------------------------
-
-    #[test]
-    fn a_shard_is_created_once_per_thread_and_then_reused() {
-        let p = pool();
-        let first = p.shard();
-        let second = p.shard();
-        assert!(
-            Rc::ptr_eq(&first, &second),
-            "the hit path must not rebuild the shard"
-        );
-        // A clone of the handle is the same pool, so the same shard.
-        assert!(Rc::ptr_eq(&first, &p.clone().shard()));
-    }
-
-    #[test]
-    fn two_pools_of_the_same_type_do_not_share_a_shard() {
-        let a = pool();
-        let b = pool();
-        assert!(
-            !Rc::ptr_eq(&a.shard(), &b.shard()),
-            "shards are keyed by pool id, not by connection type"
-        );
-    }
-
-    /// Outside a compio runtime there is nothing to spawn the reaper onto. The
-    /// pool must still be usable; expiry is then enforced on acquire instead.
-    #[test]
-    fn a_pool_with_a_reaper_config_works_without_a_runtime() {
-        let p = Pool::new(TestManager::new(), Config::new().min_idle(2));
-        assert!(p.config().needs_reaper());
-        assert_eq!(p.local_size(), 0);
-        assert_eq!(p.local_idle(), 0);
-    }
-
-    #[test]
-    fn a_pool_without_a_reaper_config_skips_the_spawn_entirely() {
-        let p = pool();
-        assert!(!p.config().needs_reaper());
-        assert_eq!(p.local_size(), 0);
-    }
-
-    // ---- Handle surface ------------------------------------------------------
-
-    #[test]
-    fn debug_reports_identity_state_and_metrics() {
-        let p = pool();
-        let s = format!("{p:?}");
-        assert!(s.contains("closed: false"), "got {s}");
-        assert!(s.contains("metrics"), "got {s}");
-
-        p.close();
-        assert!(format!("{p:?}").contains("closed: true"));
-    }
-
-    #[test]
-    fn pool_ids_are_unique() {
-        let a = pool();
-        let b = pool();
-        assert_ne!(a.inner.id, b.inner.id);
-    }
-
-    #[test]
-    fn destroy_closes_through_the_manager_and_frees_budget() {
-        let manager = TestManager::new();
-        let counts = manager.counts();
-        let p = Pool::new(manager, untimed());
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-        Counters::inc(&p.inner.counters.live);
-
-        p.destroy(&shard, Slot::new(crate::test_support::TestConn::new(0), 0));
-
-        assert_eq!(counts.disconnected(), 1);
-        assert_eq!(shard.size(), 0);
-        let m = p.metrics();
-        assert_eq!((m.live, m.closed), (0, 1));
-    }
-
-    #[test]
-    fn forget_frees_budget_without_closing_anything() {
-        let manager = TestManager::new();
-        let counts = manager.counts();
-        let p = Pool::new(manager, untimed());
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-        Counters::inc(&p.inner.counters.live);
-
-        p.forget(&shard);
-
-        assert_eq!(counts.disconnected(), 0, "the caller owns it now");
-        assert_eq!(shard.size(), 0, "but the shard may open a replacement");
-        let m = p.metrics();
-        assert_eq!((m.live, m.closed), (0, 0));
+impl<R: Resource> Drop for Lease<R> {
+    fn drop(&mut self) {
+        if let Some(mut resource) = self.resource.take() {
+            let inner = &self.pool.inner;
+            // `taken` still counts this lease, so `idle + taken <= capacity` is
+            // exactly "there is room for one more idle resource once we leave".
+            let room = inner.idle.borrow().len() + inner.taken.get() <= inner.capacity;
+            if room && resource.recycle() {
+                inner.idle.borrow_mut().push(resource);
+            }
+        }
+        self.pool.release();
     }
 }
