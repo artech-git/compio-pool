@@ -24,9 +24,10 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
 [workspace]
 members = []
-# A nested repository with its own history. It targets the previous API and is
-# not part of this build.
-exclude = ["crates/compio-redis"]
+# `compio-redis` is a nested repository with its own history, targeting the
+# previous API. `deadpool-baseline` is the tokio + deadpool yardstick for the
+# examples, its own workspace root. Neither is part of this build.
+exclude = ["crates/compio-redis", "crates/deadpool-baseline"]
 
 [dependencies]
 # `default-features = false` drops `io-uring`, which is the whole point, so it

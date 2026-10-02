@@ -91,6 +91,64 @@ this design — admission is per core, and a parked connection is a deliberate q
 dropped one. If that is not acceptable, `capacity` is too small, or `OverflowPolicy::Reject`
 turns the wait into a fast failure.
 
+## Baseline: tokio + deadpool
+
+The numbers above say how the design scales against itself. This says how it compares to the
+incumbent. [`crates/deadpool-baseline`](../crates/deadpool-baseline/) ports `echo` to **tokio +
+deadpool** — one multi-threaded runtime, one `TcpListener`, a task per connection, and one
+shared `deadpool` pool standing in for the thread-local `Resource` pool — and the same
+[`load`](../examples/load.rs) client drives both. Same echo handler, same 16 KiB pooled buffer;
+only the I/O and scheduling architecture differ.
+
+> These rows were taken in this repo's CI-style container — **4 vCPUs, loopback, the 64-thread
+> load generator sharing the same 4 cores as the server** — not the 12-vCPU VM above. They are
+> medians of three 5 s runs and are only meaningful against each other. Reproduce with:
+>
+> ```sh
+> cargo run --release --example echo -- 127.0.0.1:7200 1024 W            # compio-pool
+> cargo run --release -p deadpool-baseline --example echo -- 127.0.0.1:7200 1024 W   # tokio+deadpool
+> cargo run --release --example load -- 127.0.0.1:7200 --conns C --seconds 5 --bytes B
+> ```
+
+**Scaling, 512-byte echo, 64 persistent connections.** compio-pool scales close to linearly to
+the core count; the tokio baseline plateaus at two workers and dips at four, where the single
+accept loop and the one shared pool mutex become the ceiling.
+
+| workers | compio-pool req/s | compio p50 µs | tokio+deadpool req/s | tokio p50 µs |
+|---|---|---|---|---|
+| 1 | 67,603 | 899 | 71,965 | 872 |
+| 2 | 167,877 | 346 | 147,604 | 404 |
+| 4 | 245,659 | 212 | 138,416 | 412 |
+
+**Fixed 4 workers, 512-byte echo, varying connections.** With fewer connections than the VM run
+the per-core separation shows most: no shared pool, no cross-core hop.
+
+| connections | compio-pool req/s | compio p50 µs | tokio+deadpool req/s | tokio p50 µs |
+|---|---|---|---|---|
+| 16 | 272,724 | 52 | 107,291 | 126 |
+| 64 | 245,659 | 212 | 138,416 | 412 |
+
+**16 KiB echo, 64 connections, 4 workers.** The one place the baseline wins here: large
+transfers are bandwidth-bound, where io_uring's per-op edge matters least, and tokio's readiness
+model streams the big buffer efficiently — at the cost of a bimodal tail.
+
+| server | req/s | p50 µs | p90 µs | p99 µs |
+|---|---|---|---|---|
+| compio-pool | 158,081 | 336 | 654 | 1,674 |
+| tokio+deadpool | 285,662 | 7.5 | 845 | 2,511 |
+
+**Connection churn** (`--reconnect 1`, fresh connection per request, 64 conns, 512 B, 4 workers)
+is bounded by connection setup on loopback for both — ~15k conn/s — and compio-pool's fd-handoff
+path (capacity 2, ~65k of 74k connections handed off) costs nothing measurable over capacity
+1024: 14,875 vs 15,019 req/s.
+
+Read together: the thread-per-core, no-shared-state design buys its biggest wins on
+small-message throughput and latency as cores are added; the shared-runtime baseline holds its
+own on single-core and large-payload work. The one structural caveat is `SO_REUSEPORT` hash
+distribution — with only a handful of connections the kernel may stack several onto one listener,
+which is why a 4-connection run swings widely (63k–496k req/s across repeats) while a 16- or
+64-connection run is steady.
+
 ## What is not measured
 
 * Real NIC steering (steps 1–4). The VM has one queue. The recipe's cache-locality gain —

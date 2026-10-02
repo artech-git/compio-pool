@@ -1,0 +1,24 @@
+[package]
+name = "deadpool-baseline"
+version = "0.0.0"
+edition = "2021"
+description = "The tokio + deadpool counterpart to compio-pool's echo example, for comparison"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/artech-git/compio-pool"
+# A yardstick, not a product. Nothing here is meant to be released.
+publish = false
+
+# Its own workspace root so it never joins the parent crate's build or
+# Cargo.lock; the parent also lists it under `exclude`.
+[workspace]
+
+[dev-dependencies]
+# `rt_tokio_1` arms deadpool's pool-get timeout with the tokio runtime.
+deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "macros",
+    "time",
+] }
