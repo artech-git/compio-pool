@@ -22,3 +22,7 @@ tokio = { version = "1", features = [
     "macros",
     "time",
 ] }
+# `echo_tpc` only: a SO_REUSEPORT listener and core pinning for the
+# thread-per-core tokio control.
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"

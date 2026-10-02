@@ -25,6 +25,8 @@ name = "deadpool-baseline"
 version = "0.0.0"
 dependencies = [
  "deadpool",
+ "libc",
+ "socket2",
  "tokio",
 ]
 
