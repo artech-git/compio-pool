@@ -651,15 +651,22 @@ log "results directory: $OUT"
 
 if (( ! NO_PREFLIGHT )); then
     log "preflight: starting each server once ..."
-    declare -A seen_pf=()
-    IFS=, read -ra all_specs <<<"$SERVERS,compio-pool:2"
-    [[ ,$SERVERS, == *,compio-pool,* ]] || all_specs=(${SERVERS//,/ })
+    declare -A seen_pf=(); all_specs=()
+    for p in "${POINTS[@]}"; do
+        IFS='|' read -ra f <<<"$p"; IFS=, read -ra ss <<<"${f[10]}"
+        for spec in "${ss[@]}"; do [[ -n ${seen_pf[$spec]:-} ]] || { seen_pf[$spec]=1; all_specs+=("$spec"); }; done
+    done
+    seen_pf=()
     for spec in "${all_specs[@]}"; do
         [[ -n ${seen_pf[$spec]:-} ]] && continue; seen_pf[$spec]=1
         run_one preflight p "$spec" 0 1 8 512 "" "" 0 "$NCPU" "" 0
         st=$(fld "$ROW" 11)
         if [[ $st == ok ]]; then log "  $spec: ok ($(fld "$ROW" 12) req/s)"
-        else log "  $spec: FAILED: $st"; die "preflight failed for $spec (compio-pool needs io_uring: /proc/sys/kernel/io_uring_disabled must be 0 and no seccomp filter blocking it)"; fi
+        else
+            log "  $spec: FAILED: $st"
+            hint=""; [[ $spec == compio* ]] && hint=" (compio-pool needs io_uring: /proc/sys/kernel/io_uring_disabled must be 0 and no seccomp filter may block it)"
+            die "preflight failed for $spec: $st$hint"
+        fi
     done
 fi
 
