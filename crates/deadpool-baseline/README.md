@@ -15,6 +15,8 @@ joins the parent crate's build or `Cargo.lock`.
 | `examples/echo.rs` | **tokio default**: one multi-threaded work-stealing runtime, one shared listener, one shared `deadpool` buffer pool | [`examples/echo.rs`](../../examples/echo.rs) |
 | `examples/echo_tpc.rs` | **tokio per-core**, the control: epoll like the above, but one pinned `current_thread` runtime per core, `SO_REUSEPORT`, thread-local buffers, nothing shared | the same architecture as compio-pool, on epoll instead of io_uring |
 | `probe.py` | runs `examples/load.rs` against all three and records CPU time and context switches per request, with `taskset` control over where server and clients run | |
+| `matrix.py` | the comprehensive sweep for a many-core machine: worker scaling, payload, connection count, shared placement, connection churn and the handoff path, NUMA when there is more than one node; writes `results.jsonl` and a Markdown `report.md` | |
+| `run-on-vm.sh` | builds everything (installing Rust into `$HOME` if needed) and runs `matrix.py` | |
 
 ```sh
 cargo build --release --example echo --example load
@@ -31,6 +33,29 @@ python3 crates/deadpool-baseline/probe.py --label split --workers 1 --server-cpu
 
 The CLI and the per-second stats line of `echo` mirror compio-pool's, so `load` measures every
 server unchanged. `echo_tpc` accepts the capacity argument and ignores it.
+
+## Running the full matrix on a bigger machine
+
+**Use the `reuseport-workers` branch.** The repository's default branch, `experimental`, is an
+older design without the examples, and `main` is an empty initial commit, so a plain
+`git clone` gives a checkout none of this runs on (`run-on-vm.sh` refuses it).
+
+```sh
+git clone -b reuseport-workers https://github.com/artech-git/compio-pool
+cd compio-pool
+crates/deadpool-baseline/run-on-vm.sh --dry-run        # the plan, and how long it will take
+nohup crates/deadpool-baseline/run-on-vm.sh > bench.log 2>&1 &   # survives a dropped ssh
+tail -f bench.log                                      # results land in bench-results/<host>-<time>/
+```
+
+`matrix.py` reads the machine's topology and gives the server dedicated physical cores (SMT
+siblings left idle) and the clients every other CPU, so the clients cannot share a core with
+the server: the nearest one machine gets to a remote load generator. Every point is flagged
+**S** (server-bound), **C** (client-bound: the number mostly measures the load generator) or
+**B** (the whole box busy, shared placement), because on any single machine the client costs as
+much per request as the server, and a **C** row is a lower bound. Repeats are interleaved
+across servers so noisy-neighbour drift lands on all of them. `--quick` is a few-minute smoke
+test; `--only scale512,payload` runs part of it; `--report-only DIR` rebuilds the report.
 
 ## What the comparison isolates
 

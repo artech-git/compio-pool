@@ -42,9 +42,11 @@ Linux only; standard library only. Medians of --repeats runs, by req/s.
 import argparse
 import os
 import re
+import resource
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -99,17 +101,25 @@ def sys_stat():
     return cpu, ctxt
 
 
-def one_run(server, port, workers, server_cpus, load_cpus, conns, nbytes, seconds):
-    cmd = [str(SERVERS[server]), f"127.0.0.1:{port}", "1024", str(workers)]
+def one_run(server, port, workers, server_cpus, load_cpus, conns, nbytes, seconds,
+            capacity=1024, load_extra=(), capture_stats=False):
+    """One server, one load run. `capacity` is the per-worker pool size (ignored by echo_tpc),
+    `load_extra` extra `load` flags such as ("--reconnect", "1"), `capture_stats` keeps the
+    server's last stats line (compio-pool's counters, the baseline's pool state)."""
+    cmd = [str(SERVERS[server]), f"127.0.0.1:{port}", str(capacity), str(workers)]
     if server_cpus:
         cmd = ["taskset", "-c", server_cpus] + cmd
-    srv = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    stats_file = tempfile.TemporaryFile("w+") if capture_stats else None
+    errlog = tempfile.TemporaryFile("w+")
+    srv = subprocess.Popen(cmd, stdout=stats_file or subprocess.DEVNULL, stderr=errlog)
     try:
         if not wait_port(port):
-            raise RuntimeError(f"{server} did not start on port {port}")
+            errlog.seek(0)
+            raise RuntimeError(f"{server} did not start on port {port}: "
+                               f"{errlog.read().strip()[-300:] or 'no output'}")
         time.sleep(0.4)
         lcmd = [str(LOAD), f"127.0.0.1:{port}", "--conns", str(conns),
-                "--seconds", str(seconds), "--bytes", str(nbytes)]
+                "--seconds", str(seconds), "--bytes", str(nbytes), *map(str, load_extra)]
         if load_cpus:
             lcmd = ["taskset", "-c", load_cpus] + lcmd
 
@@ -117,19 +127,35 @@ def one_run(server, port, workers, server_cpus, load_cpus, conns, nbytes, second
         v0, i0 = proc_ctx(srv.pid)
         c0, x0 = sys_stat()
         # stderr merged so a flood of "client failed" lines cannot fill a pipe.
+        ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         lp = subprocess.Popen(lcmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        out = lp.stdout.read()
-        _, _, ru = os.wait4(lp.pid, 0)
-        lp.returncode = 0  # reaped by wait4
+        try:
+            out, _ = lp.communicate(timeout=seconds + 30 + conns * 0.02)
+        except subprocess.TimeoutExpired:
+            # load.rs returns from a client that fails to connect *before* its start
+            # barrier, so every other client then waits forever. Past a backlog or
+            # file-descriptor limit that is a hang, not a slow run.
+            lp.kill()
+            lp.communicate()
+            raise RuntimeError(f"load did not finish ({conns} conns): a client most likely failed "
+                               "to connect (listen backlog or fd limit) and the rest are stuck")
+        ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
         u1, s1 = proc_times(srv.pid)
         v1, i1 = proc_ctx(srv.pid)
         c1, x1 = sys_stat()
+        time.sleep(1.1 if capture_stats else 0)  # let the once-a-second stats line catch up
     finally:
         srv.terminate()
         try:
             srv.wait(timeout=3)
         except subprocess.TimeoutExpired:
             srv.kill()
+    stats = ""
+    if stats_file is not None:
+        stats_file.seek(0)
+        lines = [l for l in stats_file.read().splitlines() if l.startswith("active")]
+        stats = lines[-1] if lines else ""
+        stats_file.close()
 
     m = re.search(r"requests (\d+)\s+\((\d+) req/s\)", out)
     if not m:
@@ -146,9 +172,12 @@ def one_run(server, port, workers, server_cpus, load_cpus, conns, nbytes, second
         srv_sys_us=us(s1 - s0) / reqs,
         srv_vol_cs=(v1 - v0) / reqs,
         srv_invol_cs=(i1 - i0) / reqs,
-        cli_us=(ru.ru_utime + ru.ru_stime) * 1e6 / reqs,
+        cli_us=((ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime)) * 1e6 / reqs,
         sys_cs=(x1 - x0) / reqs,
         idle_pct=100.0 * dcpu[3] / total,
+        reqs=reqs,
+        secs=float(re.search(r"seconds (\d+)", out).group(1)),
+        stats=stats,
     )
 
 
