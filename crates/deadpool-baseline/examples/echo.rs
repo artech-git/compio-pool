@@ -124,7 +124,11 @@ fn main() -> io::Result<()> {
         .map(|s| s.parse())
         .transpose()
         .map_err(invalid)?
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)

@@ -49,7 +49,11 @@ fn main() -> io::Result<()> {
         .map(|s| s.parse())
         .transpose()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
 
     println!("tokio thread-per-core echo on {addr} — {workers} workers (epoll, SO_REUSEPORT, no shared state)");
 
@@ -102,10 +106,24 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+/// The CPUs this process may run on, in id order. Reads the affinity mask rather
+/// than assuming ids `0..n`, so it stays correct under `taskset -c 2,3` and
+/// cgroup cpusets, the same way compio-pool's `Workers::Count` does.
 fn core_ids() -> Vec<usize> {
-    // The parent crate already depends on core_affinity; avoid adding a dep here
-    // by reading the online CPU list from std.
-    (0..std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)).collect()
+    // SAFETY: sched_getaffinity fills a zeroed cpu_set_t of the correct size for
+    // the calling thread.
+    let mask = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0)
+            .then_some(set)
+    };
+    match mask {
+        Some(set) => (0..libc::CPU_SETSIZE as usize)
+            // SAFETY: `i` is below CPU_SETSIZE and `set` is initialised.
+            .filter(|&i| unsafe { libc::CPU_ISSET(i, &set) })
+            .collect(),
+        None => (0..std::thread::available_parallelism().map_or(1, |n| n.get())).collect(),
+    }
 }
 
 fn pin(cpu: usize) {
