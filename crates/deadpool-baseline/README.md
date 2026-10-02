@@ -17,6 +17,7 @@ joins the parent crate's build or `Cargo.lock`.
 | `probe.py` | runs `examples/load.rs` against all three and records CPU time and context switches per request, with `taskset` control over where server and clients run | |
 | `matrix.py` | the comprehensive sweep for a many-core machine: worker scaling, payload, connection count, shared placement, connection churn and the handoff path, NUMA when there is more than one node; writes `results.jsonl` and a Markdown `report.md` | |
 | `run-on-vm.sh` | builds everything (installing Rust into `$HOME` if needed) and runs `matrix.py` | |
+| `bench.sh` | the same matrix as one self-contained bash script (no Python): clones and builds the branch itself, runs selectable variations, and writes **one log file** (environment, summary, every raw run as TSV) to upload or share | |
 
 ```sh
 cargo build --release --example echo --example load
@@ -48,7 +49,31 @@ nohup crates/deadpool-baseline/run-on-vm.sh > bench.log 2>&1 &   # survives a dr
 tail -f bench.log                                      # results land in bench-results/<host>-<time>/
 ```
 
-`matrix.py` reads the machine's topology and gives the server dedicated physical cores (SMT
+**`bench.sh` is the simplest way to get a log off a machine.** It needs only bash, awk and
+coreutils, and it fetches and builds the branch itself, so it can be downloaded on its own:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/artech-git/compio-pool/reuseport-workers/crates/deadpool-baseline/bench.sh
+chmod +x bench.sh
+./bench.sh --dry-run                 # the plan and the time estimate
+nohup ./bench.sh > bench.out 2>&1 &  # everything; Ctrl-C or a dropped ssh still writes the log
+```
+
+It prints the path of one `bench-<host>-<time>.log` at the end. Variations are flags, for example:
+
+```sh
+./bench.sh --suites scale512,scale16k --workers "1 2 4 8 16"
+./bench.sh --suites payload,conns --servers tokio-per-core,compio-pool,compio-defer,compio-nocoop
+./bench.sh --suites onecpu                      # server and clients forced onto one CPU
+./bench.sh --suites custom --workers 4 --bytes "512 16384" --conns "64 256" --placement split
+./bench.sh --suites custom --workers 4 --conns 256 --servers compio-pool:1,compio-pool:2,compio-pool
+./bench.sh --quick                              # a few-minute smoke test of everything
+```
+
+`--help` lists them all; `--resume --out DIR` continues an interrupted run. `matrix.py` is the
+Python equivalent with a richer Markdown report.
+
+`matrix.py` and `bench.sh` read the machine's topology and give the server dedicated physical cores (SMT
 siblings left idle) and the clients every other CPU, so the clients cannot share a core with
 the server: the nearest one machine gets to a remote load generator. Every point is flagged
 **S** (server-bound), **C** (client-bound: the number mostly measures the load generator) or

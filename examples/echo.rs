@@ -4,13 +4,17 @@
 //! path can be watched under load.
 //!
 //! ```text
-//! cargo run --release --example echo -- [ADDR] [CAPACITY] [WORKERS] [--incoming-cpu]
-//!   ADDR            bind address        default 0.0.0.0:7000
-//!   CAPACITY        connections/worker  default 1024
-//!   WORKERS         worker count        default: one per core
-//!   --incoming-cpu  set SO_INCOMING_CPU on each listener. Only after
-//!                   scripts/tune-nic.sh has steered the NIC queues; on an
-//!                   untuned host it sends every connection to one worker.
+//! cargo run --release --example echo -- [ADDR] [CAPACITY] [WORKERS] [FLAGS]
+//!   ADDR              bind address        default 0.0.0.0:7000
+//!   CAPACITY          connections/worker  default 1024
+//!   WORKERS           worker count        default: one per core
+//!   --incoming-cpu    set SO_INCOMING_CPU on each listener. Only after
+//!                     scripts/tune-nic.sh has steered the NIC queues; on an
+//!                     untuned host it sends every connection to one worker.
+//!   --defer-taskrun   IORING_SETUP_DEFER_TASKRUN on each ring (Linux 6.1+):
+//!                     completions are processed only when the worker asks.
+//!   --no-coop-taskrun turn off IORING_SETUP_COOP_TASKRUN, which is on by
+//!                     default, to see what it buys.
 //! ```
 //!
 //! Drive it with `examples/load.rs`. A small CAPACITY (say 2) with many
@@ -22,7 +26,7 @@ use compio::{
     BufResult,
     io::{AsyncRead, AsyncWriteExt},
 };
-use compio_pool::{Connection, Resource, Server, Service, WorkerContext, Workers};
+use compio_pool::{Connection, Resource, Server, Service, UringConfig, WorkerContext, Workers};
 
 /// The resource each in-flight connection leases: one read buffer, allocated
 /// on the core that will use it and reused for every connection it serves.
@@ -68,13 +72,20 @@ impl Service for Echo {
 fn main() -> io::Result<()> {
     let (flags, positional): (Vec<String>, Vec<String>) =
         std::env::args().skip(1).partition(|a| a.starts_with("--"));
-    let incoming_cpu = flags.iter().any(|f| f == "--incoming-cpu");
-    if let Some(unknown) = flags.iter().find(|f| *f != "--incoming-cpu") {
+    const KNOWN: [&str; 3] = ["--incoming-cpu", "--defer-taskrun", "--no-coop-taskrun"];
+    if let Some(unknown) = flags.iter().find(|f| !KNOWN.contains(&f.as_str())) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unknown flag {unknown}"),
         ));
     }
+    let has = |name: &str| flags.iter().any(|f| f == name);
+    let incoming_cpu = has("--incoming-cpu");
+    let uring = UringConfig {
+        defer_taskrun: has("--defer-taskrun"),
+        coop_taskrun: !has("--no-coop-taskrun"),
+        ..UringConfig::default()
+    };
     let mut args = positional.into_iter();
     let addr: SocketAddr = args
         .next()
@@ -103,6 +114,7 @@ fn main() -> io::Result<()> {
         .capacity(capacity)
         .handoff_capacity(4096)
         .incoming_cpu(incoming_cpu)
+        .uring(uring.clone())
         .start()?;
 
     println!(
@@ -120,6 +132,9 @@ fn main() -> io::Result<()> {
     }
     if incoming_cpu {
         println!("SO_INCOMING_CPU is on: each listener prefers flows that arrive on its core");
+    }
+    if uring != UringConfig::default() {
+        println!("io_uring setup: {uring:?}");
     }
     println!("tune the NIC for this layout with:");
     println!(

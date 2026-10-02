@@ -232,9 +232,11 @@ connections × payload (512 KiB) as 16 KiB × 32, reach 0.90× and 0.95× of per
 throughput instead of 0.59×, so payload size matters on its own and the threshold is open.
 Hardware counters would be the way to settle it, and `perf` is not available in this container.
 The io_uring setup flags are not the lever, going by a one-off run (16 KiB, 16 connections, one
-CPU) that is not among the committed benchmarks: `defer_taskrun` recovered under half of the gap
-to per-core tokio, and turning `coop_taskrun` or `single_issuer` off made no measurable
-difference.
+CPU) made before the shipped `echo` had flags for them: `defer_taskrun` recovered under half of
+the gap to per-core tokio, and turning `coop_taskrun` or `single_issuer` off made no measurable
+difference. `echo --defer-taskrun` and `--no-coop-taskrun` now reproduce the first two
+(`single_issuer` has no flag), and `bench.sh --suites onecpu --servers
+tokio-per-core,compio-pool,compio-defer,compio-nocoop` runs them in that regime.
 
 For a server with remote clients the relevant regime is the previous subsection. The thing to
 avoid is reading the shared-core 16 KiB row, or any benchmark with a co-resident load generator,
@@ -266,7 +268,7 @@ three repeats).
   measurements find on 16–24 cores is not reproduced here.
 * Hardware counters. The cache explanation for the 16 KiB shared-core result is a hypothesis
   because `perf` is not available where this was measured.
-* `sqpoll`, and `defer_taskrun` beyond the one-off run in the baseline section. The tables use
-  defaults.
+* `sqpoll`, and the `defer_taskrun` and `coop_taskrun` flags beyond the one-off run in the
+  baseline section. The tables use defaults.
 * Anything but echo. The handler is the cheapest possible one so that the server's own cost
   shows.
