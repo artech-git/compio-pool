@@ -102,7 +102,9 @@ count and never blocks on buffers in the no-overflow runs.
 
 ## Results
 
-In [`docs/performance.md`](../../docs/performance.md#baseline-tokio), with the conditions they
-were taken under. Placement matters as much as the server: on a machine where the load generator
+In [`docs/performance.md`](../../docs/performance.md#baseline-tokio) for a 4-vCPU container and
+[for a 16-vCPU cloud VM](../../docs/performance.md#baseline-tokio-on-a-16-vcpu-vm) (raw logs in
+[`docs/results/`](../../docs/results/gcp-epyc-9b45-16vcpu/)), with the conditions they were taken
+under. Placement matters as much as the server: on a machine where the load generator
 shares the server's cores, results differ from a run with the clients kept apart, and
 `probe.py` exists to show which one you are looking at.

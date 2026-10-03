@@ -181,7 +181,9 @@ Two limits. The architecture effect is much smaller here (default to per-core is
 workers, against 1.2-3.0× above): part of what the shared-core table credits to thread-per-core
 is that pinned workers cope better with an oversubscribed box. And two workers cannot show the
 scaling difference that published thread-per-core measurements find on 16-24 cores. This machine
-has no CPUs left for the clients beyond that.
+has no CPUs left for the clients beyond that. [A 16-vCPU VM](#baseline-tokio-on-a-16-vcpu-vm)
+confirms the first limit (default to per-core is 1.02-1.11× there) and reaches four separated
+workers.
 
 ### What happens at 16 KiB when the clients share the core
 
@@ -258,14 +260,169 @@ may stack several onto one listener. compio-pool with 4 connections on 4 workers
 this property; tokio default, with its one shared listener, does not (66k-73k over the same
 three repeats).
 
+## Baseline: tokio on a 16-vCPU VM
+
+The container above has four vCPUs, could separate at most two workers from their clients, and
+spent 10-15 µs of server CPU per request in its split runs where this machine spends 2.1-2.7 µs.
+These rows come from a quiet **Google Cloud VM: AMD EPYC 9B45, 16 vCPUs (8 physical cores × 2 threads), one NUMA node, 1 MiB
+L2 per core, kernel 6.12**, loopback, driven by
+[`bench.sh`](../crates/deadpool-baseline/bench.sh). The raw logs are in
+[`docs/results/gcp-epyc-9b45-16vcpu/`](results/gcp-epyc-9b45-16vcpu/).
+
+Placement is the `split` regime of the container section: the server on W dedicated physical
+cores (their hyperthread siblings idle) and the clients on the remaining cores. The load generator
+costs more CPU per request than the server (at 512 B, 3.0-4.1 µs against 2.1-2.7 µs), so eight
+physical cores leave room for **at most four separated workers**; asking for more is skipped, not
+run unseparated. Quality of the data: 612 runs across six logs with no errors, no failed clients
+and no steal time; repeat spread of 1% or less in most cells (up to ±10% at four connections);
+and a second session seven hours later reproduced the scaling rows to within 2%. The scaling,
+payload and connection rows from 16 connections up are server-bound (99% of the server CPUs
+busy), so they are throughput limits of the servers and not of the load generator.
+
+### Scaling
+
+req/s, split placement, 64 connections for one and two workers and 128 for four (32 per worker,
+at least 64); the last two columns are ratios.
+
+| | tokio default | tokio per-core | compio-pool | per-core ÷ default | compio ÷ per-core |
+|---|---|---|---|---|---|
+| 512 B, 1 worker | 451,630 | 460,882 | 418,787 | 1.02 | 0.91 |
+| 512 B, 2 workers | 859,508 | 948,205 | 865,371 | 1.10 | 0.91 |
+| 512 B, 4 workers | 1,363,151 | 1,507,097 | 1,442,679 | 1.11 | 0.96 |
+| 16 KiB, 1 worker | 274,379 | 275,213 | 284,810 | 1.00 | 1.03 |
+| 16 KiB, 2 workers | 550,510 | 583,746 | 620,494 | 1.06 | 1.06 |
+| 16 KiB, 4 workers | 996,051 | 1,088,320 | 1,064,520 | 1.09 | 0.98 |
+
+* **The architecture is worth 0-11%, growing with workers.** Default to per-core on the same epoll
+  backend is 1.02, 1.10 and 1.11 at 512 B and 1.00, 1.06 and 1.09 at 16 KiB. Tokio's default
+  workers are also not kept busy: at four workers they use 3.7 of 4 CPUs where the pinned designs
+  use 3.9. The 1.2-3.0× of the container's shared-core table was largely a property of an
+  oversubscribed 4-vCPU box, as that section suspected; the size of the effect on 16-24 cores is
+  still unmeasured.
+* **The backend is a small loss at small messages and level at large ones.** Per-core to
+  compio-pool is 0.91-0.96 at 512 B (compio-pool needs 2.3-2.7 µs of server CPU per request
+  against 2.1-2.6) and 1.03, 1.06, 0.98 at 16 KiB. io_uring is not faster than epoll on this
+  workload, which is consistent with the
+  [published](https://www.include.gr/writing/rust-thread-per-core-async.html)
+  [measurements](https://arxiv.org/html/2512.04859) that find no io_uring advantage for simple
+  servers without zero-copy or registered buffers.
+* **compio-pool scales slightly better than the others.** Four workers against one is 3.45×
+  (86% of linear) for compio-pool, 3.27× for per-core tokio and 3.02× for tokio default at
+  512 B; at 16 KiB it is 3.74×, 3.95× and 3.63×. Its absolute deficit shrinks as workers are
+  added (0.91, 0.91 and 0.96 at 512 B), which a larger machine could turn either way.
+* **Against tokio's default model, the actual comparison most people will make,** compio-pool is
+  0.93, 1.01 and 1.06 at 512 B and 1.04, 1.13 and 1.07 at 16 KiB: a modest edge that comes from
+  the architecture and is not attributable to io_uring, since the same architecture on epoll is
+  faster.
+
+### Payload and connections
+
+Four workers, split placement, compio ÷ per-core in brackets. Payload at 128 connections:
+
+| | 64 B | 512 B | 2 KiB | 8 KiB | 16 KiB |
+|---|---|---|---|---|---|
+| tokio default | 1,378,057 | 1,370,130 | 1,312,689 | 1,202,212 | 997,372 |
+| tokio per-core | 1,516,836 | 1,500,863 | 1,452,457 | 1,323,407 | 1,088,332 |
+| compio-pool | 1,450,550 (0.96) | 1,433,999 (0.96) | 1,380,326 (0.95) | 1,274,375 (0.96) | 1,063,295 (0.98) |
+
+Connection count at 512 B:
+
+| | 4 | 16 | 64 | 256 | 1024 |
+|---|---|---|---|---|---|
+| tokio default | 516,946 | 1,211,794 | 1,318,362 | 1,409,189 | 1,433,258 |
+| tokio per-core | 766,124 | 1,349,839 | 1,505,972 | 1,514,200 | 1,474,102 |
+| compio-pool | 751,304 (0.98) | 1,344,670 (1.00) | 1,445,563 (0.96) | 1,440,657 (0.95) | 1,406,786 (0.95) |
+
+* **Payload does not change the picture** up to 16 KiB: compio-pool is 2-5% behind per-core
+  tokio throughout, with CPU per request within 0.2 µs.
+* **Few connections favour the per-core designs most.** At four connections the closed loop is
+  latency-bound (p50 5 µs for per-core and compio-pool, 7 µs for tokio default; the extra 2 µs is
+  consistent with a cross-thread wakeup), which makes tokio default 32% slower than per-core. At four connections
+  the `SO_REUSEPORT` hash also decides how many workers get work: in one session the per-core runs
+  swung by ±9-10%, in another by ±0-2%.
+* **Many connections converge.** At 1024 connections the three are within 5% and compio-pool is
+  2% below tokio default.
+* **The io_uring setup flags are not a throughput lever.** `--defer-taskrun` and
+  `--no-coop-taskrun` are within 1% of the defaults across the payload sweep and from 64
+  connections up. At 16 connections `COOP_TASKRUN` off was 6% slower and `DEFER_TASKRUN` 1.5%
+  slower, so the default is the right one; four connections is too noisy to say.
+
+### Where the clients are not separated
+
+Everything floating (`shared`, 16 vCPUs, up to eight workers), compio ÷ per-core:
+
+| workers | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| 512 B | 0.89 | 0.90 | 0.93 | 0.97 |
+| 16 KiB | 1.00 | 0.95 | 0.98 | 0.94 |
+
+and per-core tokio ahead of tokio default by 2%, 6%, 10% and 14% at 512 B. Eight workers on this
+box is the largest configuration measured anywhere: per-core tokio leads tokio default there by
+14% at 512 B and 11% at 16 KiB, and compio-pool by 10% and 5%.
+
+With server and clients forced onto **one CPU**, the container's 16 KiB effect reproduces in
+miniature. At 16 connections compio-pool is level with per-core tokio up to 8 KiB (0.98-1.00),
+and with 16 KiB it falls to 0.97, 0.98, 0.93, 0.90 and 0.88 at 2, 4, 8, 16 and 32 connections (a
+second session: 0.96, 1.01, 0.96, 0.89, 0.87). The signature is the same: tokio's p50 collapses
+to 5-10 µs (one-request-at-a-time ping-pong) while compio-pool's rises to 96 µs and 197 µs at 16
+and 32 connections. The size is not: 0.88 against 0.59 in the container. The container's
+explanation, that the in-flight working set outgrows L2, would predict an earlier and stronger
+effect on this machine's 1 MiB L2 than on the container's 2 MiB, not a weaker one. The machines
+differ in more than L2, but the explanation does not fit; the mechanism is still unidentified,
+and its practical weight is small.
+
+### Admission control and the handoff path
+
+256 persistent 512 B connections against four workers, split placement. `cap` is the per-worker
+capacity, so cap=2 serves 8 connections at a time and parks the other 248 in the handoff channel:
+
+| | req/s | p50 | p99 | longest wait |
+|---|---|---|---|---|
+| cap=1024 (all 256 served) | 1,427,451 | 174 µs | 209 µs | 1.6 ms |
+| cap=2 (8 served) | 1,368,933 | 5 µs | 10 µs | **4.9 s** |
+| cap=1 (4 served) | 732,224 | 5 µs | 9 µs | **4.9 s** |
+
+Limiting concurrency to 8 keeps 96% of the throughput at 3% of the median latency, which is the
+queueing arithmetic the design relies on, and it is paid for by the parked clients, who wait the
+whole run: the percentiles describe only the connections that were served. With one slot per
+worker each worker waits on a single client, and half the throughput is lost.
+
+Connection churn (a fresh connection per request, 64 connections, four workers) is client-bound
+for the first four columns at about 25k connections/s, the client spending about 300 µs of CPU
+per connection and the server 10-13 µs. cap=1 is slower and not client-bound:
+
+| | tokio default | tokio per-core | compio-pool | cap=2 | cap=1 |
+|---|---|---|---|---|---|
+| conn/s | 23,545 | 25,736 | 25,713 | 25,383 | 21,358 |
+| server µs per connection | 13.3 | 10.1 | 10.7 | 12.2 | 15.5 |
+
+The handoff (about 112,000 of 127,000 connections at cap=2) costs the server 1.5 µs, or 14%, per
+connection at cap=2, which does not show in the connection rate because the client saturates
+first, and 5 µs, or 45%, at cap=1, which does (17% fewer connections per second). The
+client-bound rows are lower bounds on what the servers can do.
+
+### What this adds up to
+
+On a quiet machine, with the clients kept apart and up to four workers, compio-pool is between 7%
+behind and 13% ahead of tokio's default model (45% ahead at four connections, where latency rules)
+and 4-9% behind the same architecture on epoll at small messages. The case for it is not raw echo
+throughput. It is the structure the other measurements show: a per-core pool, admission control
+with a deliberate queue, and a handoff that costs a few microseconds per connection, none of which
+a plain tokio accept loop gives you without building it. What these numbers cannot say is how the
+gap moves beyond four separated workers, with a real NIC, or with registered buffers and zero-copy
+receive, which the [VLDB paper](https://arxiv.org/html/2512.04859) finds are where io_uring's
+advantage comes from.
+
 ## What is not measured
 
 * Real NIC steering (steps 1–4). The VM has one queue. The recipe's cache-locality gain —
   interrupt, accept and I/O on one core — is unmeasured here and is the point of running the
   script on real hardware.
-* More than two pinned workers with the clients on other CPUs. The container has four vCPUs, so
-  the multi-core scaling difference between thread-per-core and work stealing that published
-  measurements find on 16–24 cores is not reproduced here.
+* More than four pinned workers with the clients on other CPUs. The load generator costs more
+  CPU per request than the server, so eight physical cores separate four workers at most; the
+  multi-core scaling difference between thread-per-core and work stealing that published
+  measurements find on 16–24 cores is not reproduced here. A machine with 24 or more physical
+  cores, or a cheaper load generator, is needed.
 * Hardware counters. The cache explanation for the 16 KiB shared-core result is a hypothesis
   because `perf` is not available where this was measured.
 * `sqpoll`, and the `defer_taskrun` and `coop_taskrun` flags beyond the one-off run in the

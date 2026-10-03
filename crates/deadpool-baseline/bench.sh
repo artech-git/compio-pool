@@ -267,6 +267,7 @@ pow2_list() {
 # ------------------------------------------------------------------------------- the plan
 
 POINTS=()
+SKIPPED=()   # points that cannot run on this machine, and why; shown in the plan and the log
 # fields: suite|row|W|conns|bytes|server_cpus|client_cpus|n_client_cpus|box_cpus|extra|servers
 add_point() { POINTS+=("$1|$2|$3|$4|$5|$6|$7|$8|$9|${10}|${11}"); }
 
@@ -277,15 +278,18 @@ add_split() {
     local suite=$1 row=$2 w=$3 conns=$4 bytes=$5 servers=$6 extra=${7:-} first=${8:-0} over=${9:-}
     if [[ -n $SERVER_CPUS ]]; then
         local s=() all; IFS=, read -ra all <<<"$SERVER_CPUS"
-        (( w <= ${#all[@]} )) || return 0
+        (( w <= ${#all[@]} )) || { SKIPPED+=("$suite / $row: W=$w but --server-cpus lists only ${#all[@]} CPUs"); return 0; }
         s=("${all[@]:0:w}")
         local ncli; ncli=$(tr ',' '\n' <<<"$CLIENT_CPUS" | wc -l)
         add_point "$suite" "$row" "$w" "$conns" "$bytes" "$(join_by_comma "${s[@]}")" "$CLIENT_CPUS" "$ncli" 0 "$extra" "$servers"
         return 0
     fi
-    place_split "$w" "$first" || return 0
+    place_split "$w" "$first" || {
+        SKIPPED+=("$suite / $row: W=$w needs $w dedicated server cores plus cores for the clients; this machine has $NCORES physical cores")
+        return 0
+    }
     if [[ -n $over ]]; then P_CLIENTS=$over; P_NCLI=$(tr ',' '\n' <<<"$over" | wc -l); fi
-    (( P_NCLI >= 1 )) || { echo "note: skipping $suite / $row: no CPU left for the clients" >&2; return 0; }
+    (( P_NCLI >= 1 )) || { SKIPPED+=("$suite / $row: W=$w leaves no CPU for the clients ($NCORES physical cores; the server cores' SMT siblings are kept idle)"); return 0; }
     add_point "$suite" "$row" "$w" "$conns" "$bytes" "$P_SERVER" "$P_CLIENTS" "$P_NCLI" 0 "$extra" "$servers"
 }
 add_shared() { add_point "$1" "$2" "$3" "$4" "$5" "" "" 0 "$NCPU" "${7:-}" "$6"; }
@@ -373,7 +377,8 @@ gen_plan() {
             case $PLACEMENT in
                 split) add_split custom "$row" "$w" "$c" "$b" "$SERVERS" "$extra";;
                 shared) add_shared custom "$row" "$w" "$c" "$b" "$SERVERS" "$extra";;
-                onecpu) [[ $w == 1 ]] && add_onecpu custom "$row" "$c" "$b" "$SERVERS" "$extra";;
+                onecpu) if [[ $w == 1 ]]; then add_onecpu custom "$row" "$c" "$b" "$SERVERS" "$extra"
+                        else SKIPPED+=("custom / $row: --placement onecpu runs one worker"); fi;;
             esac
         done; done; done
     fi
@@ -630,6 +635,11 @@ for p in "${POINTS[@]}"; do
     IFS='|' read -ra f <<<"$p"
     printf '  %-9s %-34s %-4s %-6s %-6s %-14.14s %-18.18s %s\n' "${f[0]}" "${f[1]}" "${f[2]}" "${f[3]}" "${f[4]}" "${f[5]:--}" "${f[6]:--}" "${f[10]}"
 done
+if (( ${#SKIPPED[@]} )); then
+    echo "not runnable here, skipped:"
+    printf '  %s\n' "${SKIPPED[@]}"
+    echo "  (--suites shared runs up to $(( NCPU / 2 )) workers with the clients floating over every CPU instead of separated)"
+fi
 (( DRY )) && { FINALIZED=1; exit 0; }
 
 ulimit -n "$(ulimit -Hn)" 2>/dev/null
@@ -648,6 +658,7 @@ if [[ ! -s $OUT/runs.tsv ]]; then printf '%s\n' "$TSV_HEADER" >"$OUT/runs.tsv"; 
 [[ -f $OUT/env.txt ]] && (( RESUME )) || write_env
 log() { echo "$*" | tee -a "$OUT/run.log"; }
 log "results directory: $OUT"
+(( ${#SKIPPED[@]} )) && for i in "${!SKIPPED[@]}"; do log "skipped: ${SKIPPED[i]}"; done
 
 if (( ! NO_PREFLIGHT )); then
     log "preflight: starting each server once ..."

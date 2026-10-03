@@ -1,0 +1,413 @@
+##### bench.sh 1 - upload this file #####
+
+##### ENVIRONMENT #####
+bench.sh version:  1
+date (UTC):        2026-10-03T03:03:10Z
+host:              high-core-machine
+note:              
+command line:      --suites payload,conns --servers tokio-per-core,compio-pool,compio-defer,compio-nocoop
+kernel:            Linux 6.12.107+deb13-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.107-1 (2026-08-29) x86_64
+virtualization:    google
+cpus allowed:      16 (8 physical cores; threads/core 2; NUMA nodes 1)
+max split workers: 4 (client ratio 1.5)
+memory (MiB):      total 62289, available 61058
+io_uring_disabled: 0
+cpu governor:      n/a
+somaxconn:         4096   tcp_tw_reuse: 2   nofile: 524288
+rustc:             rustc 1.99.0 (b940084d7 2026-09-28)
+git:               reuseport-workers@1ffe0be
+cache cpu0:        L1 Data 48K
+cache cpu0:        L1 Instruction 32K
+cache cpu0:        L2 Unified 1024K
+cache cpu0:        L3 Unified 32768K
+vulnerability mitigations (they change syscall cost):
+  gather_data_sampling: Not affected
+  indirect_target_selection: Not affected
+  itlb_multihit: Not affected
+  l1tf: Not affected
+  mds: Not affected
+  meltdown: Not affected
+  mmio_stale_data: Not affected
+  reg_file_data_sampling: Not affected
+  retbleed: Not affected
+  spec_rstack_overflow: Mitigation: IBPB on VMEXIT only
+  spec_store_bypass: Mitigation: Speculative Store Bypass disabled via prctl
+  spectre_v1: Mitigation: usercopy/swapgs barriers and __user pointer sanitization
+  spectre_v2: Mitigation: Enhanced / Automatic IBRS; IBPB: conditional; STIBP: always-on; PBRSB-eIBRS: Not affected; BHI: Not affected
+  srbds: Not affected
+  tsa: Not affected
+  tsx_async_abort: Not affected
+  vmscape: Not affected
+
+--- lscpu ---
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           52 bits physical, 57 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  16
+On-line CPU(s) list:                     0-15
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD EPYC 9B45
+CPU family:                              26
+Model:                                   2
+Thread(s) per core:                      2
+Core(s) per socket:                      8
+Socket(s):                               1
+Stepping:                                1
+BogoMIPS:                                5391.90
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext mwaitx ssbd ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b avx512_vp2intersect flush_l1d
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               384 KiB (8 instances)
+L1i cache:                               256 KiB (8 instances)
+L2 cache:                                8 MiB (8 instances)
+L3 cache:                                32 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-15
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Mitigation; IBPB on VMEXIT only
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+
+##### SUMMARY #####
+Legend: S = server CPUs >=85% busy (server-bound). C = client CPUs >=85% busy (client-bound:
+the number mostly measures the load generator; read it as a lower bound). B = whole box
+>=90% busy (shared / onecpu placement). No flag = neither saturated. '+-N%' is half the
+min-max spread over repeats. Each cell is the median run by req/s.
+
+=== payload ===
+
+median req/s [flag] +-spread
+                              tokio-per-core             compio-pool                compio-defer               compio-nocoop              compio/pc    
+64 B                          1503287 [S] +-0%           1435956 [S] +-0%           1446752 [S] +-0%           1440148 [S] +-0%           0.96x        
+512 B                         1487619 [S] +-0%           1429740 [S] +-0%           1431287 [S] +-0%           1428588 [S] +-0%           0.96x        
+2048 B                        1436666 [S] +-0%           1368299 [S] +-0%           1369034 [S] +-0%           1376457 [S] +-0%           0.95x        
+8192 B                        1315892 [S] +-0%           1255617 [S] +-0%           1259980 [S] +-0%           1254950 [S] +-0%           0.95x        
+16384 B                       1082245 [S] +-0%           1063244 [S] +-0%           1056807 [S] +-0%           1055075 [S] +-0%           0.98x        
+
+p50 / p99 latency, us
+                              tokio-per-core             compio-pool                compio-defer               compio-nocoop              
+64 B                          90 / 111                   89 / 112                   87 / 111                   87 / 117                   
+512 B                         80 / 114                   89 / 107                   89 / 114                   85 / 120                   
+2048 B                        87 / 104                   90 / 118                   88 / 123                   90 / 119                   
+8192 B                        95 / 116                   94 / 140                   103 / 123                  96 / 140                   
+16384 B                       116 / 162                  121 / 143                  121 / 140                  127 / 156                  
+
+CPU us per request: server(user+sys) / client
+                              tokio-per-core             compio-pool                compio-defer               compio-nocoop              
+64 B                          2.6 / 4.0                  2.7 / 3.9                  2.7 / 3.9                  2.7 / 3.9                  
+512 B                         2.6 / 4.1                  2.8 / 3.9                  2.8 / 3.9                  2.8 / 3.9                  
+2048 B                        2.7 / 4.3                  2.9 / 4.2                  2.9 / 4.2                  2.9 / 4.1                  
+8192 B                        3.0 / 4.8                  3.1 / 4.6                  3.1 / 4.6                  3.1 / 4.6                  
+16384 B                       3.6 / 5.7                  3.7 / 5.5                  3.7 / 5.5                  3.7 / 5.5                  
+
+=== conns ===
+
+median req/s [flag] +-spread
+                              tokio-per-core             compio-pool                compio-defer               compio-nocoop              compio/pc    
+4 conns                       752865 +-9%                739932 +-10%               770589 +-0%                496711 +-13%               0.98x        
+16 conns                      1285438 [S] +-2%           1288709 [S] +-1%           1269066 [S] +-5%           1207123 [S] +-0%           1.00x        
+64 conns                      1489679 [S] +-0%           1435278 [S] +-0%           1431746 [S] +-0%           1426152 [S] +-0%           0.96x        
+256 conns                     1507494 [S] +-0%           1429717 [S] +-0%           1428820 [S] +-0%           1430539 [S] +-0%           0.95x        
+1024 conns                    1461768 [S] +-0%           1374819 [S] +-0%           1381884 [S] +-2%           1383017 [S] +-0%           0.94x        
+
+p50 / p99 latency, us
+                              tokio-per-core             compio-pool                compio-defer               compio-nocoop              
+4 conns                       5 / 10                     5 / 10                     5 / 9                      9 / 12                     
+16 conns                      12 / 23                    11 / 24                    13 / 21                    13 / 22                    
+64 conns                      47 / 62                    44 / 58                    48 / 62                    39 / 78                    
+256 conns                     175 / 207                  168 / 222                  168 / 228                  172 / 211                  
+1024 conns                    697 / 750                  710 / 788                  727 / 796                  721 / 778                  
+
+CPU us per request: server(user+sys) / client
+                              tokio-per-core             compio-pool                compio-defer               compio-nocoop              
+4 conns                       2.7 / 2.9                  3.0 / 2.9                  2.9 / 2.8                  3.3 / 3.2                  
+16 conns                      2.7 / 4.0                  2.9 / 4.0                  2.8 / 3.9                  3.2 / 4.2                  
+64 conns                      2.7 / 4.0                  2.8 / 3.9                  2.8 / 3.9                  2.8 / 3.9                  
+256 conns                     2.6 / 4.1                  2.7 / 4.0                  2.7 / 4.0                  2.7 / 4.0                  
+1024 conns                    2.6 / 4.3                  2.8 / 4.2                  2.8 / 4.1                  2.8 / 4.1                  
+
+##### RAW RUNS (TSV, one line per run; the columns are in the header line) #####
+#suite	row	server	repeat	workers	conns	bytes	capacity	server_cpus	client_cpus	status	rps	reqs	p50_us	p90_us	p99_us	p999_us	max_us	srv_user_us_per_req	srv_sys_us_per_req	srv_vol_cs_per_req	srv_invol_cs_per_req	cli_cpu_us_per_req	sys_cs_per_req	idle_pct	failed_clients	srv_cpus_used	cli_cpus_used	flag	steal_pct	server_stats
+payload	64 B	tokio-per-core	1	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1501039	7505194	84.6	96.9	105.8	134.7	447.6	0.305	2.312	0.0000	0.0001	4.015	1.509	35.9	0	3.928	6.027	S	0.00	
+payload	64 B	compio-pool	1	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1433563	7167816	91.4	110.2	119.2	127.9	516.8	0.396	2.337	0.0000	0.0001	3.853	1.601	38.3	0	3.918	5.523	S	0.00	
+payload	64 B	compio-defer	1	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1451336	7256681	88.4	96.2	103.8	112.7	392.4	0.376	2.344	0.0000	0.0001	3.854	1.613	37.7	0	3.948	5.593	S	0.00	
+payload	64 B	compio-nocoop	1	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1446459	7232294	89.4	107.8	117.0	128.0	511.8	0.384	2.348	0.0000	0.0001	3.860	1.611	37.9	0	3.952	5.583	S	0.00	
+payload	64 B	compio-pool	2	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1446625	7233123	96.2	106.0	115.0	131.4	436.2	0.382	2.346	0.0000	0.0001	3.866	1.605	37.7	0	3.946	5.593	S	0.00	
+payload	64 B	compio-defer	2	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1446752	7233759	86.6	102.1	110.6	119.1	418.2	0.364	2.364	0.0000	0.0001	3.859	1.595	37.8	0	3.946	5.583	S	0.00	
+payload	64 B	compio-nocoop	2	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1440148	7200741	86.6	107.6	117.3	138.1	968.9	0.386	2.359	0.0000	0.0001	3.873	1.597	37.8	0	3.954	5.578	S	0.00	
+payload	64 B	tokio-per-core	2	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1503287	7516436	89.6	103.1	111.2	119.5	2026.0	0.319	2.296	0.0000	0.0001	3.995	1.516	35.9	0	3.932	6.006	S	0.00	
+payload	64 B	compio-defer	3	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1441683	7208415	87.5	101.7	110.5	119.3	1074.8	0.372	2.357	0.0000	0.0001	3.862	1.594	38.1	0	3.934	5.567	S	0.00	
+payload	64 B	compio-nocoop	3	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1436339	7181696	87.3	105.5	114.7	125.8	936.7	0.383	2.353	0.0000	0.0001	3.864	1.594	38.2	0	3.930	5.551	S	0.00	
+payload	64 B	tokio-per-core	3	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1511374	7556870	86.1	95.5	103.4	114.5	320.6	0.311	2.309	0.0000	0.0001	4.018	1.509	35.1	0	3.960	6.073	S	0.00	
+payload	64 B	compio-pool	3	4	128	64	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1435956	7179782	88.9	102.9	111.6	119.7	738.1	0.390	2.348	0.0000	0.0001	3.852	1.601	38.3	0	3.932	5.531	S	0.00	
+payload	512 B	tokio-per-core	1	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1496432	7482160	89.4	99.5	107.7	117.0	514.4	0.302	2.339	0.0000	0.0001	4.055	1.511	35.2	0	3.952	6.068	S	0.00	
+payload	512 B	compio-pool	1	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1425295	7126474	91.6	110.3	119.8	146.8	541.5	0.403	2.370	0.0000	0.0001	3.935	1.594	37.8	0	3.952	5.608	S	0.00	
+payload	512 B	compio-defer	1	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1430543	7152713	92.3	102.3	110.2	121.3	640.6	0.387	2.366	0.0000	0.0001	3.922	1.614	37.7	0	3.938	5.611	S	0.00	
+payload	512 B	compio-nocoop	1	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1430428	7152140	87.0	98.6	109.4	140.4	1228.7	0.415	2.348	0.0000	0.0001	3.931	1.611	37.3	0	3.952	5.623	S	0.00	
+payload	512 B	compio-pool	2	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1429740	7148700	88.6	98.7	107.1	115.6	627.2	0.383	2.371	0.0000	0.0001	3.914	1.597	37.8	0	3.938	5.596	S	0.00	
+payload	512 B	compio-defer	2	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1437208	7186041	86.5	100.9	109.9	119.7	3230.4	0.384	2.363	0.0000	0.0001	3.904	1.595	37.6	0	3.948	5.611	S	0.00	
+payload	512 B	compio-nocoop	2	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1428588	7142940	85.4	111.0	120.1	129.1	456.5	0.377	2.383	0.0000	0.0001	3.908	1.606	37.7	0	3.942	5.583	S	0.00	
+payload	512 B	tokio-per-core	2	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1487619	7438097	80.1	104.7	114.3	135.2	349.6	0.294	2.353	0.0000	0.0001	4.069	1.508	35.5	0	3.938	6.053	S	0.00	
+payload	512 B	compio-defer	3	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1431287	7156437	88.6	105.5	114.2	122.8	401.9	0.381	2.375	0.0000	0.0001	3.910	1.594	37.8	0	3.946	5.596	S	0.00	
+payload	512 B	compio-nocoop	3	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1419439	7097196	87.5	103.2	112.2	120.9	1359.5	0.364	2.402	0.0000	0.0001	3.908	1.598	38.0	0	3.926	5.548	S	0.00	
+payload	512 B	tokio-per-core	3	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1479433	7397164	84.7	106.2	116.4	138.6	459.6	0.300	2.350	0.0000	0.0001	4.062	1.515	35.6	0	3.920	6.009	S	0.00	
+payload	512 B	compio-pool	3	4	128	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1432354	7161772	86.6	104.0	113.1	122.5	613.0	0.391	2.368	0.0000	0.0001	3.900	1.598	37.7	0	3.952	5.587	S	0.00	
+payload	2048 B	tokio-per-core	1	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1438342	7191712	95.2	108.0	117.2	143.3	415.9	0.299	2.444	0.0000	0.0001	4.287	1.490	34.8	0	3.946	6.167	S	0.00	
+payload	2048 B	compio-pool	1	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1374613	6873065	90.4	104.9	114.2	124.3	872.6	0.374	2.500	0.0000	0.0001	4.141	1.590	37.2	0	3.950	5.692	S	0.00	
+payload	2048 B	compio-defer	1	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1373267	6866333	91.9	107.5	116.5	127.8	387.7	0.414	2.463	0.0000	0.0001	4.146	1.587	37.1	0	3.950	5.694	S	0.00	
+payload	2048 B	compio-nocoop	1	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1376457	6882285	90.0	109.6	118.7	126.6	395.5	0.382	2.493	0.0000	0.0001	4.137	1.591	37.2	0	3.958	5.694	S	0.00	
+payload	2048 B	compio-pool	2	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1368299	6841493	89.6	108.5	118.5	143.2	428.3	0.387	2.499	0.0000	0.0001	4.169	1.588	37.1	0	3.950	5.704	S	0.00	
+payload	2048 B	compio-defer	2	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1369020	6845099	92.9	103.3	111.7	121.3	587.3	0.400	2.476	0.0000	0.0001	4.146	1.590	37.5	0	3.938	5.677	S	0.00	
+payload	2048 B	compio-nocoop	2	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1380642	6903210	91.3	98.3	106.0	115.4	883.1	0.381	2.483	0.0000	0.0001	4.149	1.608	36.9	0	3.954	5.728	S	0.00	
+payload	2048 B	tokio-per-core	2	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1436666	7183328	87.4	96.0	104.4	115.6	426.8	0.299	2.442	0.0000	0.0001	4.284	1.493	34.8	0	3.938	6.154	S	0.00	
+payload	2048 B	compio-defer	3	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1369034	6845168	87.5	113.6	123.2	135.7	400.1	0.419	2.457	0.0000	0.0001	4.155	1.585	37.3	0	3.938	5.689	S	0.00	
+payload	2048 B	compio-nocoop	3	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1369778	6848891	92.0	104.5	113.2	121.4	385.2	0.388	2.485	0.0000	0.0001	4.132	1.591	37.4	0	3.936	5.660	S	0.00	
+payload	2048 B	tokio-per-core	3	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1424726	7123629	83.6	108.2	118.4	145.2	420.3	0.328	2.436	0.0000	0.0001	4.308	1.502	34.8	0	3.938	6.137	S	0.00	
+payload	2048 B	compio-pool	3	4	128	2048	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1367519	6837597	84.9	132.3	141.6	150.1	359.7	0.401	2.473	0.0000	0.0001	4.139	1.591	37.6	0	3.930	5.660	S	0.00	
+payload	8192 B	tokio-per-core	1	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1319159	6595793	98.4	111.9	121.0	130.2	370.2	0.309	2.687	0.0000	0.0001	4.812	1.465	33.8	0	3.952	6.348	S	0.00	
+payload	8192 B	compio-pool	1	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1255617	6278083	93.9	129.9	139.9	153.1	913.1	0.371	2.764	0.0000	0.0001	4.632	1.571	36.5	0	3.936	5.817	S	0.00	
+payload	8192 B	compio-defer	1	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1263650	6318251	100.1	109.1	118.2	135.6	701.6	0.410	2.711	0.0000	0.0001	4.629	1.573	36.4	0	3.944	5.849	S	0.00	
+payload	8192 B	compio-nocoop	1	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1254950	6274750	96.5	130.4	139.8	149.7	836.8	0.397	2.735	0.0000	0.0001	4.619	1.574	36.7	0	3.930	5.796	S	0.00	
+payload	8192 B	compio-pool	2	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1254846	6274232	100.5	115.0	123.6	133.7	554.8	0.390	2.740	0.0000	0.0001	4.631	1.581	36.7	0	3.928	5.811	S	0.00	
+payload	8192 B	compio-defer	2	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1258883	6294413	98.5	123.5	134.5	158.8	800.8	0.399	2.737	0.0000	0.0001	4.653	1.564	36.2	0	3.948	5.858	S	0.00	
+payload	8192 B	compio-nocoop	2	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1253718	6268588	99.9	120.0	130.1	140.9	523.9	0.399	2.728	0.0000	0.0001	4.624	1.570	36.7	0	3.920	5.797	S	0.00	
+payload	8192 B	tokio-per-core	2	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1299499	6497497	95.6	106.4	118.4	154.3	876.8	0.343	2.664	0.0000	0.0001	4.821	1.469	34.5	0	3.908	6.265	S	0.00	
+payload	8192 B	compio-defer	3	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1259980	6299900	103.2	114.1	123.4	133.1	473.5	0.381	2.732	0.0000	0.0001	4.623	1.569	36.4	0	3.922	5.825	S	0.00	
+payload	8192 B	compio-nocoop	3	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1256037	6280187	98.7	115.0	124.4	135.5	1111.3	0.428	2.691	0.0000	0.0001	4.620	1.580	36.6	0	3.918	5.803	S	0.00	
+payload	8192 B	tokio-per-core	3	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1315892	6579461	94.9	105.9	116.0	137.1	573.4	0.290	2.692	0.0000	0.0001	4.800	1.458	34.2	0	3.924	6.316	S	0.00	
+payload	8192 B	compio-pool	3	4	128	8192	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1257947	6289736	95.5	129.7	140.1	151.9	404.9	0.399	2.730	0.0000	0.0001	4.623	1.571	36.5	0	3.936	5.815	S	0.00	
+payload	16384 B	tokio-per-core	1	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1082245	5411225	115.7	151.1	161.9	172.4	507.6	0.407	3.232	0.0000	0.0001	5.726	1.557	34.9	0	3.938	6.196	S	0.00	
+payload	16384 B	compio-pool	1	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1070931	5354653	134.1	146.5	157.7	176.9	566.5	0.437	3.251	0.0000	0.0001	5.466	1.592	36.7	0	3.950	5.854	S	0.00	
+payload	16384 B	compio-defer	1	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1060849	5304246	119.7	144.1	155.2	178.6	410.0	0.430	3.280	0.0000	0.0001	5.467	1.598	37.2	0	3.936	5.799	S	0.00	
+payload	16384 B	compio-nocoop	1	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1053871	5269357	116.4	144.8	155.2	169.0	940.5	0.419	3.312	0.0000	0.0001	5.445	1.618	37.4	0	3.932	5.738	S	0.00	
+payload	16384 B	compio-pool	2	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1051855	5259273	120.8	133.5	146.2	173.1	785.7	0.420	3.310	0.0000	0.0001	5.480	1.600	37.2	0	3.924	5.764	S	0.00	
+payload	16384 B	compio-defer	2	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1056807	5284033	121.0	130.8	140.5	155.7	492.2	0.454	3.253	0.0000	0.0001	5.487	1.621	36.8	0	3.918	5.799	S	0.00	
+payload	16384 B	compio-nocoop	2	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1055075	5275373	126.9	145.2	156.5	170.1	2874.1	0.440	3.291	0.0000	0.0001	5.471	1.600	37.2	0	3.936	5.772	S	0.00	
+payload	16384 B	tokio-per-core	2	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1077009	5385043	123.7	132.5	141.8	153.9	713.7	0.401	3.248	0.0000	0.0001	5.721	1.570	35.2	0	3.930	6.161	S	0.00	
+payload	16384 B	compio-defer	3	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1053456	5267281	119.9	130.5	142.0	173.4	527.9	0.440	3.292	0.0000	0.0001	5.502	1.609	37.0	0	3.932	5.797	S	0.00	
+payload	16384 B	compio-nocoop	3	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1058027	5290137	112.5	152.0	163.2	173.4	584.4	0.456	3.280	0.0000	0.0001	5.465	1.617	37.3	0	3.952	5.782	S	0.00	
+payload	16384 B	tokio-per-core	3	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1089087	5445433	118.2	135.5	146.1	156.6	819.8	0.382	3.234	0.0000	0.0001	5.730	1.544	34.7	0	3.938	6.241	S	0.00	
+payload	16384 B	compio-pool	3	4	128	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1063244	5316221	120.7	132.0	142.7	161.7	647.6	0.448	3.271	0.0000	0.0001	5.451	1.604	36.9	0	3.954	5.796	S	0.00	
+conns	4 conns	tokio-per-core	1	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	792686	3963431	4.7	5.7	9.6	11.4	900.6	0.664	2.061	0.5533	0.0002	2.673	3.108	73.8	0	2.160	2.119		0.00	
+conns	4 conns	compio-pool	1	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	739932	3699661	5.2	5.9	9.5	12.0	496.2	0.724	2.287	0.5258	0.0002	2.934	3.053	62.9	0	2.228	2.171		0.00	
+conns	4 conns	compio-defer	1	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	770589	3852946	4.9	5.7	8.9	11.9	523.7	0.719	2.201	0.5197	0.0002	2.757	3.041	62.8	0	2.250	2.124		0.00	
+conns	4 conns	compio-nocoop	1	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	496711	2483554	9.2	10.6	12.5	16.6	431.9	0.689	2.621	0.3931	0.0001	3.212	2.788	65.7	0	1.644	1.595		0.00	
+conns	4 conns	compio-pool	2	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	750851	3754257	5.2	5.7	9.1	11.8	62.0	0.698	2.256	0.5057	0.0002	2.918	3.013	62.2	0	2.218	2.191		0.00	
+conns	4 conns	compio-defer	2	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	765024	3825122	4.9	5.5	9.8	11.6	269.9	0.643	1.901	0.0346	0.0002	2.873	2.071	61.1	0	1.946	2.198		0.00	
+conns	4 conns	compio-nocoop	2	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	491365	2456827	9.3	10.6	12.3	16.3	80.9	0.611	2.695	0.3837	0.0001	3.263	2.770	65.5	0	1.624	1.603		0.00	
+conns	4 conns	tokio-per-core	2	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	752865	3764325	4.6	6.3	9.9	11.6	58.2	0.656	2.056	0.6233	0.0002	2.886	3.248	73.9	0	2.042	2.173		0.00	
+conns	4 conns	compio-defer	3	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	772968	3864842	4.9	5.7	9.2	11.4	100.1	0.727	2.197	0.5159	0.0002	2.780	3.033	62.8	0	2.260	2.149		0.00	
+conns	4 conns	compio-nocoop	3	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	626847	3134233	5.7	8.3	10.9	14.1	416.6	0.794	2.674	0.6889	0.0002	3.177	3.380	63.6	0	2.174	1.991		0.00	
+conns	4 conns	tokio-per-core	3	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	646839	3234193	6.5	7.1	8.0	12.9	67.4	0.569	1.898	0.3236	0.0001	2.942	2.649	78.3	0	1.596	1.903		0.00	
+conns	4 conns	compio-pool	3	4	4	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	598076	2990382	6.9	7.5	8.8	15.3	544.4	0.642	2.083	0.3149	0.0001	3.030	2.632	63.8	0	1.630	1.812		0.00	
+conns	16 conns	tokio-per-core	1	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1285438	6427188	12.1	18.1	22.7	27.0	218.1	0.457	2.220	0.1774	0.0001	4.027	2.201	44.4	0	3.442	5.176	S	0.00	
+conns	16 conns	compio-pool	1	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1320382	6601912	10.1	19.3	24.5	29.4	5274.0	0.501	2.411	0.0516	0.0002	4.047	1.872	40.0	0	3.846	5.344	S	0.00	
+conns	16 conns	compio-defer	1	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1365210	6826051	11.2	15.6	20.9	27.6	616.8	0.489	2.385	0.0231	0.0002	4.019	1.783	38.5	0	3.924	5.487	S	0.00	
+conns	16 conns	compio-nocoop	1	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1208533	6042666	12.9	16.8	21.5	26.1	534.6	0.518	2.668	0.0560	0.0002	4.171	1.992	42.0	0	3.850	5.041	S	0.00	
+conns	16 conns	compio-pool	2	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1288709	6443543	10.8	19.3	24.3	28.7	532.5	0.539	2.354	0.0890	0.0002	4.003	1.999	41.2	0	3.728	5.159	S	0.00	
+conns	16 conns	compio-defer	2	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1236761	6183806	9.3	23.5	28.1	32.3	200.4	0.548	2.296	0.1666	0.0002	3.956	2.206	43.7	0	3.518	4.893	S	0.00	
+conns	16 conns	compio-nocoop	2	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1204329	6021646	12.9	16.8	21.6	26.8	284.6	0.518	2.680	0.0556	0.0002	4.185	1.991	41.7	0	3.852	5.040	S	0.00	
+conns	16 conns	tokio-per-core	2	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1328327	6641636	12.1	16.7	21.4	26.1	892.8	0.473	2.254	0.1125	0.0002	4.040	2.017	41.8	0	3.622	5.367	S	0.00	
+conns	16 conns	compio-defer	3	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1269066	6345329	12.6	16.6	21.0	25.4	1169.9	0.509	2.250	0.1110	0.0001	3.894	2.111	42.6	0	3.502	4.942	S	0.00	
+conns	16 conns	compio-nocoop	3	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1207123	6035617	12.9	16.8	21.6	26.7	882.8	0.469	2.719	0.0558	0.0002	4.178	1.990	41.7	0	3.848	5.043	S	0.00	
+conns	16 conns	tokio-per-core	3	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1256272	6281359	9.6	22.2	26.7	31.0	3564.0	0.484	2.202	0.2076	0.0002	4.029	2.282	45.6	0	3.374	5.061		0.00	
+conns	16 conns	compio-pool	3	4	16	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1287959	6439797	10.9	19.1	24.0	28.6	961.4	0.530	2.365	0.0880	0.0002	4.003	1.998	41.1	0	3.728	5.156	S	0.00	
+conns	64 conns	tokio-per-core	1	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1493988	7469939	42.5	51.5	59.1	91.3	603.7	0.305	2.357	0.0000	0.0001	4.034	1.539	35.3	0	3.978	6.026	S	0.00	
+conns	64 conns	compio-pool	1	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1435278	7176391	43.6	51.3	58.1	64.8	2588.1	0.385	2.381	0.0000	0.0001	3.887	1.656	37.7	0	3.970	5.578	S	0.00	
+conns	64 conns	compio-defer	1	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1431746	7158731	48.4	55.4	61.9	68.5	995.6	0.402	2.364	0.0000	0.0001	3.897	1.661	37.5	0	3.960	5.579	S	0.00	
+conns	64 conns	compio-nocoop	1	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1424603	7123017	43.3	59.4	67.0	75.6	702.2	0.397	2.377	0.0000	0.0001	3.896	1.653	37.9	0	3.952	5.550	S	0.00	
+conns	64 conns	compio-pool	2	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1435336	7176681	43.7	51.2	58.5	83.4	337.9	0.401	2.369	0.0000	0.0001	3.901	1.654	37.4	0	3.976	5.599	S	0.00	
+conns	64 conns	compio-defer	2	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1436306	7181529	44.8	52.7	59.3	66.1	706.1	0.404	2.367	0.0000	0.0001	3.918	1.651	37.4	0	3.980	5.627	S	0.00	
+conns	64 conns	compio-nocoop	2	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1426152	7130759	39.4	69.5	78.1	96.1	1560.1	0.394	2.391	0.0000	0.0001	3.914	1.651	37.7	0	3.972	5.582	S	0.00	
+conns	64 conns	tokio-per-core	2	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1489679	7448395	47.0	55.1	62.2	69.1	702.5	0.291	2.371	0.0000	0.0001	4.023	1.546	35.5	0	3.966	5.993	S	0.00	
+conns	64 conns	compio-defer	3	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1431157	7155785	41.4	61.3	69.1	85.8	1091.2	0.412	2.355	0.0000	0.0001	3.898	1.650	37.5	0	3.960	5.578	S	0.00	
+conns	64 conns	compio-nocoop	3	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1439221	7196104	44.0	50.2	56.7	63.3	647.1	0.406	2.355	0.0000	0.0001	3.897	1.658	37.4	0	3.974	5.608	S	0.00	
+conns	64 conns	tokio-per-core	3	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1480429	7402146	43.7	57.1	64.7	71.6	1582.0	0.343	2.339	0.0000	0.0001	4.024	1.561	36.0	0	3.970	5.957	S	0.00	
+conns	64 conns	compio-pool	3	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1435041	7175206	39.1	64.6	72.3	79.4	941.8	0.387	2.380	0.0000	0.0001	3.897	1.653	37.6	0	3.972	5.593	S	0.00	
+conns	256 conns	tokio-per-core	1	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1520281	7601405	161.2	202.2	214.7	226.2	766.7	0.272	2.319	0.0000	0.0001	4.118	1.438	34.6	0	3.940	6.261	S	0.00	
+conns	256 conns	compio-pool	1	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1417398	7086990	176.4	204.2	219.2	245.0	913.9	0.374	2.382	0.0000	0.0001	3.989	1.563	37.4	0	3.906	5.655	S	0.00	
+conns	256 conns	compio-defer	1	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1426712	7133559	174.2	191.0	205.1	233.7	826.2	0.380	2.356	0.0000	0.0001	3.976	1.586	37.4	0	3.904	5.673	S	0.00	
+conns	256 conns	compio-nocoop	1	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1428450	7142251	174.1	205.7	221.7	264.3	1125.3	0.388	2.363	0.0000	0.0001	3.980	1.561	37.1	0	3.930	5.685	S	0.00	
+conns	256 conns	compio-pool	2	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1429717	7148583	168.5	207.6	222.2	234.3	872.3	0.387	2.349	0.0000	0.0001	3.975	1.575	37.2	0	3.912	5.683	S	0.00	
+conns	256 conns	compio-defer	2	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1429169	7145844	177.0	197.5	213.9	234.7	4702.9	0.364	2.383	0.0000	0.0001	3.973	1.568	37.3	0	3.926	5.678	S	0.00	
+conns	256 conns	compio-nocoop	2	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1433563	7167816	172.4	196.1	212.2	232.9	578.4	0.403	2.337	0.0000	0.0001	3.975	1.579	37.6	0	3.928	5.698	S	0.00	
+conns	256 conns	tokio-per-core	2	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1496678	7483388	169.4	180.9	193.2	234.8	16244.2	0.286	2.318	0.0000	0.0001	4.140	1.441	35.3	0	3.898	6.196	S	0.00	
+conns	256 conns	compio-defer	3	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1428820	7144102	168.3	214.2	228.3	242.9	4692.4	0.402	2.338	0.0000	0.0001	3.961	1.555	37.6	0	3.914	5.660	S	0.00	
+conns	256 conns	compio-nocoop	3	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1430539	7152697	171.7	194.8	211.0	223.2	1130.0	0.377	2.354	0.0000	0.0001	3.975	1.588	37.2	0	3.908	5.686	S	0.00	
+conns	256 conns	tokio-per-core	3	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1507494	7537471	175.0	195.9	207.0	234.6	783.3	0.305	2.297	0.0000	0.0001	4.129	1.443	34.8	0	3.922	6.224	S	0.00	
+conns	256 conns	compio-pool	3	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1432980	7164902	172.8	202.9	217.5	231.9	561.8	0.385	2.360	0.0000	0.0001	3.973	1.570	37.5	0	3.934	5.694	S	0.00	
+conns	1024 conns	tokio-per-core	1	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1467468	7337342	684.0	712.7	736.2	826.2	2480.0	0.324	2.331	0.0001	0.0001	4.297	1.421	35.0	0	3.896	6.305	S	0.00	
+conns	1024 conns	compio-pool	1	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1389229	6946145	710.2	755.3	779.8	866.0	2734.3	0.410	2.381	0.0001	0.0001	4.143	1.557	37.5	0	3.878	5.756	S	0.00	
+conns	1024 conns	compio-defer	1	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1381884	6909418	727.4	769.2	795.6	937.5	1620.4	0.420	2.358	0.0001	0.0001	4.138	1.560	37.7	0	3.838	5.718	S	0.00	
+conns	1024 conns	compio-nocoop	1	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1383017	6915084	721.2	750.4	778.1	888.5	5934.7	0.411	2.383	0.0001	0.0001	4.143	1.520	37.7	0	3.864	5.729	S	0.00	
+conns	1024 conns	compio-pool	2	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1374258	6871290	706.7	774.1	804.1	979.4	17583.2	0.406	2.388	0.0001	0.0001	4.172	1.526	37.8	0	3.840	5.734	S	0.00	
+conns	1024 conns	compio-defer	2	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1404004	7020019	719.9	791.2	821.6	872.5	8945.0	0.397	2.382	0.0001	0.0001	4.109	1.521	37.4	0	3.902	5.769	S	0.00	
+conns	1024 conns	compio-nocoop	2	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1379315	6896574	714.2	745.6	770.5	919.3	2660.5	0.397	2.401	0.0001	0.0001	4.170	1.549	37.6	0	3.860	5.752	S	0.00	
+conns	1024 conns	tokio-per-core	2	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1461768	7308841	697.2	726.4	750.0	914.7	16481.0	0.319	2.330	0.0001	0.0001	4.311	1.410	35.3	0	3.872	6.302	S	0.00	
+conns	1024 conns	compio-defer	3	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1344923	6724616	712.5	757.6	1007.7	1152.7	13214.4	0.440	2.419	0.0000	0.0001	4.187	1.551	35.7	0	3.846	5.632	S	0.00	
+conns	1024 conns	compio-nocoop	3	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1391019	6955094	688.1	822.6	851.6	903.2	1183.2	0.403	2.380	0.0000	0.0001	4.162	1.546	37.3	0	3.870	5.789	S	0.00	
+conns	1024 conns	tokio-per-core	3	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1440401	7202004	689.9	722.1	765.9	969.0	16505.9	0.325	2.347	0.0001	0.0001	4.333	1.421	35.4	0	3.848	6.241	S	0.00	
+conns	1024 conns	compio-pool	3	4	1024	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1374819	6874095	709.5	761.1	787.7	868.2	2090.1	0.418	2.381	0.0001	0.0001	4.173	1.541	37.7	0	3.848	5.737	S	0.00	
+
+##### PROGRESS LOG #####
+results directory: ~/bench-results/high-core-machine-20261003T030310Z
+preflight: starting each server once ...
+  tokio-per-core: ok (430139 req/s)
+  compio-pool: ok (418271 req/s)
+  compio-defer: ok (411326 req/s)
+  compio-nocoop: ok (415927 req/s)
+[1/10] payload / 64 B   W=4 conns=128 bytes=64 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-per-core  1501039 req/s  p50 84.6us  p99 105.8us  S
+    run 1  compio-pool  1433563 req/s  p50 91.4us  p99 119.2us  S
+    run 1  compio-defer  1451336 req/s  p50 88.4us  p99 103.8us  S
+    run 1  compio-nocoop  1446459 req/s  p50 89.4us  p99 117.0us  S
+    run 2  compio-pool  1446625 req/s  p50 96.2us  p99 115.0us  S
+    run 2  compio-defer  1446752 req/s  p50 86.6us  p99 110.6us  S
+    run 2  compio-nocoop  1440148 req/s  p50 86.6us  p99 117.3us  S
+    run 2  tokio-per-core  1503287 req/s  p50 89.6us  p99 111.2us  S
+    run 3  compio-defer  1441683 req/s  p50 87.5us  p99 110.5us  S
+    run 3  compio-nocoop  1436339 req/s  p50 87.3us  p99 114.7us  S
+    run 3  tokio-per-core  1511374 req/s  p50 86.1us  p99 103.4us  S
+    run 3  compio-pool  1435956 req/s  p50 88.9us  p99 111.6us  S
+    point done; 1 min elapsed, about 11 min left
+[2/10] payload / 512 B   W=4 conns=128 bytes=512 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-per-core  1496432 req/s  p50 89.4us  p99 107.7us  S
+    run 1  compio-pool  1425295 req/s  p50 91.6us  p99 119.8us  S
+    run 1  compio-defer  1430543 req/s  p50 92.3us  p99 110.2us  S
+    run 1  compio-nocoop  1430428 req/s  p50 87.0us  p99 109.4us  S
+    run 2  compio-pool  1429740 req/s  p50 88.6us  p99 107.1us  S
+    run 2  compio-defer  1437208 req/s  p50 86.5us  p99 109.9us  S
+    run 2  compio-nocoop  1428588 req/s  p50 85.4us  p99 120.1us  S
+    run 2  tokio-per-core  1487619 req/s  p50 80.1us  p99 114.3us  S
+    run 3  compio-defer  1431287 req/s  p50 88.6us  p99 114.2us  S
+    run 3  compio-nocoop  1419439 req/s  p50 87.5us  p99 112.2us  S
+    run 3  tokio-per-core  1479433 req/s  p50 84.7us  p99 116.4us  S
+    run 3  compio-pool  1432354 req/s  p50 86.6us  p99 113.1us  S
+    point done; 2 min elapsed, about 10 min left
+[3/10] payload / 2048 B   W=4 conns=128 bytes=2048 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-per-core  1438342 req/s  p50 95.2us  p99 117.2us  S
+    run 1  compio-pool  1374613 req/s  p50 90.4us  p99 114.2us  S
+    run 1  compio-defer  1373267 req/s  p50 91.9us  p99 116.5us  S
+    run 1  compio-nocoop  1376457 req/s  p50 90.0us  p99 118.7us  S
+    run 2  compio-pool  1368299 req/s  p50 89.6us  p99 118.5us  S
+    run 2  compio-defer  1369020 req/s  p50 92.9us  p99 111.7us  S
+    run 2  compio-nocoop  1380642 req/s  p50 91.3us  p99 106.0us  S
+    run 2  tokio-per-core  1436666 req/s  p50 87.4us  p99 104.4us  S
+    run 3  compio-defer  1369034 req/s  p50 87.5us  p99 123.2us  S
+    run 3  compio-nocoop  1369778 req/s  p50 92.0us  p99 113.2us  S
+    run 3  tokio-per-core  1424726 req/s  p50 83.6us  p99 118.4us  S
+    run 3  compio-pool  1367519 req/s  p50 84.9us  p99 141.6us  S
+    point done; 3 min elapsed, about 8 min left
+[4/10] payload / 8192 B   W=4 conns=128 bytes=8192 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-per-core  1319159 req/s  p50 98.4us  p99 121.0us  S
+    run 1  compio-pool  1255617 req/s  p50 93.9us  p99 139.9us  S
+    run 1  compio-defer  1263650 req/s  p50 100.1us  p99 118.2us  S
+    run 1  compio-nocoop  1254950 req/s  p50 96.5us  p99 139.8us  S
+    run 2  compio-pool  1254846 req/s  p50 100.5us  p99 123.6us  S
+    run 2  compio-defer  1258883 req/s  p50 98.5us  p99 134.5us  S
+    run 2  compio-nocoop  1253718 req/s  p50 99.9us  p99 130.1us  S
+    run 2  tokio-per-core  1299499 req/s  p50 95.6us  p99 118.4us  S
+    run 3  compio-defer  1259980 req/s  p50 103.2us  p99 123.4us  S
+    run 3  compio-nocoop  1256037 req/s  p50 98.7us  p99 124.4us  S
+    run 3  tokio-per-core  1315892 req/s  p50 94.9us  p99 116.0us  S
+    run 3  compio-pool  1257947 req/s  p50 95.5us  p99 140.1us  S
+    point done; 5 min elapsed, about 7 min left
+[5/10] payload / 16384 B   W=4 conns=128 bytes=16384 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-per-core  1082245 req/s  p50 115.7us  p99 161.9us  S
+    run 1  compio-pool  1070931 req/s  p50 134.1us  p99 157.7us  S
+    run 1  compio-defer  1060849 req/s  p50 119.7us  p99 155.2us  S
+    run 1  compio-nocoop  1053871 req/s  p50 116.4us  p99 155.2us  S
+    run 2  compio-pool  1051855 req/s  p50 120.8us  p99 146.2us  S
+    run 2  compio-defer  1056807 req/s  p50 121.0us  p99 140.5us  S
+    run 2  compio-nocoop  1055075 req/s  p50 126.9us  p99 156.5us  S
+    run 2  tokio-per-core  1077009 req/s  p50 123.7us  p99 141.8us  S
+    run 3  compio-defer  1053456 req/s  p50 119.9us  p99 142.0us  S
+    run 3  compio-nocoop  1058027 req/s  p50 112.5us  p99 163.2us  S
+    run 3  tokio-per-core  1089087 req/s  p50 118.2us  p99 146.1us  S
+    run 3  compio-pool  1063244 req/s  p50 120.7us  p99 142.7us  S
+    point done; 6 min elapsed, about 6 min left
+[6/10] conns / 4 conns   W=4 conns=4 bytes=512 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-per-core  792686 req/s  p50 4.7us  p99 9.6us  
+    run 1  compio-pool  739932 req/s  p50 5.2us  p99 9.5us  
+    run 1  compio-defer  770589 req/s  p50 4.9us  p99 8.9us  
+    run 1  compio-nocoop  496711 req/s  p50 9.2us  p99 12.5us  
+    run 2  compio-pool  750851 req/s  p50 5.2us  p99 9.1us  
+    run 2  compio-defer  765024 req/s  p50 4.9us  p99 9.8us  
+    run 2  compio-nocoop  491365 req/s  p50 9.3us  p99 12.3us  
+    run 2  tokio-per-core  752865 req/s  p50 4.6us  p99 9.9us  
+    run 3  compio-defer  772968 req/s  p50 4.9us  p99 9.2us  
+    run 3  compio-nocoop  626847 req/s  p50 5.7us  p99 10.9us  
+    run 3  tokio-per-core  646839 req/s  p50 6.5us  p99 8.0us  
+    run 3  compio-pool  598076 req/s  p50 6.9us  p99 8.8us  
+    point done; 7 min elapsed, about 5 min left
+[7/10] conns / 16 conns   W=4 conns=16 bytes=512 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-per-core  1285438 req/s  p50 12.1us  p99 22.7us  S
+    run 1  compio-pool  1320382 req/s  p50 10.1us  p99 24.5us  S
+    run 1  compio-defer  1365210 req/s  p50 11.2us  p99 20.9us  S
+    run 1  compio-nocoop  1208533 req/s  p50 12.9us  p99 21.5us  S
+    run 2  compio-pool  1288709 req/s  p50 10.8us  p99 24.3us  S
+    run 2  compio-defer  1236761 req/s  p50 9.3us  p99 28.1us  S
+    run 2  compio-nocoop  1204329 req/s  p50 12.9us  p99 21.6us  S
+    run 2  tokio-per-core  1328327 req/s  p50 12.1us  p99 21.4us  S
+    run 3  compio-defer  1269066 req/s  p50 12.6us  p99 21.0us  S
+    run 3  compio-nocoop  1207123 req/s  p50 12.9us  p99 21.6us  S
+    run 3  tokio-per-core  1256272 req/s  p50 9.6us  p99 26.7us  
+    run 3  compio-pool  1287959 req/s  p50 10.9us  p99 24.0us  S
+    point done; 8 min elapsed, about 3 min left
+[8/10] conns / 64 conns   W=4 conns=64 bytes=512 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-per-core  1493988 req/s  p50 42.5us  p99 59.1us  S
+    run 1  compio-pool  1435278 req/s  p50 43.6us  p99 58.1us  S
+    run 1  compio-defer  1431746 req/s  p50 48.4us  p99 61.9us  S
+    run 1  compio-nocoop  1424603 req/s  p50 43.3us  p99 67.0us  S
+    run 2  compio-pool  1435336 req/s  p50 43.7us  p99 58.5us  S
+    run 2  compio-defer  1436306 req/s  p50 44.8us  p99 59.3us  S
+    run 2  compio-nocoop  1426152 req/s  p50 39.4us  p99 78.1us  S
+    run 2  tokio-per-core  1489679 req/s  p50 47.0us  p99 62.2us  S
+    run 3  compio-defer  1431157 req/s  p50 41.4us  p99 69.1us  S
+    run 3  compio-nocoop  1439221 req/s  p50 44.0us  p99 56.7us  S
+    run 3  tokio-per-core  1480429 req/s  p50 43.7us  p99 64.7us  S
+    run 3  compio-pool  1435041 req/s  p50 39.1us  p99 72.3us  S
+    point done; 10 min elapsed, about 2 min left
+[9/10] conns / 256 conns   W=4 conns=256 bytes=512 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-per-core  1520281 req/s  p50 161.2us  p99 214.7us  S
+    run 1  compio-pool  1417398 req/s  p50 176.4us  p99 219.2us  S
+    run 1  compio-defer  1426712 req/s  p50 174.2us  p99 205.1us  S
+    run 1  compio-nocoop  1428450 req/s  p50 174.1us  p99 221.7us  S
+    run 2  compio-pool  1429717 req/s  p50 168.5us  p99 222.2us  S
+    run 2  compio-defer  1429169 req/s  p50 177.0us  p99 213.9us  S
+    run 2  compio-nocoop  1433563 req/s  p50 172.4us  p99 212.2us  S
+    run 2  tokio-per-core  1496678 req/s  p50 169.4us  p99 193.2us  S
+    run 3  compio-defer  1428820 req/s  p50 168.3us  p99 228.3us  S
+    run 3  compio-nocoop  1430539 req/s  p50 171.7us  p99 211.0us  S
+    run 3  tokio-per-core  1507494 req/s  p50 175.0us  p99 207.0us  S
+    run 3  compio-pool  1432980 req/s  p50 172.8us  p99 217.5us  S
+    point done; 11 min elapsed, about 1 min left
+[10/10] conns / 1024 conns   W=4 conns=1024 bytes=512 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-per-core  1467468 req/s  p50 684.0us  p99 736.2us  S
+    run 1  compio-pool  1389229 req/s  p50 710.2us  p99 779.8us  S
+    run 1  compio-defer  1381884 req/s  p50 727.4us  p99 795.6us  S
+    run 1  compio-nocoop  1383017 req/s  p50 721.2us  p99 778.1us  S
+    run 2  compio-pool  1374258 req/s  p50 706.7us  p99 804.1us  S
+    run 2  compio-defer  1404004 req/s  p50 719.9us  p99 821.6us  S
+    run 2  compio-nocoop  1379315 req/s  p50 714.2us  p99 770.5us  S
+    run 2  tokio-per-core  1461768 req/s  p50 697.2us  p99 750.0us  S
+    run 3  compio-defer  1344923 req/s  p50 712.5us  p99 1007.7us  S
+    run 3  compio-nocoop  1391019 req/s  p50 688.1us  p99 851.6us  S
+    run 3  tokio-per-core  1440401 req/s  p50 689.9us  p99 765.9us  S
+    run 3  compio-pool  1374819 req/s  p50 709.5us  p99 787.7us  S
+    point done; 12 min elapsed, about 0 min left
+finished in 12 min
