@@ -1,244 +1,170 @@
 # Architecture
 
-How the pool is put together, where every piece of state lives, and what runs on each step of a
-checkout. For *why* any of it is shaped this way, see [decisions/](decisions/).
+How the server is put together, where every piece of state lives, and what runs on each
+event. For *why* any of it is shaped this way, see [decisions/](decisions/).
 
 ## The constraint everything follows from
 
-`compio` is completion-based and thread-per-core. Each thread runs its own driver (io_uring,
-IOCP, or a poll fallback), IO handles are bound to the driver that created them, and buffers are
-handed to the kernel by ownership for the duration of an operation. So `compio::net::TcpStream`
-is `!Send`.
+`compio` is completion-based and thread-per-core. Each thread runs its own `io_uring`, I/O
+handles are bound to the ring that created them, and buffers are handed to the kernel by
+ownership for the duration of an operation. `compio::net::TcpStream` is `!Send`.
 
-A pool therefore cannot keep connections in the pool handle, because the handle is shared across
-threads and the connections cannot be. Every structural decision below is a consequence of
-splitting those two things apart.
+So the unit of ownership is the core. Everything a connection touches — the listener that
+accepted it, the ring its I/O goes through, the pool it borrows from, the task that serves it —
+belongs to one worker thread. The only things that cross threads are the raw file descriptor of
+a connection nobody local can serve, and counters.
+
+## One worker
+
+```text
+ thread "compio-pool/<i>", pinned to core c_i
+ ┌───────────────────────────────────────────────────────────────────────┐
+ │ compio Runtime (io_uring; coop_taskrun, single_issuer)                │
+ │                                                                       │
+ │  TcpListener         socket2: SO_REUSEADDR, SO_REUSEPORT, [SO_INCOMING_CPU=c_i], bind, listen
+ │  LocalPool<R>        Rc<Inner>: idle: RefCell<Vec<R>>, taken: Cell, waiters
+ │  Rc<Worker<S>>       the service clone, Sender/Receiver of the channel, Arc<WorkerStats>
+ │                                                                       │
+ │  task accept_loop    accept → try_reserve → spawn serve | hand_off     │
+ │  task claim_loop     wait_available → recv → try_reserve → attach → spawn serve
+ │  tasks serve × n     permit.acquire → service.handle(conn, &mut lease)  │
+ └───────────────────────────────────────────────────────────────────────┘
+```
+
+Startup order inside the thread matters and is fixed: pin (step 8), build the ring (10), bind
+the listener (9), wrap it in the runtime (10), build the pool (11), prewarm, report ready, then
+spawn the two loops. Worker 0 starts alone so that a configured port of 0 is resolved once; the
+others bind the port it got.
 
 ## State, and which thread can see it
 
-```text
- ┌──────────────────────────────────────────────────────────────────────┐
- │ Arc<Inner<M, X>>          shared by every thread, holds no connection │
- │   id: u64                 index into each thread's SHARDS map        │
- │   manager: Arc<M>         user's Manage impl                          │
- │   config: Config          immutable after build                       │
- │   exchange: X             NoExchange (ZST) or Reservoir               │
- │   counters: Arc<Counters> relaxed atomics, see metrics                │
- │   generation: AtomicU64   bumped by invalidate()                      │
- │   closed: AtomicBool      set by close()                              │
- └──────────────────────────────────────────────────────────────────────┘
-        ▲ Pool<M, X> is a clone of this Arc, and is Send + Sync
-        │
- ┌──────┴───────────────────┐   ┌──────────────────────────┐
- │ thread A                 │   │ thread B                 │
- │ thread_local SHARDS      │   │ thread_local SHARDS      │
- │   HashMap<u64, Box<Any>> │   │   HashMap<u64, Box<Any>> │
- │     └─ Rc<Shard<M>>      │   │     └─ Rc<Shard<M>>      │
- │          free: Vec<Slot> │   │          free: Vec<Slot> │
- │          size: Cell      │   │          size: Cell      │
- │          waiters: VecDeq │   │          waiters: VecDeq │
- └──────────────────────────┘   └──────────────────────────┘
-   !Send connections live here, reachable only from their own thread
-```
-
-`SHARDS` is keyed by pool id (a process-wide `AtomicU64` counter), so several pools coexist on one
-thread, and the value is `Box<dyn Any>` because the map is shared by pools of different `M`. The
-downcast is infallible in practice: a pool id uniquely determines the shard type.
-
-The `Arc`s inside `Inner` are cloned into the shard once, at shard creation, and never on the hit
-path — two atomic refcount bumps on a cache line every core writes to would undo the point of the
-design.
-
-## The types
-
-| type | thread | role |
+| state | type | visible to |
 |---|---|---|
-| `Pool<M, X>` | any | `Arc<Inner>` handle. Clone it onto every compio thread |
-| `Shard<M>` | one | Free list, size counter, waiter queue. `Cell`/`RefCell`, no atomics |
-| `Slot<C>` | one | A connection plus its `SlotMeta` (created_at, last_used, uses, generation) |
-| `Pooled<M, X>` | one | Checkout guard. Derefs to the connection, returns it on drop |
-| `OpGuard` | one | Arms cancellation protection for one operation |
-| `Manage` | — | User trait: `connect`, `recycle`, `disconnect` |
-| `Detach` | — | Opt-in extension: `detach`/`attach`, required by `Reservoir` |
-| `Exchange<M>` | any | `park`/`unpark`. `NoExchange` is a ZST no-op; `Reservoir` is the real one |
+| connections, resources, pool, runtime, ring | `Rc`, `Cell`, `RefCell` | one worker |
+| the service | `S: Clone + Send` | one clone per worker |
+| handoff channel | `flume::bounded<Overflow>` | every worker; lock-free MPMC |
+| per-worker counters | `WorkerStats`, relaxed atomics, 128-byte aligned | written by one worker, read by anyone |
+| configuration | `Arc<Config>` | everyone, read-only |
+| shutdown signal | `flume::Receiver<()>` per worker; the `Server` holds the only `Sender` | everyone |
 
-`Shard` is deliberately built from `Cell` and `RefCell` rather than atomics. Nothing else can
-reach it, so there is nothing to synchronise — that is the whole return on per-thread sharding.
+`WorkerStats` is aligned to its own cache line so two workers never write the same line. The
+totals in `Server::stats()` are a sum of per-worker snapshots, taken counter by counter, not a
+consistent cut.
 
-## `acquire`, step by step
+## The three loops
 
-`Pool::acquire` wraps `acquire_inner` in `compio::time::timeout` when `acquire_timeout` is set,
-counts a timeout, and returns `Error::Timeout`. `acquire_inner` is a loop over four steps:
+### accept (steps 12–15)
 
 ```text
-  ┌─ loop ───────────────────────────────────────────────────────────────┐
-  │ 0.  closed? ──────────────────────────────────── yes ─► Error::Closed │
-  │                                                                       │
-  │ 1.  pop_idle()  (LIFO — warmest first, no lock, no atomic)            │
-  │       expired?  ──► destroy, try the next one                         │
-  │       recycle().await                                                 │
-  │         Ok  ──────────────────────────────────────────► Pooled        │
-  │         Err ──► recycle_failures++, destroy, try the next one         │
-  │                                                                       │
-  │ 2.  try_reserve(max_size)  (size < max_size ? size += 1)              │
-  │       exchange.unpark().await                                         │
-  │         Claimed ──► unparked++, live++ ────────────────► Pooled       │
-  │         Lost    ──► closed++, fall through to dial                    │
-  │         Empty   ──► fall through to dial                              │
-  │       manager.connect().await                                         │
-  │         Ok  ──► created++, live++ ─────────────────────► Pooled       │
-  │         Err ──► release budget ───────────────────────► Error::Backend│
-  │                                                                       │
-  │ 3.  at max_size: waits++, shard.wait().await, then loop               │
-  └───────────────────────────────────────────────────────────────────────┘
+loop
+  (stream, peer) = race(listener.accept(), shutdown)      shutdown → return
+  stats.accepted++ ; set_nodelay
+  match pool.try_reserve()                                 Cell compare, no await
+    Some(permit) → stats.served_local++ ; spawn serve(permit, Connection{route: Local})
+    None         → fd = detach(stream).await               SharedFd::try_unwrap, immediate for a fresh socket
+                   match tx.try_send(Overflow{fd, peer, from: i, hops: 0})
+                     Ok           → stats.handed_off++
+                     Full(ov)     → stats.handoff_full++ ; channel_full(ov)
+                     Disconnected → drop (shutting down)
 ```
 
-Three things are worth pulling out.
+`accept` errors that mean "out of descriptors" (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) back
+off 10 ms before the next accept; anything else is counted and the loop continues.
 
-**The fast path is step 1 alone.** A `Vec::pop` out of a `RefCell`, a `recycle` call, and a guard
-allocation. No lock, no atomic RMW, no cross-thread traffic. See
-[performance.md](performance.md#the-acquire-fast-path).
-
-**Stealing is tried before dialling.** Step 2 claims shard budget *first*, so one reservation
-covers both the unpark and the connect, and a warm socket from another thread is always preferred
-over a handshake.
-
-**Waiting is local only.** Step 3 waits for one of *this thread's* checkouts to come back. A
-thread at `max_size` has outstanding connections of its own, which always return, so this cannot
-deadlock — and it needs no cross-thread wakeup. See
-[decision 0007](decisions/0007-thread-local-waiters.md).
-
-### Every await is a cancellation point
-
-`acquire` can be dropped at any await: by its own timeout, or by the caller's `select!`. Between
-`try_reserve` and the end of an await, the shard has claimed budget that no connection is backing
-yet — drop the future there and the shard permanently believes it is one connection fuller than it
-is. Repeat that and the shard sits at `max_size` holding nothing.
-
-`Reserved` is the RAII guard that closes this. It wraps each awaited region, and on drop refunds
-the budget (and, in the `holding` case, accounts for the connection that the cancelled future is
-about to drop as `live--`, `closed++`). `disarm()` is called the moment the await completes and
-ownership has moved on. `tests/cancellation.rs` cancels at each awaited step and asserts the
-shard recovers.
-
-## Release, step by step
-
-Returning happens in `Pooled::drop`, which cannot await. Everything here is synchronous.
+### claim (steps 16–17)
 
 ```text
-  drop(Pooled)
-    meta.uses += 1; meta.last_used = now
-    poisoned?             ─► poisoned++,  destroy
-    pool closed?          ─► destroy
-    expired?              ─► destroy          (generation / lifetime / idle / uses)
-    no local waiters
-      and idle >= min_idle?
-        exchange.park()
-          Accepted  ─► live--, release budget      (now the exchange's)
-          Destroyed ─► live--, closed++, release   (detach found an op in flight)
-          Refused   ─► fall through
-    push_idle()  ─► wake one waiter
+loop
+  race(pool.wait_available(), shutdown)                    shutdown → return
+  ov = race(rx.recv_async(), shutdown)                     shutdown / disconnected → return
+  match pool.try_reserve()
+    Some(permit) → stream = attach(ov.fd)                  TcpStream::from_std on THIS ring
+                   stats.claimed++ ; spawn serve(permit, Connection{route: Claimed{from, hops}})
+    None         → the listener took the slot meanwhile
+                   if ov.hops < max_hops → ov.hops++ ; tx.try_send(ov) → stats.bounced++ (Full → channel_full)
+                   else                  → channel_full(ov)
 ```
 
-`destroy` is always `manager.disconnect(conn)`, `live--`, `closed++`, `release()` — one path, so
-the counters cannot drift between call sites.
+The wait comes before the receive on purpose: a worker only takes what it can serve, and it
+does not hold a slot while it waits, so an idle worker's full capacity stays available to its
+own listener. The price is the race in the `None` arm, which is bounded by `max_hops`.
 
-The `no local waiters` check matters: a shard with someone parked on it must not give its
-connection away to another thread while its own caller waits.
+### channel_full
 
-## Retirement
+Only reached when every worker is at capacity *and* the queue is full.
 
-A connection is retired when `Slot::is_expired` says so, checked on the way *out* of the free
-list (so nothing stale is ever handed to a caller) and by the background reaper. Four independent
-reasons:
+* `OverflowPolicy::ServeLocally` (default): `attach` on this ring, `reserve_unbounded`, serve.
+  The pool is over capacity by one until the connection ends; `stats.oversubscribed++`.
+* `OverflowPolicy::Reject`: drop the `Overflow`, which closes the socket; `stats.rejected++`.
 
-| reason | config | checked against |
-|---|---|---|
-| generation mismatch | `invalidate()` | `Inner::generation` |
-| too old | `max_lifetime` | `meta.created_at` |
-| idle too long | `idle_timeout` | `meta.last_used` |
-| used enough | `max_uses` | `meta.uses` |
-
-`invalidate()` is the interesting one: it bumps a generation counter rather than walking any
-data structure, so it retires connections on *every* thread at once, at `Relaxed` cost, without
-touching another thread's shard. Live checkouts keep working and are destroyed when returned.
-
-## The reaper
-
-One per shard, spawned on the shard's first touch, and only when the config actually needs it
-(`min_idle > 0 || idle_timeout.is_some() || max_lifetime.is_some()`). It holds a `Weak<Shard>`,
-so it stops on its own when the thread's shard goes away, and it is spawned *outside* the
-`SHARDS.with` closure so the thread-local is not borrowed when the task first reaches for it.
-
-Each tick: sleep `reap_interval` → if the pool is closed, drain and stop → drain expired →
-refill up to `min_idle`, but never while a waiter is parked (a waiter will be served by a returning
-connection sooner than by a fresh dial).
-
-If there is no compio runtime on the thread, spawning is skipped silently and the pool still
-works — expiry is then enforced at checkout instead. See
-[decision 0009](decisions/0009-per-shard-reaper.md).
-
-## The cross-thread exchange
-
-Optional, off by default, and requires `Detach`.
+### serve
 
 ```text
-  thread A                  shared ArrayQueue              thread B
-  --------                  -----------------              --------
-  free list over min_idle
-       │  admit() reserves a slot (CAS)
-       │  Detach::detach — fd out of A's driver
-       └──── push (cannot fail) ──► [ e, e, e ] ──┐
-                                                   │ pop, readmit()
-                                                   │ Detach::attach
-                                                   └─► re-wrapped in B's driver
+stats.active++
+lease = permit.acquire().await          pop idle, else R::create(&cx).await; Err → stats.resource_errors++, slot released
+service.handle(conn, &mut lease).await  Ok → completed++ ; Err → handler_errors++
+stats.active--                          lease drops: recycle() ? idle.push : drop ; slot released
 ```
 
-The `admitted` counter is not decoration. `ArrayQueue::push` can fail when full, but by then the
-connection has already been detached and there is no synchronous way to rebuild it. So a slot is
-claimed with a CAS *before* detaching: a full reservoir refuses the offer while the connection is
-still whole, and the push that follows cannot fail. The count is released on pop, and on the two
-failure paths.
-
-The queue is FIFO, not LIFO, on purpose — see
-[decision 0006](decisions/0006-lock-free-reservoir.md#why-fifo).
-
-## The invariants
-
-These are what `tests/fuzz.rs` and the libFuzzer targets assert after every step.
-
-**Conservation — no connection is ever lost.**
+## The pool
 
 ```text
-created == closed + live + parked + taken + cleared
+capacity        fixed
+idle            Vec<R>, LIFO
+taken           permits + leases outstanding
+invariant       idle.len() + taken <= capacity   (except through reserve_unbounded)
 ```
 
-`taken` is `Pooled::take`, which hands ownership out of the pool by design. `cleared` is
-`Exchange::clear` (from `close()` and `invalidate()`), which drops parked connections *without*
-counting them closed. The test driver tracks both explicitly rather than pretending they do not
-happen.
+* `try_reserve` → `Permit` if `taken < capacity`; `taken += 1`. Synchronous.
+* `Permit::acquire` → `Lease`: pops an idle resource or creates one. Dropping an unconverted
+  permit refunds the slot.
+* `Lease` drop: `taken -= 1`; the resource goes back on the idle list if `recycle()` says so
+  and there is room, else it is dropped. Over-capacity leases therefore never grow the idle list.
+* Waiting (`reserve`, `wait_available`, `drained`) registers exactly one waker per waiting
+  future, removed when the future resolves *or is dropped*, so nothing stale is ever woken.
+  Every release wakes all capacity waiters: a `wait_available` waiter does not consume the slot
+  it was woken for, so waking one could strand a `reserve` waiter while a slot is free.
 
-**Capacity.** `shard.size() <= max_size`, always, including across a cancellation.
+## Moving an fd between rings
 
-**Exclusivity.** No connection id is checked out twice at the same time.
+```text
+detach(stream):  shared = stream.to_shared_fd()      refcount 2
+                 drop(stream)                        refcount 1
+                 shared.try_unwrap()                 Ok(socket2::Socket) → OwnedFd
+                 (Err → shared.take().await: an op is still in flight; wait for it)
+attach(fd):      TcpStream::from_std(std::net::TcpStream::from(fd))
+                 → Socket::from_socket2 → Attacher::new → Runtime::with_current(|r| r.attach(fd))
+```
 
-**Retirement is final.** A connection retired by generation, lifetime, idle time or use count is
-never handed out again.
+Nothing is submitted against a freshly accepted socket, so `detach` is synchronous in practice.
+`attach` must run inside the destination worker's runtime; that is what binds the fd to its
+ring. Between the two the fd is just an `OwnedFd` inside an `Overflow`, and dropping an
+`Overflow` closes it.
 
-**Admission never leaks.** Whatever sequence of parks, claims, failed detaches, failed attaches
-and clears happens, it must still be possible to fill the reservoir to exactly `capacity`.
+## Shutdown
 
-## Module map
+1. `Server::shutdown` drops the only `Sender<()>`. Every worker's `recv_async` on its clone of
+   the receiver resolves with `Disconnected`.
+2. Both loops exit (their `race` against shutdown resolves); the worker awaits them.
+3. The worker waits for `pool.drained()` up to `drain_timeout`: in-flight handlers finish.
+4. `block_on` returns and the runtime drops. Whatever is still pending is cancelled with it; the
+   listener and any remaining sockets close.
+5. `Server::join` (or `Drop`) joins the threads.
 
-| file | contents |
-|---|---|
-| [src/lib.rs](../src/lib.rs) | Crate docs and the public re-exports |
-| [src/pool.rs](../src/pool.rs) | `Pool`, `Builder`, `Inner`, the `SHARDS` thread-local, `Reserved`, the reaper |
-| [src/shard.rs](../src/shard.rs) | `Shard`, the free list, the waiter queue and `WaitForSlot` |
-| [src/slot.rs](../src/slot.rs) | `Slot`, `SlotMeta`, `is_expired` |
-| [src/guard.rs](../src/guard.rs) | `Pooled`, `OpGuard`, poisoning |
-| [src/manage.rs](../src/manage.rs) | `Manage`, `Detach` |
-| [src/exchange.rs](../src/exchange.rs) | `Exchange`, `NoExchange`, `Reservoir`, `Parked`, `Unparked` |
-| [src/config.rs](../src/config.rs) | `Config` and its setters |
-| [src/metrics.rs](../src/metrics.rs) | `Metrics`, `Counters` |
-| [src/error.rs](../src/error.rs) | `Error<E>` |
+If the `Server` is dropped *while the dropping thread is unwinding*, the sender is dropped from a
+helper thread instead. compio's executor aborts the process when one of its task wakers runs on
+a thread that is already panicking, and the disconnect wakes worker tasks synchronously. See
+[decision 0006](decisions/0006-shutdown-and-the-unwinding-thread.md).
+
+## Invariants
+
+These hold in every test and are what a change must keep true:
+
+* `idle + taken <= capacity` on every pool, except by `reserve_unbounded`.
+* `served_local + handed_off == accepted` per worker, at all times.
+* Over a quiescent server: `claimed + oversubscribed + rejected == handed_off` summed over
+  workers, `queued == 0`, `active == 0`.
+* `bounced` only ever increments from the claim loop's `None` arm, and a connection bounces at
+  most `max_hops` times.
+* A stream is only ever polled by the ring it is currently attached to. `detach` happens on the
+  accepting worker, `attach` on the claiming worker, and nothing touches the fd in between.

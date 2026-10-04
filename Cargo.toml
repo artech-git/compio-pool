@@ -1,46 +1,48 @@
 [package]
 name = "compio-pool"
-version = "0.0.2"
+version = "0.1.0"
 edition = "2024"
-description = "A thread-per-core connection pool for the compio runtime"
+description = "A bb8-style connection pool for compio: build once, clone the handle onto each thread-per-core io_uring runtime, and lease ring-local connections that never cross threads"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/artech-git/compio-pool"
 documentation = "https://docs.rs/compio-pool"
 homepage = "https://github.com/artech-git/compio-pool"
-# Rendered as the crates.io front page, badges and all.
 readme = "README.md"
-keywords = ["compio", "pool", "thread-per-core", "io-uring", "async"]
+keywords = ["compio", "io-uring", "pool", "bb8", "thread-per-core"]
 categories = ["asynchronous", "network-programming", "concurrency"]
-# Edition 2024 alone would allow 1.85, but compio pulls in `thin-cell`, which
-# uses `cell_update` — stable since 1.88. Enforced by the `msrv` job in CI.
-rust-version = "1.88"
-# The fuzz crate is its own workspace and needs nightly; keep it out of the package.
-exclude = ["fuzz"]
+# Bisected, not guessed: compio 0.19's executor uses `cfg_select!`, stable
+# since 1.95. 1.88 through 1.94 fail to build the dependency tree. Enforced by
+# the `msrv` job in CI.
+rust-version = "1.95"
 
-# docs.rs builds with every feature on, and with `--cfg docsrs` so the
-# `#[doc(cfg(...))]` annotations in the source render.
+# docs.rs builds with `--cfg docsrs` so `#[doc(cfg(...))]` renders. The crate
+# only supports Linux, so only Linux targets are built there.
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
-# `crates/*` are consumers of this crate that ship in the same repo. `fuzz` is
-# deliberately absent: it declares its own `[workspace]` so the parent keeps
-# building on stable.
 [workspace]
-members = ["crates/compio-redis"]
+members = []
+# `compio-redis` is a nested repository with its own history, targeting the
+# previous API. `deadpool-baseline` is the tokio + deadpool yardstick for the
+# examples, its own workspace root. Neither is part of this build.
+exclude = ["crates/compio-redis", "crates/deadpool-baseline"]
 
 [dependencies]
-compio = { version = "0.18", default-features = false, features = ["runtime", "time"] }
-# Lock-free bounded MPMC queue backing the cross-thread overflow pool.
-crossbeam-queue = { version = "0.3", default-features = false, features = ["std"] }
-
-[dev-dependencies]
-compio = { version = "0.18", features = ["runtime", "time", "macros", "net", "io"] }
-
-[[bench]]
-name = "acquire"
-harness = false
-
-[[bench]]
-name = "exchange"
-harness = false
+# `default-features = false` drops `io-uring`, which is the whole point, so it
+# is named explicitly. `time` is what `LocalPool::get` uses for the connection
+# timeout; `net`/`io`/`fs` are for the examples' own accept loops and handlers.
+compio = { version = "0.19.2", default-features = false, features = [
+    "runtime",
+    "net",
+    "io",
+    "time",
+    "io-uring",
+    "fs",
+] }
+# `all` is what gates `Socket::set_cpu_affinity` (SO_INCOMING_CPU) on Linux,
+# used by `listener::bind_reuseport`.
+socket2 = { version = "0.6.5", features = ["all"] }
+# Core enumeration and thread pinning for the `cpu` helper module.
+core_affinity = "0.8.3"

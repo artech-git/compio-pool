@@ -1,0 +1,134 @@
+##### bench.sh 1 - upload this file #####
+
+##### ENVIRONMENT #####
+bench.sh version:  1
+date (UTC):        2026-10-03T03:29:29Z
+host:              high-core-machine
+note:              
+command line:      --suites custom --workers 4 --conns 256 --servers compio-pool:1,compio-pool:2,compio-pool
+kernel:            Linux 6.12.107+deb13-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.107-1 (2026-08-29) x86_64
+virtualization:    google
+cpus allowed:      16 (8 physical cores; threads/core 2; NUMA nodes 1)
+max split workers: 4 (client ratio 1.5)
+memory (MiB):      total 62289, available 59891
+io_uring_disabled: 0
+cpu governor:      n/a
+somaxconn:         4096   tcp_tw_reuse: 2   nofile: 524288
+rustc:             rustc 1.99.0 (b940084d7 2026-09-28)
+git:               reuseport-workers@1ffe0be
+cache cpu0:        L1 Data 48K
+cache cpu0:        L1 Instruction 32K
+cache cpu0:        L2 Unified 1024K
+cache cpu0:        L3 Unified 32768K
+vulnerability mitigations (they change syscall cost):
+  gather_data_sampling: Not affected
+  indirect_target_selection: Not affected
+  itlb_multihit: Not affected
+  l1tf: Not affected
+  mds: Not affected
+  meltdown: Not affected
+  mmio_stale_data: Not affected
+  reg_file_data_sampling: Not affected
+  retbleed: Not affected
+  spec_rstack_overflow: Mitigation: IBPB on VMEXIT only
+  spec_store_bypass: Mitigation: Speculative Store Bypass disabled via prctl
+  spectre_v1: Mitigation: usercopy/swapgs barriers and __user pointer sanitization
+  spectre_v2: Mitigation: Enhanced / Automatic IBRS; IBPB: conditional; STIBP: always-on; PBRSB-eIBRS: Not affected; BHI: Not affected
+  srbds: Not affected
+  tsa: Not affected
+  tsx_async_abort: Not affected
+  vmscape: Not affected
+
+--- lscpu ---
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           52 bits physical, 57 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  16
+On-line CPU(s) list:                     0-15
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD EPYC 9B45
+CPU family:                              26
+Model:                                   2
+Thread(s) per core:                      2
+Core(s) per socket:                      8
+Socket(s):                               1
+Stepping:                                1
+BogoMIPS:                                5391.90
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext mwaitx ssbd ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b avx512_vp2intersect flush_l1d
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               384 KiB (8 instances)
+L1i cache:                               256 KiB (8 instances)
+L2 cache:                                8 MiB (8 instances)
+L3 cache:                                32 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-15
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Mitigation; IBPB on VMEXIT only
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+
+##### SUMMARY #####
+Legend: S = server CPUs >=85% busy (server-bound). C = client CPUs >=85% busy (client-bound:
+the number mostly measures the load generator; read it as a lower bound). B = whole box
+>=90% busy (shared / onecpu placement). No flag = neither saturated. '+-N%' is half the
+min-max spread over repeats. Each cell is the median run by req/s.
+
+=== custom ===
+
+median req/s [flag] +-spread
+                              compio-pool@cap1           compio-pool@cap2           compio-pool                
+W=4 B=512 C=256               732224 +-0%                1368933 [S] +-0%           1427451 [S] +-0%           
+
+p50 / p99 latency, us
+                              compio-pool@cap1           compio-pool@cap2           compio-pool                
+W=4 B=512 C=256               5 / 9                      5 / 10                     174 / 209                  
+
+CPU us per request: server(user+sys) / client
+                              compio-pool@cap1           compio-pool@cap2           compio-pool                
+W=4 B=512 C=256               3.4 / 2.8                  2.7 / 3.4                  2.7 / 4.0                  
+
+##### RAW RUNS (TSV, one line per run; the columns are in the header line) #####
+#suite	row	server	repeat	workers	conns	bytes	capacity	server_cpus	client_cpus	status	rps	reqs	p50_us	p90_us	p99_us	p999_us	max_us	srv_user_us_per_req	srv_sys_us_per_req	srv_vol_cs_per_req	srv_invol_cs_per_req	cli_cpu_us_per_req	sys_cs_per_req	idle_pct	failed_clients	srv_cpus_used	cli_cpus_used	flag	steal_pct	server_stats
+custom	W=4 B=512 C=256	compio-pool@cap1	1	4	256	512	1	0,1,2,3	4,12,5,13,6,14,7,15	ok	735269	3676346	5.2	5.8	8.7	11.8	4890280.0	0.827	2.570	1.0000	0.0002	2.878	4.002	64.4	0	2.498	2.116		0.00	
+custom	W=4 B=512 C=256	compio-pool@cap2	1	4	256	512	2	0,1,2,3	4,12,5,13,6,14,7,15	ok	1375994	6879972	5.2	6.7	10.3	12.8	4923640.0	0.674	2.017	0.0912	0.0002	3.415	2.184	45.2	0	3.704	4.699	S	0.00	
+custom	W=4 B=512 C=256	compio-pool	1	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1425018	7125092	171.0	201.2	217.4	236.0	1119.2	0.386	2.355	0.0000	0.0001	3.978	1.571	37.5	0	3.906	5.669	S	0.00	
+custom	W=4 B=512 C=256	compio-pool@cap2	2	4	256	512	2	0,1,2,3	4,12,5,13,6,14,7,15	ok	1360613	6803066	5.2	6.8	10.4	13.1	4909580.0	0.675	2.027	0.0996	0.0002	3.449	2.200	44.9	0	3.676	4.692	S	0.00	
+custom	W=4 B=512 C=256	compio-pool	2	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1427451	7137256	173.5	190.5	209.4	252.0	1642.8	0.392	2.355	0.0000	0.0001	4.001	1.588	37.0	0	3.922	5.711	S	0.00	
+custom	W=4 B=512 C=256	compio-pool@cap1	2	4	256	512	1	0,1,2,3	4,12,5,13,6,14,7,15	ok	732224	3661119	5.2	5.8	8.7	11.7	4861210.0	0.860	2.568	1.0000	0.0002	2.818	4.002	65.1	0	2.510	2.064		0.00	
+custom	W=4 B=512 C=256	compio-pool	3	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1430426	7152132	173.1	188.0	202.7	227.3	746.6	0.410	2.317	0.0000	0.0001	3.969	1.595	37.3	0	3.900	5.677	S	0.00	
+custom	W=4 B=512 C=256	compio-pool@cap1	3	4	256	512	1	0,1,2,3	4,12,5,13,6,14,7,15	ok	729270	3646349	5.3	5.9	8.8	12.1	4904270.0	0.850	2.597	1.0000	0.0002	2.876	4.003	64.5	0	2.514	2.098		0.00	
+custom	W=4 B=512 C=256	compio-pool@cap2	3	4	256	512	2	0,1,2,3	4,12,5,13,6,14,7,15	ok	1368933	6844666	5.2	6.7	10.4	13.2	4901500.0	0.649	2.056	0.0861	0.0002	3.433	2.173	45.0	0	3.702	4.700	S	0.00	
+
+##### PROGRESS LOG #####
+results directory: ~/bench-results/high-core-machine-20261003T032929Z
+preflight: starting each server once ...
+  compio-pool:1: ok (195799 req/s)
+  compio-pool:2: ok (394277 req/s)
+  compio-pool: ok (416245 req/s)
+[1/1] custom / W=4 B=512 C=256   W=4 conns=256 bytes=512 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  compio-pool@cap1  735269 req/s  p50 5.2us  p99 8.7us  
+    run 1  compio-pool@cap2  1375994 req/s  p50 5.2us  p99 10.3us  S
+    run 1  compio-pool  1425018 req/s  p50 171.0us  p99 217.4us  S
+    run 2  compio-pool@cap2  1360613 req/s  p50 5.2us  p99 10.4us  S
+    run 2  compio-pool  1427451 req/s  p50 173.5us  p99 209.4us  S
+    run 2  compio-pool@cap1  732224 req/s  p50 5.2us  p99 8.7us  
+    run 3  compio-pool  1430426 req/s  p50 173.1us  p99 202.7us  S
+    run 3  compio-pool@cap1  729270 req/s  p50 5.3us  p99 8.8us  
+    run 3  compio-pool@cap2  1368933 req/s  p50 5.2us  p99 10.4us  S
+    point done; 0 min elapsed, about 0 min left
+finished in 0 min
