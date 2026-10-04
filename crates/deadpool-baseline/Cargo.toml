@@ -15,12 +15,17 @@ publish = false
 [dev-dependencies]
 # `rt_tokio_1` arms deadpool's pool-get timeout with the tokio runtime.
 deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
+# The tokio + deadpool Redis proxy (`redis_proxy` example) — the counterpart to
+# compio-redis's `server`. Re-exports the `redis` client it pools.
+deadpool-redis = "0.23"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "net",
     "io-util",
     "macros",
     "time",
+    "fs",
+    "sync",
 ] }
 # `echo_tpc` only: a SO_REUSEPORT listener and core pinning for the
 # thread-per-core tokio control.

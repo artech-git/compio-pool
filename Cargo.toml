@@ -39,6 +39,7 @@ compio = { version = "0.19.2", default-features = false, features = [
     "io",
     "time",
     "io-uring",
+    "fs",
 ] }
 # `all` is what gates `Socket::set_cpu_affinity` (SO_INCOMING_CPU) on Linux.
 socket2 = { version = "0.6.5", features = ["all"] }
