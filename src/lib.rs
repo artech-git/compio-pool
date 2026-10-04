@@ -1,127 +1,103 @@
-//! A connection pool for [`compio`], the completion-based, thread-per-core
-//! Rust runtime.
+//! A bb8-style connection pool for [`compio`] on Linux `io_uring`.
 //!
-//! # Why compio needs its own pool
+//! You build one [`Pool`] — the manager plus a handful of [`Builder`] knobs —
+//! then clone that handle onto each thread of your own thread-per-core runtime.
+//! On every thread you call [`Pool::local`] once to get that thread's
+//! [`LocalPool`], and [`LocalPool::get`] to lease a connection. The pool is the
+//! product; spawning threads, pinning them and running an accept loop are yours.
 //!
-//! General-purpose pools (`bb8`, `deadpool`, `r2d2`) assume connections are
-//! `Send`: one shared `Mutex<Vec<Conn>>`, any worker takes any connection.
-//! `compio` breaks that assumption. Each thread runs its own driver
-//! (io_uring, IOCP or poll), IO handles are bound to the driver that created
-//! them, and buffers are handed to the kernel by ownership — so
-//! [`compio::net::TcpStream`] is `!Send` and cannot be put behind an `Arc<Mutex<_>>`
-//! at all.
+//! # Why it is shaped this way
 //!
-//! So "share one connection across threads simultaneously" is not the thing to
-//! build. Two different things hide behind that phrase:
+//! A `compio` connection is bound to the `io_uring` ring of the thread that
+//! opened it: its buffers are registered with that ring and its completions are
+//! delivered there. It cannot be used from another thread. So, unlike bb8 on
+//! `tokio`, the pool of connections cannot be a single shared, work-stealing
+//! store. What *is* shared is only the blueprint:
 //!
-//! * **Concurrent use of a single connection** — only meaningful for protocols
-//!   that multiplex (HTTP/2, Redis pipelining). Otherwise a connection is an
-//!   exclusive resource and sharing means taking turns.
-//! * **A pool shared by every thread** — any thread can check out *some*
-//!   connection. That is what this crate provides.
+//! * **[`Pool`] — `Send + Sync + Clone`.** The manager and the configuration,
+//!   behind one `Arc`. Cloning is an `Arc` bump. This is the only thing that
+//!   crosses threads.
+//! * **[`LocalPool`] — `!Send`, one per thread.** The idle connections and the
+//!   slot count, all `Rc`/`Cell`, no lock, no atom. The compiler keeps it, and
+//!   the ring-bound connections it holds, on its own thread.
 //!
-//! # Design
+//! The parts of bb8 that make sense per thread are here — [`max_size`], idle and
+//! lifetime timeouts, `test_on_check_out`, [`min_idle`] warm-up — sized per
+//! thread, not per process.
 //!
-//! [`Pool`] is `Send + Sync` and cheap to clone, but holds no connections. The
-//! connections live in a **per-thread shard** stored in a thread-local, so:
+//! [`max_size`]: Builder::max_size
+//! [`min_idle`]: Builder::min_idle
 //!
-//! * the acquire fast path touches no atomics and takes no lock;
-//! * [`Manage::Connection`] never needs to be `Send`;
-//! * a connection is always driven by the compio driver that created it;
-//! * at thread exit, that thread's connections close on their own thread.
+//! # Quickstart
 //!
-//! [`Config::max_size`] is therefore **per shard**, not per process. A global
-//! cap would need a cross-thread semaphore on the hot path, which is the exact
-//! contention thread-per-core exists to avoid.
-//!
-//! ## Letting connections migrate
-//!
-//! Pure sharding wastes connections when load is skewed: a quiet thread holds
-//! idle sockets a busy thread could use. The optional [`Reservoir`] fixes that
-//! with a bounded, lock-free `ArrayQueue` shared by every thread: a shard whose
-//! free list is over `min_idle` detaches the surplus into it, and a shard whose
-//! free list is empty pops from it before paying for a handshake. The claiming
-//! thread re-wraps the socket in its own runtime via [`Detach::attach`].
-//!
-//! It requires [`Detach`], which is **platform-dependent and deliberately
-//! opt-in**:
-//!
-//! | driver | `attach` | connections may change threads |
-//! |---|---|---|
-//! | io_uring (Linux) | no-op | yes |
-//! | poll (Unix fallback) | no-op | yes |
-//! | IOCP (Windows) | `CreateIoCompletionPort`, once per handle | **no** |
-//!
-//! ## Cancellation is the sharp edge
-//!
-//! With completion-based IO, dropping a future mid-operation does not undo the
-//! operation. The connection's protocol state is then unknown and it must be
-//! destroyed rather than returned. See [`Pooled::begin_op`].
-//!
-//! # Example
+//! Define a manager, build the pool, and use it from a compio task:
 //!
 //! ```no_run
-//! use std::time::Duration;
-//! use compio_pool::{Config, Manage, Pool, SlotMeta};
+//! use std::io;
 //!
-//! struct Tcp(String);
+//! use compio_pool::{ManageConnection, Pool};
 //!
-//! impl Manage for Tcp {
-//!     type Connection = compio::net::TcpStream;
-//!     type Error = std::io::Error;
+//! /// A pool of reusable 16 KiB scratch buffers. A real manager would open a
+//! /// backend connection (Redis, Postgres, an upstream socket) in `connect`.
+//! struct Buffers;
 //!
-//!     async fn connect(&self) -> std::io::Result<Self::Connection> {
-//!         compio::net::TcpStream::connect(&self.0).await
+//! impl ManageConnection for Buffers {
+//!     type Connection = Vec<u8>;
+//!     type Error = io::Error;
+//!
+//!     async fn connect(&self) -> io::Result<Vec<u8>> {
+//!         Ok(Vec::with_capacity(16 * 1024))
 //!     }
-//!
-//!     async fn recycle(
-//!         &self,
-//!         conn: &mut Self::Connection,
-//!         _meta: &SlotMeta,
-//!     ) -> std::io::Result<()> {
-//!         conn.peer_addr().map(|_| ())
+//!     async fn is_valid(&self, _buf: &mut Vec<u8>) -> io::Result<()> {
+//!         Ok(())
+//!     }
+//!     fn has_broken(&self, _buf: &mut Vec<u8>) -> bool {
+//!         false
 //!     }
 //! }
 //!
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let pool = Pool::builder(Tcp("127.0.0.1:6379".into()))
-//!     .max_size(8)                                   // per thread
-//!     .min_idle(2)
-//!     .acquire_timeout(Duration::from_secs(5))
-//!     .build();
+//! // Build once; `Pool` is `Send + Clone`, so hand a clone to each thread.
+//! let pool = Pool::builder().max_size(1024).build(Buffers);
 //!
-//! // Clone `pool` onto every compio thread; each gets its own shard.
-//! let mut conn = pool.acquire().await?;
-//!
-//! let op = conn.begin_op();
-//! // ... use `conn` ...
-//! op.complete_op();
+//! // On each compio thread you spawn (see `examples/echo.rs` for the full
+//! // pinned, SO_REUSEPORT thread-per-core setup):
+//! let local = pool.local(); // this thread's own pool, `!Send`
+//! # async fn run(
+//! #     local: compio_pool::LocalPool<Buffers>,
+//! # ) -> Result<(), compio_pool::RunError<io::Error>> {
+//! let mut buf = local.get().await?; // PooledConnection, returned on drop
+//! buf.clear();
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! The crate also ships the two helpers that building your own thread-per-core
+//! loop needs: [`cpu`] for core enumeration and pinning, and
+//! [`listener::bind_reuseport`] for a shared-address `SO_REUSEPORT` socket.
+//!
+//! # Platform
+//!
+//! Linux is the only supported target: `SO_REUSEPORT` load balancing and
+//! `io_uring` are Linux semantics. The crate type-checks on other Unixes so
+//! editors work, but nothing is tested there.
 
-#![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![forbid(unsafe_code)]
+#![warn(missing_docs, rust_2018_idioms)]
 
-mod config;
-mod error;
-mod exchange;
-mod guard;
-mod manage;
-mod metrics;
-mod pool;
-mod shard;
-mod slot;
+#[cfg(not(unix))]
+compile_error!(
+    "compio-pool needs SO_REUSEPORT and an fd-based socket model; it supports Linux and only type-checks on other Unixes"
+);
 
-#[cfg(test)]
-mod test_support;
+pub mod builder;
+pub mod cpu;
+pub mod listener;
+pub mod manage;
+pub mod pool;
 
-pub use crate::{
-    config::Config,
-    error::Error,
-    exchange::{Exchange, NoExchange, Parked, Reservoir, Unparked},
-    guard::{OpGuard, Pooled},
-    manage::{Detach, Manage},
-    metrics::Metrics,
-    pool::{Builder, Pool},
-    slot::SlotMeta,
-};
+pub use builder::Builder;
+pub use cpu::CoreId;
+pub use listener::bind_reuseport;
+pub use manage::{ManageConnection, RunError};
+pub use pool::{LocalPool, Pool, PooledConnection, State};

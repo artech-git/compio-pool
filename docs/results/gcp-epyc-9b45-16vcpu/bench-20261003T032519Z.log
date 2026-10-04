@@ -1,0 +1,203 @@
+##### bench.sh 1 - upload this file #####
+
+##### ENVIRONMENT #####
+bench.sh version:  1
+date (UTC):        2026-10-03T03:25:19Z
+host:              high-core-machine
+note:              
+command line:      --suites custom --workers 4 --bytes 512 16384 --conns 64 256 --placement split
+kernel:            Linux 6.12.107+deb13-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.107-1 (2026-08-29) x86_64
+virtualization:    google
+cpus allowed:      16 (8 physical cores; threads/core 2; NUMA nodes 1)
+max split workers: 4 (client ratio 1.5)
+memory (MiB):      total 62289, available 61013
+io_uring_disabled: 0
+cpu governor:      n/a
+somaxconn:         4096   tcp_tw_reuse: 2   nofile: 524288
+rustc:             rustc 1.99.0 (b940084d7 2026-09-28)
+git:               reuseport-workers@1ffe0be
+cache cpu0:        L1 Data 48K
+cache cpu0:        L1 Instruction 32K
+cache cpu0:        L2 Unified 1024K
+cache cpu0:        L3 Unified 32768K
+vulnerability mitigations (they change syscall cost):
+  gather_data_sampling: Not affected
+  indirect_target_selection: Not affected
+  itlb_multihit: Not affected
+  l1tf: Not affected
+  mds: Not affected
+  meltdown: Not affected
+  mmio_stale_data: Not affected
+  reg_file_data_sampling: Not affected
+  retbleed: Not affected
+  spec_rstack_overflow: Mitigation: IBPB on VMEXIT only
+  spec_store_bypass: Mitigation: Speculative Store Bypass disabled via prctl
+  spectre_v1: Mitigation: usercopy/swapgs barriers and __user pointer sanitization
+  spectre_v2: Mitigation: Enhanced / Automatic IBRS; IBPB: conditional; STIBP: always-on; PBRSB-eIBRS: Not affected; BHI: Not affected
+  srbds: Not affected
+  tsa: Not affected
+  tsx_async_abort: Not affected
+  vmscape: Not affected
+
+--- lscpu ---
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           52 bits physical, 57 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  16
+On-line CPU(s) list:                     0-15
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD EPYC 9B45
+CPU family:                              26
+Model:                                   2
+Thread(s) per core:                      2
+Core(s) per socket:                      8
+Socket(s):                               1
+Stepping:                                1
+BogoMIPS:                                5391.90
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext mwaitx ssbd ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b avx512_vp2intersect flush_l1d
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               384 KiB (8 instances)
+L1i cache:                               256 KiB (8 instances)
+L2 cache:                                8 MiB (8 instances)
+L3 cache:                                32 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-15
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Mitigation; IBPB on VMEXIT only
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+
+##### SUMMARY #####
+Legend: S = server CPUs >=85% busy (server-bound). C = client CPUs >=85% busy (client-bound:
+the number mostly measures the load generator; read it as a lower bound). B = whole box
+>=90% busy (shared / onecpu placement). No flag = neither saturated. '+-N%' is half the
+min-max spread over repeats. Each cell is the median run by req/s.
+
+=== custom ===
+
+median req/s [flag] +-spread
+                              tokio-default              tokio-per-core             compio-pool                pc/default   compio/pc    
+W=4 B=512 C=64                1307091 [S] +-0%           1480585 [S] +-0%           1434250 [S] +-0%           1.13x        0.97x        
+W=4 B=512 C=256               1387053 [S] +-1%           1506051 [S] +-0%           1428658 [S] +-0%           1.09x        0.95x        
+W=4 B=16384 C=64              973647 [S] +-0%            1120122 [S] +-0%           1104892 [S] +-0%           1.15x        0.99x        
+W=4 B=16384 C=256             929730 [S] +-0%            964921 [S] +-0%            952081 [S] +-0%            1.04x        0.99x        
+
+p50 / p99 latency, us
+                              tokio-default              tokio-per-core             compio-pool                
+W=4 B=512 C=64                48 / 84                    45 / 70                    43 / 61                    
+W=4 B=512 C=256               180 / 313                  164 / 198                  172 / 209                  
+W=4 B=16384 C=64              64 / 112                   58 / 76                    57 / 76                    
+W=4 B=16384 C=256             271 / 460                  243 / 351                  258 / 318                  
+
+CPU us per request: server(user+sys) / client
+                              tokio-default              tokio-per-core             compio-pool                
+W=4 B=512 C=64                2.8 / 4.1                  2.7 / 4.0                  2.8 / 3.9                  
+W=4 B=512 C=256               2.7 / 4.2                  2.6 / 4.1                  2.7 / 4.0                  
+W=4 B=16384 C=64              3.8 / 5.7                  3.5 / 5.6                  3.6 / 5.4                  
+W=4 B=16384 C=256             4.1 / 6.2                  4.0 / 6.1                  4.1 / 5.9                  
+
+##### RAW RUNS (TSV, one line per run; the columns are in the header line) #####
+#suite	row	server	repeat	workers	conns	bytes	capacity	server_cpus	client_cpus	status	rps	reqs	p50_us	p90_us	p99_us	p999_us	max_us	srv_user_us_per_req	srv_sys_us_per_req	srv_vol_cs_per_req	srv_invol_cs_per_req	cli_cpu_us_per_req	sys_cs_per_req	idle_pct	failed_clients	srv_cpus_used	cli_cpus_used	flag	steal_pct	server_stats
+custom	W=4 B=512 C=64	tokio-default	1	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1300558	6502788	48.0	69.1	84.8	113.0	841.3	0.400	2.362	0.0365	0.0003	4.061	1.672	43.0	0	3.592	5.282	S	0.00	
+custom	W=4 B=512 C=64	tokio-per-core	1	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1480585	7402925	45.0	62.0	69.9	77.9	477.0	0.350	2.337	0.0000	0.0001	4.031	1.564	35.6	0	3.978	5.968	S	0.00	
+custom	W=4 B=512 C=64	compio-pool	1	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1434946	7174730	41.2	61.3	68.7	75.8	317.4	0.400	2.365	0.0000	0.0001	3.895	1.653	37.5	0	3.968	5.589	S	0.00	
+custom	W=4 B=512 C=64	tokio-per-core	2	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1480153	7400764	42.2	59.0	67.7	94.3	2898.3	0.305	2.375	0.0000	0.0001	4.027	1.557	34.2	0	3.968	5.961	S	0.00	
+custom	W=4 B=512 C=64	compio-pool	2	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1432526	7162631	43.4	59.0	70.3	81.7	786.8	0.402	2.373	0.0000	0.0001	3.889	1.655	37.0	0	3.976	5.571	S	0.00	
+custom	W=4 B=512 C=64	tokio-default	2	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1308225	6541125	47.9	69.0	84.5	103.2	2633.5	0.417	2.342	0.0366	0.0003	4.054	1.673	42.3	0	3.610	5.304	S	0.00	
+custom	W=4 B=512 C=64	compio-pool	3	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1434250	7171248	42.9	53.8	60.9	67.4	758.7	0.382	2.382	0.0000	0.0001	3.882	1.655	37.8	0	3.964	5.568	S	0.00	
+custom	W=4 B=512 C=64	tokio-default	3	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1307091	6535457	47.9	69.0	84.2	99.3	294.3	0.392	2.366	0.0365	0.0003	4.059	1.674	43.0	0	3.604	5.305	S	0.00	
+custom	W=4 B=512 C=64	tokio-per-core	3	4	64	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1499498	7497491	46.9	55.0	61.9	68.8	345.8	0.315	2.342	0.0000	0.0001	4.029	1.539	35.0	0	3.984	6.041	S	0.00	
+custom	W=4 B=512 C=256	tokio-default	1	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1387053	6935264	179.6	257.2	313.0	343.3	736.0	0.322	2.382	0.0044	0.0003	4.162	1.488	39.0	0	3.750	5.773	S	0.00	
+custom	W=4 B=512 C=256	tokio-per-core	1	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1515540	7577699	169.5	190.5	201.2	212.3	467.1	0.292	2.303	0.0000	0.0001	4.116	1.442	34.6	0	3.932	6.239	S	0.00	
+custom	W=4 B=512 C=256	compio-pool	1	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1428658	7143291	172.3	192.9	209.2	222.7	1711.6	0.368	2.363	0.0000	0.0001	3.969	1.590	37.3	0	3.902	5.671	S	0.00	
+custom	W=4 B=512 C=256	tokio-per-core	2	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1500731	7503656	168.1	200.4	213.4	236.6	822.0	0.292	2.310	0.0000	0.0001	4.122	1.447	35.4	0	3.904	6.186	S	0.00	
+custom	W=4 B=512 C=256	compio-pool	2	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1428297	7141483	176.0	211.7	225.2	242.2	1084.8	0.399	2.350	0.0000	0.0001	3.962	1.555	37.7	0	3.926	5.659	S	0.00	
+custom	W=4 B=512 C=256	tokio-default	2	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1365321	6826606	181.1	258.8	314.7	342.8	4003.6	0.369	2.353	0.0044	0.0003	4.158	1.506	40.0	0	3.716	5.677	S	0.00	
+custom	W=4 B=512 C=256	compio-pool	3	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1431612	7158062	172.4	203.2	217.4	246.2	576.2	0.379	2.360	0.0000	0.0001	3.972	1.562	37.4	0	3.920	5.686	S	0.00	
+custom	W=4 B=512 C=256	tokio-default	3	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1408337	7041683	178.6	255.7	311.9	342.2	793.1	0.364	2.329	0.0040	0.0003	4.146	1.488	38.6	0	3.792	5.838	S	0.00	
+custom	W=4 B=512 C=256	tokio-per-core	3	4	256	512	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1506051	7530255	164.2	185.7	198.0	212.2	729.7	0.296	2.301	0.0000	0.0001	4.129	1.440	35.0	0	3.912	6.218	S	0.00	
+custom	W=4 B=16384 C=64	tokio-default	1	4	64	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	977954	4889771	64.1	91.9	111.8	130.0	302.5	0.511	3.278	0.0360	0.0003	5.719	1.731	40.6	0	3.706	5.593	S	0.00	
+custom	W=4 B=16384 C=64	tokio-per-core	1	4	64	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1120122	5600608	57.8	67.8	76.0	84.1	1106.7	0.391	3.151	0.0000	0.0001	5.568	1.559	34.6	0	3.968	6.237	S	0.00	
+custom	W=4 B=16384 C=64	compio-pool	1	4	64	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1109194	5545971	55.8	66.3	75.0	84.2	1577.9	0.384	3.193	0.0000	0.0001	5.366	1.631	35.7	0	3.968	5.952	S	0.00	
+custom	W=4 B=16384 C=64	tokio-per-core	2	4	64	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1134672	5673360	53.1	70.3	79.1	86.9	835.8	0.395	3.111	0.0000	0.0001	5.543	1.549	34.1	0	3.978	6.290	S	0.00	
+custom	W=4 B=16384 C=64	compio-pool	2	4	64	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1095172	5475860	59.1	76.3	85.1	103.5	299.8	0.384	3.258	0.0000	0.0001	5.398	1.648	36.0	0	3.988	5.911	S	0.00	
+custom	W=4 B=16384 C=64	tokio-default	2	4	64	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	972101	4860504	64.2	91.9	111.6	127.0	434.3	0.490	3.298	0.0361	0.0004	5.707	1.731	40.8	0	3.682	5.548	S	0.00	
+custom	W=4 B=16384 C=64	compio-pool	3	4	64	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1104892	5524458	56.9	66.3	76.1	111.3	4938.9	0.415	3.188	0.0000	0.0001	5.414	1.621	35.4	0	3.980	5.982	S	0.00	
+custom	W=4 B=16384 C=64	tokio-default	3	4	64	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	973647	4868233	64.1	91.9	111.5	127.2	1360.9	0.466	3.322	0.0360	0.0004	5.703	1.734	41.0	0	3.688	5.553	S	0.00	
+custom	W=4 B=16384 C=64	tokio-per-core	3	4	64	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	1118266	5591328	60.0	72.2	80.2	88.1	432.4	0.438	3.123	0.0000	0.0001	5.556	1.584	34.5	0	3.982	6.213	S	0.00	
+custom	W=4 B=16384 C=256	tokio-default	1	4	256	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	930843	4654216	271.8	385.5	460.3	498.3	1367.0	0.425	3.689	0.0046	0.0003	6.175	1.693	38.9	0	3.830	5.748	S	0.00	
+custom	W=4 B=16384 C=256	tokio-per-core	1	4	256	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	958239	4791195	251.2	330.2	345.7	360.1	739.0	0.386	3.680	0.0000	0.0001	6.201	1.676	36.8	0	3.896	5.942	S	0.00	
+custom	W=4 B=16384 C=256	compio-pool	1	4	256	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	952081	4760405	258.3	295.5	318.0	340.4	933.5	0.468	3.640	0.0000	0.0001	5.873	1.648	38.7	0	3.912	5.592	S	0.00	
+custom	W=4 B=16384 C=256	tokio-per-core	2	4	256	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	964921	4824604	243.2	335.2	350.9	365.1	1259.4	0.363	3.671	0.0000	0.0001	6.096	1.691	37.4	0	3.892	5.882	S	0.00	
+custom	W=4 B=16384 C=256	compio-pool	2	4	256	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	952597	4762984	261.6	284.6	308.8	346.1	1435.9	0.445	3.697	0.0000	0.0001	5.779	1.732	39.0	0	3.946	5.505	S	0.00	
+custom	W=4 B=16384 C=256	tokio-default	2	4	256	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	927411	4637056	271.5	385.2	460.0	496.2	1599.8	0.438	3.670	0.0048	0.0003	6.154	1.693	39.1	0	3.810	5.707	S	0.00	
+custom	W=4 B=16384 C=256	compio-pool	3	4	256	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	949208	4746042	261.7	317.2	339.5	435.0	1601.7	0.472	3.668	0.0000	0.0001	5.787	1.703	38.8	0	3.930	5.493	S	0.00	
+custom	W=4 B=16384 C=256	tokio-default	3	4	256	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	929730	4648649	270.6	384.3	459.6	496.9	889.1	0.428	3.663	0.0046	0.0004	6.196	1.674	39.1	0	3.804	5.761	S	0.00	
+custom	W=4 B=16384 C=256	tokio-per-core	3	4	256	16384	1024	0,1,2,3	4,12,5,13,6,14,7,15	ok	967127	4835636	250.0	317.7	333.1	347.5	897.1	0.383	3.673	0.0000	0.0001	6.176	1.680	36.7	0	3.922	5.973	S	0.00	
+
+##### PROGRESS LOG #####
+results directory: ~/bench-results/high-core-machine-20261003T032519Z
+preflight: starting each server once ...
+  tokio-default: ok (443338 req/s)
+  tokio-per-core: ok (450594 req/s)
+  compio-pool: ok (417247 req/s)
+[1/4] custom / W=4 B=512 C=64   W=4 conns=64 bytes=512 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-default  1300558 req/s  p50 48.0us  p99 84.8us  S
+    run 1  tokio-per-core  1480585 req/s  p50 45.0us  p99 69.9us  S
+    run 1  compio-pool  1434946 req/s  p50 41.2us  p99 68.7us  S
+    run 2  tokio-per-core  1480153 req/s  p50 42.2us  p99 67.7us  S
+    run 2  compio-pool  1432526 req/s  p50 43.4us  p99 70.3us  S
+    run 2  tokio-default  1308225 req/s  p50 47.9us  p99 84.5us  S
+    run 3  compio-pool  1434250 req/s  p50 42.9us  p99 60.9us  S
+    run 3  tokio-default  1307091 req/s  p50 47.9us  p99 84.2us  S
+    run 3  tokio-per-core  1499498 req/s  p50 46.9us  p99 61.9us  S
+    point done; 0 min elapsed, about 2 min left
+[2/4] custom / W=4 B=512 C=256   W=4 conns=256 bytes=512 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-default  1387053 req/s  p50 179.6us  p99 313.0us  S
+    run 1  tokio-per-core  1515540 req/s  p50 169.5us  p99 201.2us  S
+    run 1  compio-pool  1428658 req/s  p50 172.3us  p99 209.2us  S
+    run 2  tokio-per-core  1500731 req/s  p50 168.1us  p99 213.4us  S
+    run 2  compio-pool  1428297 req/s  p50 176.0us  p99 225.2us  S
+    run 2  tokio-default  1365321 req/s  p50 181.1us  p99 314.7us  S
+    run 3  compio-pool  1431612 req/s  p50 172.4us  p99 217.4us  S
+    run 3  tokio-default  1408337 req/s  p50 178.6us  p99 311.9us  S
+    run 3  tokio-per-core  1506051 req/s  p50 164.2us  p99 198.0us  S
+    point done; 1 min elapsed, about 1 min left
+[3/4] custom / W=4 B=16384 C=64   W=4 conns=64 bytes=16384 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-default  977954 req/s  p50 64.1us  p99 111.8us  S
+    run 1  tokio-per-core  1120122 req/s  p50 57.8us  p99 76.0us  S
+    run 1  compio-pool  1109194 req/s  p50 55.8us  p99 75.0us  S
+    run 2  tokio-per-core  1134672 req/s  p50 53.1us  p99 79.1us  S
+    run 2  compio-pool  1095172 req/s  p50 59.1us  p99 85.1us  S
+    run 2  tokio-default  972101 req/s  p50 64.2us  p99 111.6us  S
+    run 3  compio-pool  1104892 req/s  p50 56.9us  p99 76.1us  S
+    run 3  tokio-default  973647 req/s  p50 64.1us  p99 111.5us  S
+    run 3  tokio-per-core  1118266 req/s  p50 60.0us  p99 80.2us  S
+    point done; 2 min elapsed, about 0 min left
+[4/4] custom / W=4 B=16384 C=256   W=4 conns=256 bytes=16384 server=0,1,2,3 clients=4,12,5,13,6,14,7,15
+    run 1  tokio-default  930843 req/s  p50 271.8us  p99 460.3us  S
+    run 1  tokio-per-core  958239 req/s  p50 251.2us  p99 345.7us  S
+    run 1  compio-pool  952081 req/s  p50 258.3us  p99 318.0us  S
+    run 2  tokio-per-core  964921 req/s  p50 243.2us  p99 350.9us  S
+    run 2  compio-pool  952597 req/s  p50 261.6us  p99 308.8us  S
+    run 2  tokio-default  927411 req/s  p50 271.5us  p99 460.0us  S
+    run 3  compio-pool  949208 req/s  p50 261.7us  p99 339.5us  S
+    run 3  tokio-default  929730 req/s  p50 270.6us  p99 459.6us  S
+    run 3  tokio-per-core  967127 req/s  p50 250.0us  p99 333.1us  S
+    point done; 3 min elapsed, about 0 min left
+finished in 3 min

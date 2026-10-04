@@ -1,125 +1,146 @@
-//! The pool handle, the acquire path, and the per-shard reaper.
+//! The pool: a `Send` blueprint you build once and clone onto every thread, and
+//! the strictly thread-local pool it stamps out on each.
+//!
+//! [`Pool`] holds nothing hot — only the manager and the configuration, behind
+//! one `Arc`. Cloning it is an `Arc` bump. The connections, the idle list and the
+//! slot count all live in the [`LocalPool`] that [`Pool::local`] creates on a
+//! thread: `Rc` and `Cell`, no lock and no atom, never `Send`. The type system
+//! then stops a connection — bound to one ring — from ever leaving its thread.
 
 use std::{
-    any::Any,
-    cell::RefCell,
-    collections::HashMap,
-    rc::{Rc, Weak},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
-    },
+    cell::{Cell, RefCell},
+    fmt,
+    future::Future,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    rc::Rc,
+    sync::Arc,
+    task::{Context, Poll, Waker},
     time::Instant,
 };
 
 use crate::{
-    config::Config,
-    error::Error,
-    exchange::{Exchange, NoExchange, Parked, Unparked},
-    guard::Pooled,
-    manage::Manage,
-    metrics::{Counters, Metrics},
-    shard::Shard,
-    slot::Slot,
+    builder::{Builder, PoolConfig},
+    manage::{ManageConnection, RunError},
 };
 
-static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(0);
-
-/// Holds a shard's capacity claim across an `await`, giving it back if the
-/// `acquire` future is cancelled.
+/// A blueprint for per-thread pools: build it once, clone it onto each compio
+/// thread you spawn, and call [`local`](Self::local) there.
 ///
-/// `acquire` claims budget with `Shard::try_reserve` *before* awaiting
-/// `Manage::connect`, `Exchange::unpark` or `Manage::recycle`, and `acquire`
-/// is itself cancellable - by the acquire timeout, or by the caller's own
-/// `select!`. Without this guard, a cancellation between the claim and the end
-/// of the await would leak that capacity permanently, and a shard would
-/// eventually sit at `max_size` holding no connections at all.
-struct Reserved<'a, M: Manage> {
-    shard: &'a Rc<Shard<M>>,
-    counters: &'a Counters,
-    /// True when a real connection is riding along, counted in `live`.
-    holds_conn: bool,
-    armed: bool,
+/// `Clone + Send + Sync`. Cloning shares nothing that is touched on the hot path
+/// — only the manager and the [`Builder`] settings. Every connection, idle list
+/// and counter belongs to one thread's [`LocalPool`].
+pub struct Pool<M: ManageConnection> {
+    shared: Arc<Shared<M>>,
 }
 
-impl<'a, M: Manage> Reserved<'a, M> {
-    /// Budget claimed, no connection behind it yet.
-    fn empty(shard: &'a Rc<Shard<M>>, counters: &'a Counters) -> Self {
+pub(crate) struct Shared<M: ManageConnection> {
+    manager: M,
+    config: PoolConfig,
+}
+
+impl<M: ManageConnection> Clone for Pool<M> {
+    fn clone(&self) -> Self {
         Self {
-            shard,
-            counters,
-            holds_conn: false,
-            armed: true,
+            shared: self.shared.clone(),
         }
     }
+}
 
-    /// Budget claimed and a live connection is out of the free list.
-    fn holding(shard: &'a Rc<Shard<M>>, counters: &'a Counters) -> Self {
+impl<M: ManageConnection> Pool<M> {
+    pub(crate) fn new(manager: M, config: PoolConfig) -> Self {
         Self {
-            shard,
-            counters,
-            holds_conn: true,
-            armed: true,
+            shared: Arc::new(Shared { manager, config }),
         }
     }
 
-    /// The await completed; ownership has passed on.
-    fn disarm(mut self) {
-        self.armed = false;
+    /// Start configuring a pool.
+    pub fn builder() -> Builder<M> {
+        Builder::new()
     }
-}
 
-impl<M: Manage> Drop for Reserved<'_, M> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if self.holds_conn {
-            // The connection is dropped by the cancelled future without a
-            // graceful `Manage::disconnect`; there is no way to await one here.
-            Counters::dec(&self.counters.live);
-            Counters::inc(&self.counters.closed);
-        }
-        self.shard.release();
+    /// The per-thread ceiling on open connections.
+    pub fn max_size(&self) -> u32 {
+        self.shared.config.max_size
     }
-}
 
-thread_local! {
-    /// Every pool's shard for *this* thread, keyed by pool id.
+    /// Make this thread's pool.
     ///
-    /// This is what makes `Pool` `Send + Sync` while `M::Connection` is not:
-    /// the `Arc<Inner>` holds no connections at all. They live here, and a
-    /// value in a thread-local is by construction only reachable from its own
-    /// thread. At thread exit the map drops, closing that thread's connections
-    /// on the thread whose compio driver owns them.
-    static SHARDS: RefCell<HashMap<u64, Box<dyn Any>>> = RefCell::new(HashMap::new());
+    /// Each call creates an **independent** [`LocalPool`] bound to the calling
+    /// thread. Call it once per compio thread and keep the handle; it is `Clone`
+    /// (a cheap `Rc` bump) if several tasks on that thread need it. Because the
+    /// returned pool is `!Send`, the compiler guarantees it — and the ring-bound
+    /// connections it holds — never move to another thread.
+    pub fn local(&self) -> LocalPool<M> {
+        LocalPool::new(self.shared.clone())
+    }
 }
 
-struct Inner<M: Manage, X: Exchange<M>> {
-    id: u64,
-    manager: Arc<M>,
-    config: Config,
-    exchange: X,
-    counters: Arc<Counters>,
-    generation: AtomicU64,
-    closed: AtomicBool,
+impl<M: ManageConnection> fmt::Debug for Pool<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pool")
+            .field("max_size", &self.shared.config.max_size)
+            .finish_non_exhaustive()
+    }
 }
 
-/// A sharded connection pool for `compio`.
+/// A snapshot of one thread's pool. See [`LocalPool::state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct State {
+    /// Open connections right now: idle plus checked out.
+    pub connections: u32,
+    /// How many of those are idle on the free list.
+    pub idle_connections: u32,
+}
+
+/// One connection plus the timestamps that decide when it is retired.
+struct Conn<C> {
+    raw: C,
+    created_at: Instant,
+    last_used: Instant,
+}
+
+fn is_expired<C>(conn: &Conn<C>, now: Instant, cfg: &PoolConfig) -> bool {
+    if let Some(max) = cfg.max_lifetime
+        && now.duration_since(conn.created_at) >= max
+    {
+        return true;
+    }
+    if let Some(idle) = cfg.idle_timeout
+        && now.duration_since(conn.last_used) >= idle
+    {
+        return true;
+    }
+    false
+}
+
+struct Inner<M: ManageConnection> {
+    shared: Arc<Shared<M>>,
+    idle: RefCell<Vec<Conn<M::Connection>>>,
+    /// Open connections, idle or checked out. Never exceeds `max_size`.
+    taken: Cell<u32>,
+    /// Woken when a slot frees or a connection returns to the idle list.
+    waiters: Waiters,
+}
+
+impl<M: ManageConnection> Inner<M> {
+    /// Give back one slot and wake anyone waiting for capacity.
+    fn release_slot(&self) {
+        self.taken.set(self.taken.get().saturating_sub(1));
+        self.waiters.wake_all();
+    }
+}
+
+/// One thread's pool, created by [`Pool::local`].
 ///
-/// Cheap to clone and `Send + Sync`: clone it onto every compio thread. Each
-/// thread transparently gets its own shard, so the acquire fast path touches no
-/// atomics and no locks.
-///
-/// The `X` parameter selects the cross-thread strategy. The default,
-/// [`NoExchange`], keeps threads fully independent. Swap in a
-/// [`Reservoir`](crate::Reservoir) — which requires [`Detach`](crate::Detach) —
-/// to let idle connections migrate to whichever thread needs them.
-pub struct Pool<M: Manage, X: Exchange<M> = NoExchange> {
-    inner: Arc<Inner<M, X>>,
+/// Holds the idle connections and the slot count for this thread alone — all
+/// `Rc`/`Cell`, no lock, no atom. `Clone` shares the same per-thread pool between
+/// tasks on the thread; it is never `Send`.
+pub struct LocalPool<M: ManageConnection> {
+    inner: Rc<Inner<M>>,
 }
 
-impl<M: Manage, X: Exchange<M>> Clone for Pool<M, X> {
+impl<M: ManageConnection> Clone for LocalPool<M> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -127,627 +148,342 @@ impl<M: Manage, X: Exchange<M>> Clone for Pool<M, X> {
     }
 }
 
-impl<M: Manage> Pool<M> {
-    /// Builds a pool with no cross-thread sharing.
-    pub fn new(manager: M, config: Config) -> Self {
-        Self::with_exchange(manager, config, NoExchange)
-    }
-
-    /// Starts a [`Builder`].
-    pub fn builder(manager: M) -> Builder<M, NoExchange> {
-        Builder {
-            manager,
-            config: Config::default(),
-            exchange: NoExchange,
-        }
-    }
-}
-
-impl<M: Manage, X: Exchange<M>> Pool<M, X> {
-    /// Builds a pool with an explicit cross-thread [`Exchange`].
-    pub fn with_exchange(manager: M, config: Config, exchange: X) -> Self {
+impl<M: ManageConnection> LocalPool<M> {
+    pub(crate) fn new(shared: Arc<Shared<M>>) -> Self {
+        let cap = shared.config.max_size.min(1024) as usize;
         Self {
-            inner: Arc::new(Inner {
-                id: NEXT_POOL_ID.fetch_add(1, Relaxed),
-                manager: Arc::new(manager),
-                config,
-                exchange,
-                counters: Arc::new(Counters::default()),
-                generation: AtomicU64::new(0),
-                closed: AtomicBool::new(false),
+            inner: Rc::new(Inner {
+                shared,
+                idle: RefCell::new(Vec::with_capacity(cap)),
+                taken: Cell::new(0),
+                waiters: Waiters::default(),
             }),
         }
     }
 
-    /// The manager, for callers that need to reach configuration through it.
-    pub fn manager(&self) -> &M {
-        self.inner.manager.as_ref()
+    /// The per-thread ceiling on open connections.
+    pub fn max_size(&self) -> u32 {
+        self.inner.shared.config.max_size
     }
 
-    /// The configuration this pool was built with.
-    pub fn config(&self) -> &Config {
-        &self.inner.config
-    }
-
-    /// Connections owned by *this thread's* shard, idle plus checked out.
-    pub fn local_size(&self) -> usize {
-        self.shard().size()
-    }
-
-    /// Idle connections sitting in *this thread's* shard.
-    pub fn local_idle(&self) -> usize {
-        self.shard().idle_len()
-    }
-
-    /// A snapshot of pool activity.
-    pub fn metrics(&self) -> Metrics {
-        self.inner.counters.snapshot(self.inner.exchange.parked())
-    }
-
-    /// Retires every connection created before this call.
-    ///
-    /// Live checkouts keep working and are closed when returned. Use after a
-    /// credential rotation or a failover, where existing sockets point at the
-    /// wrong place but the pool itself is still wanted.
-    pub fn invalidate(&self) {
-        self.inner.generation.fetch_add(1, Relaxed);
-        self.inner.exchange.clear();
-    }
-
-    /// Closes the pool.
-    ///
-    /// Subsequent [`acquire`](Pool::acquire) calls fail with
-    /// [`Error::Closed`]. This thread's idle connections are closed
-    /// immediately; other threads' are closed when they next touch the pool or
-    /// when their thread exits.
-    pub fn close(&self) {
-        self.inner.closed.store(true, Relaxed);
-        self.inner.exchange.clear();
-        let shard = self.shard();
-        for slot in shard.drain_all() {
-            self.destroy(&shard, slot);
+    /// A snapshot of this thread's open and idle connection counts.
+    pub fn state(&self) -> State {
+        State {
+            connections: self.inner.taken.get(),
+            idle_connections: self.inner.idle.borrow().len() as u32,
         }
     }
 
-    /// Whether [`close`](Pool::close) has been called.
-    pub fn is_closed(&self) -> bool {
-        self.inner.closed.load(Relaxed)
-    }
-
-    /// Opens connections on the current thread up to `min_idle`.
-    ///
-    /// Call this once per compio thread at startup so the first real request
-    /// does not pay for a handshake.
-    pub async fn warm(&self) -> Result<(), Error<M::Error>> {
-        let shard = self.shard();
-        let target = self.inner.config.effective_min_idle();
-        while shard.idle_len() < target {
-            if !shard.try_reserve(self.inner.config.max_size) {
+    /// Open connections up to [`min_idle`](Builder::min_idle) ahead of demand and
+    /// park them on the idle list. Returns how many were created. Stops early and
+    /// returns [`RunError::User`] if the manager fails to connect.
+    pub async fn warm(&self) -> Result<u32, RunError<M::Error>> {
+        let target = self.inner.shared.config.min_idle;
+        let mut made = 0;
+        while self.inner.taken.get() < target {
+            let Some(mut held) = self.try_reserve() else {
                 break;
-            }
-            match self.inner.manager.connect().await {
-                Ok(conn) => {
-                    Counters::inc(&self.inner.counters.created);
-                    Counters::inc(&self.inner.counters.live);
-                    let generation = self.inner.generation.load(Relaxed);
-                    shard.push_idle(Slot::new(conn, generation));
+            };
+            match self.inner.shared.manager.connect().await {
+                Ok(raw) => {
+                    let now = Instant::now();
+                    held.conn = Some(Conn {
+                        raw,
+                        created_at: now,
+                        last_used: now,
+                    });
+                    held.into_idle();
+                    made += 1;
                 }
-                Err(e) => {
-                    shard.release();
-                    return Err(Error::Backend(e));
-                }
+                // `held` drops here, releasing the slot it reserved.
+                Err(e) => return Err(RunError::User(e)),
             }
         }
-        Ok(())
+        Ok(made)
     }
 
-    /// Checks out a connection, waiting if the shard is at `max_size`.
+    /// Check a connection out of this thread's pool, waiting up to
+    /// [`connection_timeout`](Builder::connection_timeout) for one.
     ///
-    /// Must be called on a compio runtime thread. Honours
-    /// [`Config::acquire_timeout`].
-    pub async fn acquire(&self) -> Result<Pooled<M, X>, Error<M::Error>> {
-        match self.inner.config.acquire_timeout {
-            Some(limit) => match compio::time::timeout(limit, self.acquire_inner()).await {
-                Ok(result) => result,
-                Err(_elapsed) => {
-                    Counters::inc(&self.inner.counters.timeouts);
-                    Err(Error::Timeout)
-                }
-            },
-            None => self.acquire_inner().await,
+    /// Reuses an idle connection when there is one (validated first if
+    /// [`test_on_check_out`](Builder::test_on_check_out) is set), otherwise opens
+    /// one while under `max_size`, otherwise waits for a slot. The returned
+    /// [`PooledConnection`] derefs to the connection and returns it to this pool
+    /// when dropped.
+    pub async fn get(&self) -> Result<PooledConnection<M>, RunError<M::Error>> {
+        let timeout = self.inner.shared.config.connection_timeout;
+        match compio::time::timeout(timeout, self.get_inner()).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(RunError::TimedOut),
         }
     }
 
-    async fn acquire_inner(&self) -> Result<Pooled<M, X>, Error<M::Error>> {
-        let shard = self.shard();
+    async fn get_inner(&self) -> Result<PooledConnection<M>, RunError<M::Error>> {
         loop {
-            if self.inner.closed.load(Relaxed) {
-                return Err(Error::Closed);
-            }
-            let generation = self.inner.generation.load(Relaxed);
+            // Wait until there is an idle connection or room to open one. The
+            // check-and-take below is synchronous, so what we observed still
+            // holds when we act on it.
+            self.wait_ready().await;
 
-            // 1. Warmest idle connection on this thread. No atomics, no lock.
-            while let Some(slot) = shard.pop_idle() {
-                if slot.is_expired(&self.inner.config, generation) {
-                    self.destroy(&shard, slot);
-                    continue;
-                }
-                let Slot { mut conn, meta } = slot;
-                // The connection is now out of the free list but not yet in a
-                // guard: if this await is cancelled, `reserved` accounts for it.
-                let reserved = Reserved::holding(&shard, &self.inner.counters);
-                let recycled = self.inner.manager.recycle(&mut conn, &meta).await;
-                reserved.disarm();
-                match recycled {
-                    Ok(()) => {
-                        Counters::inc(&self.inner.counters.acquires);
-                        return Ok(Pooled::new(Slot { conn, meta }, shard, self.clone()));
-                    }
-                    Err(_) => {
-                        Counters::inc(&self.inner.counters.recycle_failures);
-                        self.destroy_conn(&shard, conn);
+            // Prefer a live idle connection.
+            if let Some(mut held) = self.pop_fresh_idle() {
+                if self.inner.shared.config.test_on_check_out {
+                    // Scope the borrow of `held` so it ends before the `drop`.
+                    let valid = {
+                        let conn = held.conn.as_mut().expect("idle held carries a connection");
+                        self.inner.shared.manager.is_valid(&mut conn.raw).await.is_ok()
+                    };
+                    if !valid {
+                        // Stale: dropping `held` releases the slot and the
+                        // connection; try again rather than failing.
+                        drop(held);
+                        continue;
                     }
                 }
+                return Ok(held.into_pooled());
             }
 
-            // 2. Room for one more on this thread? Claim the budget first, so
-            //    that unpark and connect are both covered by one reservation.
-            if shard.try_reserve(self.inner.config.max_size) {
-                // Both awaits below are cancellable; `reserved` hands the
-                // budget back if either is dropped part-way through.
-                let reserved = Reserved::empty(&shard, &self.inner.counters);
-                let unparked = self.inner.exchange.unpark().await;
-                reserved.disarm();
-
-                match unparked {
-                    // Someone else's idle socket, re-wrapped in this thread's
-                    // runtime. Cheaper than a handshake, so it is tried first.
-                    Unparked::Claimed(conn, meta) => {
-                        Counters::inc(&self.inner.counters.unparked);
-                        Counters::inc(&self.inner.counters.live);
-                        Counters::inc(&self.inner.counters.acquires);
-                        return Ok(Pooled::new(Slot { conn, meta }, shard, self.clone()));
+            // Nothing idle; open one if there is room.
+            if let Some(mut held) = self.try_reserve() {
+                match self.inner.shared.manager.connect().await {
+                    Ok(raw) => {
+                        let now = Instant::now();
+                        held.conn = Some(Conn {
+                            raw,
+                            created_at: now,
+                            last_used: now,
+                        });
+                        return Ok(held.into_pooled());
                     }
-                    // It was popped but could not be reattached, so it is gone.
-                    // Parking already decremented `live`; balance `created`
-                    // here and fall through to dialling a replacement.
-                    Unparked::Lost => Counters::inc(&self.inner.counters.closed),
-                    Unparked::Empty => {}
-                }
-                let reserved = Reserved::empty(&shard, &self.inner.counters);
-                let connected = self.inner.manager.connect().await;
-                reserved.disarm();
-                return match connected {
-                    Ok(conn) => {
-                        Counters::inc(&self.inner.counters.created);
-                        Counters::inc(&self.inner.counters.live);
-                        Counters::inc(&self.inner.counters.acquires);
-                        Ok(Pooled::new(
-                            Slot::new(conn, generation),
-                            shard,
-                            self.clone(),
-                        ))
-                    }
-                    Err(e) => {
-                        shard.release();
-                        Err(Error::Backend(e))
-                    }
-                };
-            }
-
-            // 3. At capacity. Wait for one of *this thread's* checkouts to come
-            //    back; they always will, so this cannot deadlock.
-            Counters::inc(&self.inner.counters.waits);
-            shard.wait().await;
-        }
-    }
-
-    /// Return path for [`Pooled::drop`].
-    pub(crate) fn release(
-        &self,
-        shard: &Rc<Shard<M>>,
-        mut slot: Slot<M::Connection>,
-        poisoned: bool,
-    ) {
-        slot.meta.uses += 1;
-        slot.meta.last_used = Instant::now();
-
-        if poisoned {
-            Counters::inc(&self.inner.counters.poisoned);
-            return self.destroy(shard, slot);
-        }
-        if self.inner.closed.load(Relaxed) {
-            return self.destroy(shard, slot);
-        }
-        let generation = self.inner.generation.load(Relaxed);
-        if slot.is_expired(&self.inner.config, generation) {
-            return self.destroy(shard, slot);
-        }
-
-        // Surplus idle connections are offered to other threads rather than
-        // held here until they age out. Only surplus: keep `min_idle` local,
-        // and never give one away while someone on this thread is waiting.
-        if !shard.has_waiters() && shard.idle_len() >= self.inner.config.effective_min_idle() {
-            let Slot { conn, meta } = slot;
-            match self.inner.exchange.park(conn, meta) {
-                Parked::Accepted => {
-                    // The reservoir took it; it is no longer this shard's.
-                    Counters::dec(&self.inner.counters.live);
-                    shard.release();
-                    return;
-                }
-                // `detach` found an operation still in flight and dropped it
-                // rather than hand a busy handle to another driver.
-                Parked::Destroyed => {
-                    Counters::dec(&self.inner.counters.live);
-                    Counters::inc(&self.inner.counters.closed);
-                    shard.release();
-                    return;
-                }
-                Parked::Refused(conn, meta) => slot = Slot { conn, meta },
-            }
-        }
-
-        shard.push_idle(slot);
-    }
-
-    /// Drops a connection out of the pool without closing it, for
-    /// [`Pooled::take`].
-    pub(crate) fn forget(&self, shard: &Rc<Shard<M>>) {
-        Counters::dec(&self.inner.counters.live);
-        shard.release();
-    }
-
-    fn destroy(&self, shard: &Rc<Shard<M>>, slot: Slot<M::Connection>) {
-        self.destroy_conn(shard, slot.conn);
-    }
-
-    fn destroy_conn(&self, shard: &Rc<Shard<M>>, conn: M::Connection) {
-        self.inner.manager.disconnect(conn);
-        Counters::dec(&self.inner.counters.live);
-        Counters::inc(&self.inner.counters.closed);
-        shard.release();
-    }
-
-    /// This thread's shard, creating it (and its reaper) on first touch.
-    fn shard(&self) -> Rc<Shard<M>> {
-        let id = self.inner.id;
-
-        let (shard, created) = SHARDS.with(|shards| {
-            let mut shards = shards.borrow_mut();
-            match shards.get(&id) {
-                Some(any) => (
-                    any.downcast_ref::<Rc<Shard<M>>>()
-                        .expect("pool id uniquely determines shard type")
-                        .clone(),
-                    false,
-                ),
-                None => {
-                    // Cloned here, not above: these are `Arc`s shared by every
-                    // thread, and bumping their refcounts on the hit path would
-                    // put two atomic RMWs on a contended cache line into every
-                    // single checkout.
-                    let shard = Rc::new(Shard::<M>::new(
-                        self.inner.counters.clone(),
-                        self.inner.manager.clone(),
-                    ));
-                    shards.insert(id, Box::new(shard.clone()));
-                    (shard, true)
+                    // `held` drops, releasing the reserved slot.
+                    Err(e) => return Err(RunError::User(e)),
                 }
             }
-        });
-
-        // Spawn outside the `with` closure: the thread-local is no longer
-        // borrowed, so the reaper is free to reach for its own shard.
-        if created && self.inner.config.needs_reaper() {
-            self.spawn_reaper(&shard);
+            // Another task took the slot between the wait and here: loop.
         }
-        shard
     }
 
-    fn spawn_reaper(&self, shard: &Rc<Shard<M>>) {
-        // Outside a compio runtime there is nothing to spawn onto. The pool
-        // still works; expired connections are then caught on acquire instead.
-        if compio::runtime::Runtime::try_with_current(|_| ()).is_err() {
+    /// Reserve a slot for a new connection, if under `max_size`.
+    fn try_reserve(&self) -> Option<Held<M>> {
+        let taken = self.inner.taken.get();
+        if taken < self.inner.shared.config.max_size {
+            self.inner.taken.set(taken + 1);
+            Some(Held {
+                inner: self.inner.clone(),
+                conn: None,
+                released: false,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Pop the newest idle connection, discarding any that have expired (each
+    /// discard frees its slot). `None` when the idle list is empty.
+    fn pop_fresh_idle(&self) -> Option<Held<M>> {
+        let now = Instant::now();
+        loop {
+            let conn = self.inner.idle.borrow_mut().pop()?;
+            if is_expired(&conn, now, &self.inner.shared.config) {
+                drop(conn);
+                self.inner.release_slot();
+                continue;
+            }
+            return Some(Held {
+                inner: self.inner.clone(),
+                conn: Some(conn),
+                released: false,
+            });
+        }
+    }
+
+    fn ready_now(&self) -> bool {
+        !self.inner.idle.borrow().is_empty()
+            || self.inner.taken.get() < self.inner.shared.config.max_size
+    }
+
+    fn wait_ready(&self) -> WaitReady<'_, M> {
+        WaitReady {
+            pool: self,
+            id: None,
+        }
+    }
+}
+
+impl<M: ManageConnection> fmt::Debug for LocalPool<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state();
+        f.debug_struct("LocalPool")
+            .field("max_size", &self.inner.shared.config.max_size)
+            .field("connections", &state.connections)
+            .field("idle", &state.idle_connections)
+            .finish()
+    }
+}
+
+/// A connection, or a reserved-but-not-yet-filled slot, that is counted in
+/// `taken` but not yet owned by a [`PooledConnection`]. Dropping it before it is
+/// committed releases the slot (and drops the connection, if any), which makes
+/// every early return and cancellation in `get`/`warm` leak-free.
+struct Held<M: ManageConnection> {
+    inner: Rc<Inner<M>>,
+    conn: Option<Conn<M::Connection>>,
+    released: bool,
+}
+
+impl<M: ManageConnection> Held<M> {
+    /// Hand the connection to a [`PooledConnection`]; the slot stays taken.
+    fn into_pooled(mut self) -> PooledConnection<M> {
+        let conn = self.conn.take();
+        self.released = true;
+        PooledConnection {
+            inner: self.inner.clone(),
+            conn,
+        }
+    }
+
+    /// Park the connection on the idle list; the slot stays taken.
+    fn into_idle(mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            conn.last_used = Instant::now();
+            self.inner.idle.borrow_mut().push(conn);
+            self.inner.waiters.wake_all();
+        }
+        self.released = true;
+    }
+}
+
+impl<M: ManageConnection> Drop for Held<M> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.conn.take();
+            self.inner.release_slot();
+        }
+    }
+}
+
+/// A connection checked out of its [`LocalPool`]. Derefs to the connection;
+/// dropping it runs [`has_broken`](ManageConnection::has_broken) and either
+/// returns the connection to this thread's idle list or drops it and frees the
+/// slot.
+pub struct PooledConnection<M: ManageConnection> {
+    inner: Rc<Inner<M>>,
+    conn: Option<Conn<M::Connection>>,
+}
+
+impl<M: ManageConnection> Deref for PooledConnection<M> {
+    type Target = M::Connection;
+
+    fn deref(&self) -> &M::Connection {
+        &self
+            .conn
+            .as_ref()
+            .expect("connection present until drop")
+            .raw
+    }
+}
+
+impl<M: ManageConnection> DerefMut for PooledConnection<M> {
+    fn deref_mut(&mut self) -> &mut M::Connection {
+        &mut self
+            .conn
+            .as_mut()
+            .expect("connection present until drop")
+            .raw
+    }
+}
+
+impl<M: ManageConnection> Drop for PooledConnection<M> {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            let broken = self.inner.shared.manager.has_broken(&mut conn.raw);
+            if broken || is_expired(&conn, Instant::now(), &self.inner.shared.config) {
+                drop(conn);
+                self.inner.release_slot();
+            } else {
+                conn.last_used = Instant::now();
+                self.inner.idle.borrow_mut().push(conn);
+                // A connection is available again; wake a waiter.
+                self.inner.waiters.wake_all();
+            }
+        }
+    }
+}
+
+impl<M: ManageConnection> fmt::Debug for PooledConnection<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PooledConnection")
+            .field("held", &self.conn.is_some())
+            .finish()
+    }
+}
+
+/// Wakers of futures waiting for the pool to be ready to hand out a connection.
+/// Each waiter owns an id so it can withdraw its waker if it is dropped first;
+/// nothing stale is ever woken.
+#[derive(Default)]
+struct Waiters {
+    next_id: Cell<u64>,
+    entries: RefCell<Vec<(u64, Waker)>>,
+}
+
+impl Waiters {
+    fn register(&self, id: &mut Option<u64>, waker: &Waker) {
+        let mut entries = self.entries.borrow_mut();
+        if let Some(existing) = *id
+            && let Some(entry) = entries.iter_mut().find(|(i, _)| *i == existing)
+        {
+            if !entry.1.will_wake(waker) {
+                entry.1 = waker.clone();
+            }
             return;
         }
-        let pool = self.clone();
-        let shard = Rc::downgrade(shard);
-        compio::runtime::spawn(async move { pool.reap_loop(shard).await }).detach();
+        let new_id = self.next_id.get();
+        self.next_id.set(new_id.wrapping_add(1));
+        entries.push((new_id, waker.clone()));
+        *id = Some(new_id);
     }
 
-    /// Enforces idle/lifetime limits and refills `min_idle` on one thread.
-    ///
-    /// Holds only a `Weak` to the shard, so it stops on its own once the
-    /// thread's shard is gone.
-    async fn reap_loop(self, shard: Weak<Shard<M>>) {
-        let interval = self.inner.config.reap_interval;
-        loop {
-            compio::time::sleep(interval).await;
+    fn unregister(&self, id: Option<u64>) {
+        if let Some(id) = id {
+            self.entries.borrow_mut().retain(|(i, _)| *i != id);
+        }
+    }
 
-            let Some(shard) = shard.upgrade() else { return };
-            if self.inner.closed.load(Relaxed) {
-                for slot in shard.drain_all() {
-                    self.destroy(&shard, slot);
-                }
-                return;
-            }
-
-            let generation = self.inner.generation.load(Relaxed);
-            for slot in shard.drain_expired(&self.inner.config, generation) {
-                self.destroy(&shard, slot);
-            }
-
-            let target = self.inner.config.effective_min_idle();
-            while shard.idle_len() < target && !shard.has_waiters() {
-                if !shard.try_reserve(self.inner.config.max_size) {
-                    break;
-                }
-                match self.inner.manager.connect().await {
-                    Ok(conn) => {
-                        Counters::inc(&self.inner.counters.created);
-                        Counters::inc(&self.inner.counters.live);
-                        shard.push_idle(Slot::new(conn, generation));
-                    }
-                    Err(_) => {
-                        shard.release();
-                        break;
-                    }
-                }
-            }
+    /// Wake everyone. The borrow is dropped before any waker runs, so a waker
+    /// that polls inline can register again without a double borrow.
+    fn wake_all(&self) {
+        let wakers: Vec<Waker> = self.entries.borrow_mut().drain(..).map(|(_, w)| w).collect();
+        for waker in wakers {
+            waker.wake();
         }
     }
 }
 
-impl<M: Manage, X: Exchange<M>> std::fmt::Debug for Pool<M, X> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pool")
-            .field("id", &self.inner.id)
-            .field("closed", &self.inner.closed.load(Relaxed))
-            .field("metrics", &self.metrics())
-            .finish_non_exhaustive()
-    }
+/// Resolves when the pool can hand out a connection — an idle one exists, or
+/// there is room to open one — keeping exactly one waker registered until then.
+struct WaitReady<'a, M: ManageConnection> {
+    pool: &'a LocalPool<M>,
+    id: Option<u64>,
 }
 
-/// Fluent constructor for [`Pool`].
-pub struct Builder<M: Manage, X: Exchange<M>> {
-    manager: M,
-    config: Config,
-    exchange: X,
-}
+impl<M: ManageConnection> Future for WaitReady<'_, M> {
+    type Output = ();
 
-impl<M: Manage, X: Exchange<M>> Builder<M, X> {
-    /// Replaces the whole configuration.
-    pub fn config(mut self, config: Config) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Maximum live connections per runtime thread.
-    pub fn max_size(mut self, n: usize) -> Self {
-        self.config = self.config.clone().max_size(n);
-        self
-    }
-
-    /// Idle connections each shard keeps warm.
-    pub fn min_idle(mut self, n: usize) -> Self {
-        self.config = self.config.clone().min_idle(n);
-        self
-    }
-
-    /// How long `acquire` waits before giving up.
-    pub fn acquire_timeout(mut self, t: impl Into<Option<std::time::Duration>>) -> Self {
-        self.config = self.config.clone().acquire_timeout(t);
-        self
-    }
-
-    /// Hard age cap on a connection.
-    pub fn max_lifetime(mut self, t: impl Into<Option<std::time::Duration>>) -> Self {
-        self.config = self.config.clone().max_lifetime(t);
-        self
-    }
-
-    /// How long a connection may sit idle before being reaped.
-    pub fn idle_timeout(mut self, t: impl Into<Option<std::time::Duration>>) -> Self {
-        self.config = self.config.clone().idle_timeout(t);
-        self
-    }
-
-    /// Retire a connection after this many checkouts.
-    pub fn max_uses(mut self, n: impl Into<Option<u64>>) -> Self {
-        self.config = self.config.clone().max_uses(n);
-        self
-    }
-
-    /// Installs a cross-thread [`Exchange`], changing the pool's type.
-    pub fn exchange<Y: Exchange<M>>(self, exchange: Y) -> Builder<M, Y> {
-        Builder {
-            manager: self.manager,
-            config: self.config,
-            exchange,
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if this.pool.ready_now() {
+            this.pool.inner.waiters.unregister(this.id.take());
+            Poll::Ready(())
+        } else {
+            this.pool.inner.waiters.register(&mut this.id, cx.waker());
+            Poll::Pending
         }
     }
-
-    /// Builds the pool.
-    pub fn build(self) -> Pool<M, X> {
-        Pool::with_exchange(self.manager, self.config, self.exchange)
-    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestManager;
-
-    fn untimed() -> Config {
-        Config::new().max_lifetime(None).idle_timeout(None)
-    }
-
-    fn pool() -> Pool<TestManager> {
-        Pool::new(TestManager::new(), untimed())
-    }
-
-    // ---- Reserved: the cancellation-safety guard ----------------------------
-    //
-    // `acquire` claims shard budget before awaiting, and `acquire` is itself
-    // cancellable. These four cases are the whole contract.
-
-    /// A guard for a claim that has already been converted into a real checkout
-    /// must not touch anything when it goes out of scope.
-    #[test]
-    fn a_disarmed_empty_reservation_returns_nothing() {
-        let p = pool();
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-
-        Reserved::empty(&shard, &p.inner.counters).disarm();
-
-        assert_eq!(shard.size(), 1, "the budget stayed claimed");
-        assert_eq!(p.metrics().closed, 0);
-    }
-
-    /// The point of the guard: a cancelled dial hands its budget back, or the
-    /// shard silently loses capacity until it sits at `max_size` holding nothing.
-    #[test]
-    fn a_dropped_empty_reservation_returns_the_budget() {
-        let p = pool();
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-
-        drop(Reserved::empty(&shard, &p.inner.counters));
-
-        assert_eq!(shard.size(), 0);
-        let m = p.metrics();
-        assert_eq!(m.closed, 0, "there was no connection to close");
-        assert_eq!(m.live, 0);
-    }
-
-    #[test]
-    fn a_disarmed_holding_reservation_leaves_the_connection_counted() {
-        let p = pool();
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-        Counters::inc(&p.inner.counters.live);
-
-        Reserved::holding(&shard, &p.inner.counters).disarm();
-
-        let m = p.metrics();
-        assert_eq!(m.live, 1, "the connection is still ours");
-        assert_eq!(m.closed, 0);
-        assert_eq!(shard.size(), 1);
-    }
-
-    /// A connection out of the free list but not yet in a guard is dropped by
-    /// the cancelled future, with no chance to await `disconnect`. It still has
-    /// to be accounted for.
-    #[test]
-    fn a_dropped_holding_reservation_counts_the_connection_closed() {
-        let p = pool();
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-        Counters::inc(&p.inner.counters.live);
-
-        drop(Reserved::holding(&shard, &p.inner.counters));
-
-        let m = p.metrics();
-        assert_eq!(m.live, 0);
-        assert_eq!(m.closed, 1);
-        assert_eq!(shard.size(), 0, "and the budget comes back too");
-    }
-
-    // ---- The thread-local shard map -----------------------------------------
-
-    #[test]
-    fn a_shard_is_created_once_per_thread_and_then_reused() {
-        let p = pool();
-        let first = p.shard();
-        let second = p.shard();
-        assert!(
-            Rc::ptr_eq(&first, &second),
-            "the hit path must not rebuild the shard"
-        );
-        // A clone of the handle is the same pool, so the same shard.
-        assert!(Rc::ptr_eq(&first, &p.clone().shard()));
-    }
-
-    #[test]
-    fn two_pools_of_the_same_type_do_not_share_a_shard() {
-        let a = pool();
-        let b = pool();
-        assert!(
-            !Rc::ptr_eq(&a.shard(), &b.shard()),
-            "shards are keyed by pool id, not by connection type"
-        );
-    }
-
-    /// Outside a compio runtime there is nothing to spawn the reaper onto. The
-    /// pool must still be usable; expiry is then enforced on acquire instead.
-    #[test]
-    fn a_pool_with_a_reaper_config_works_without_a_runtime() {
-        let p = Pool::new(TestManager::new(), Config::new().min_idle(2));
-        assert!(p.config().needs_reaper());
-        assert_eq!(p.local_size(), 0);
-        assert_eq!(p.local_idle(), 0);
-    }
-
-    #[test]
-    fn a_pool_without_a_reaper_config_skips_the_spawn_entirely() {
-        let p = pool();
-        assert!(!p.config().needs_reaper());
-        assert_eq!(p.local_size(), 0);
-    }
-
-    // ---- Handle surface ------------------------------------------------------
-
-    #[test]
-    fn debug_reports_identity_state_and_metrics() {
-        let p = pool();
-        let s = format!("{p:?}");
-        assert!(s.contains("closed: false"), "got {s}");
-        assert!(s.contains("metrics"), "got {s}");
-
-        p.close();
-        assert!(format!("{p:?}").contains("closed: true"));
-    }
-
-    #[test]
-    fn pool_ids_are_unique() {
-        let a = pool();
-        let b = pool();
-        assert_ne!(a.inner.id, b.inner.id);
-    }
-
-    #[test]
-    fn destroy_closes_through_the_manager_and_frees_budget() {
-        let manager = TestManager::new();
-        let counts = manager.counts();
-        let p = Pool::new(manager, untimed());
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-        Counters::inc(&p.inner.counters.live);
-
-        p.destroy(&shard, Slot::new(crate::test_support::TestConn::new(0), 0));
-
-        assert_eq!(counts.disconnected(), 1);
-        assert_eq!(shard.size(), 0);
-        let m = p.metrics();
-        assert_eq!((m.live, m.closed), (0, 1));
-    }
-
-    #[test]
-    fn forget_frees_budget_without_closing_anything() {
-        let manager = TestManager::new();
-        let counts = manager.counts();
-        let p = Pool::new(manager, untimed());
-        let shard = p.shard();
-        assert!(shard.try_reserve(4));
-        Counters::inc(&p.inner.counters.live);
-
-        p.forget(&shard);
-
-        assert_eq!(counts.disconnected(), 0, "the caller owns it now");
-        assert_eq!(shard.size(), 0, "but the shard may open a replacement");
-        let m = p.metrics();
-        assert_eq!((m.live, m.closed), (0, 0));
+impl<M: ManageConnection> Drop for WaitReady<'_, M> {
+    fn drop(&mut self) {
+        self.pool.inner.waiters.unregister(self.id.take());
     }
 }

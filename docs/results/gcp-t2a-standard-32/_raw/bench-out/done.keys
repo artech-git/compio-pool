@@ -1,0 +1,20 @@
+scale512|W=1
+scale512|W=2
+scale512|W=4
+scale512|W=8
+scale512|W=12
+scale16k|W=1
+scale16k|W=2
+scale16k|W=4
+scale16k|W=8
+scale16k|W=12
+payload|64 B
+payload|512 B
+payload|2048 B
+payload|8192 B
+payload|16384 B
+conns|4 conns
+conns|16 conns
+conns|64 conns
+conns|256 conns
+conns|1024 conns
