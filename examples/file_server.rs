@@ -1,221 +1,212 @@
-//! Static-file benchmark: each request names a file, the response is its
-//! length and bytes. Disk read → socket write, the classic static-server path.
+//! Disk **file I/O**: a thread-per-core static-file server. Each request names a
+//! file; the reply is its size then its bytes, read straight off disk through the
+//! ring and written to the socket.
 //!
-//! On compio the whole request — open, read_at, socket write — is io_uring
-//! submissions from one pinned thread. The tokio baseline must bounce every
-//! file operation through its blocking thread pool, which is exactly the
-//! difference this example exists to measure.
+//! This is the example where `io_uring` earns its keep: the open, the positional
+//! `read_at`s and the socket writes are all submissions from one pinned thread,
+//! never a blocking-threadpool hop. The crate's [`Pool`] supplies the reusable
+//! 64 KiB transfer buffer each connection streams through.
 //!
 //! Protocol, one request per line on a persistent connection:
 //!   client:  `<filename>\n`
-//!   server:  `<size>\n<size raw bytes>`   or   `ERR <why>\n`
+//!   server:  `<size>\n` then `<size>` raw bytes   — or   `ERR <why>\n`
+//!
+//! Filenames are resolved inside `FILE_DIR` and may not contain a path separator,
+//! so a request cannot escape that directory.
 //!
 //! ```text
 //! FILE_DIR=/tmp/bench-files \
-//! cargo run --release --example file_server -- [ADDR] [CAPACITY] [WORKERS] [FLAGS]
+//! cargo run --release --example file_server -- [ADDR] [CAPACITY]
+//!   ADDR       bind address               default 0.0.0.0:7000
+//!   CAPACITY   buffers (connections)      default 1024
 //! ```
 //!
-//! Drive it with `examples/load_file.rs`, which also creates the test files.
+//! Drive it with `examples/load_file.rs`, which creates the test files first.
 
-use std::{io, net::SocketAddr, path::PathBuf, sync::LazyLock, time::Duration};
+use std::{io, net::SocketAddr, path::PathBuf, sync::LazyLock, thread};
 
 use compio::{
     BufResult,
+    fs::File,
     io::{AsyncRead, AsyncReadAt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    runtime::Runtime,
 };
-use compio_pool::{Connection, Resource, Server, Service, UringConfig, WorkerContext, Workers};
+use compio_pool::{LocalPool, ManageConnection, Pool, bind_reuseport, cpu};
 
+/// The directory requested files are resolved inside.
 static BASE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
     PathBuf::from(std::env::var("FILE_DIR").unwrap_or_else(|_| "/tmp/bench-files".into()))
 });
 
-struct Bufs {
-    req: Vec<u8>,
-    data: Vec<u8>,
-}
+/// Hands out reusable 64 KiB transfer buffers, one per connection in flight.
+struct Buffers;
 
-impl Resource for Bufs {
-    async fn create(_cx: &WorkerContext) -> io::Result<Self> {
-        Ok(Bufs {
-            req: Vec::with_capacity(4096),
-            data: Vec::with_capacity(64 * 1024),
-        })
+impl ManageConnection for Buffers {
+    type Connection = Vec<u8>;
+    type Error = io::Error;
+
+    async fn connect(&self) -> io::Result<Vec<u8>> {
+        Ok(Vec::with_capacity(64 * 1024))
     }
 
-    fn recycle(&mut self) -> bool {
-        // A handler error can strand a buffer mid-flight; re-arm so the next
-        // connection never sees a zero-capacity vec.
-        if self.req.capacity() == 0 {
-            self.req = Vec::with_capacity(4096);
-        }
-        if self.data.capacity() == 0 {
-            self.data = Vec::with_capacity(64 * 1024);
-        }
-        true
+    async fn is_valid(&self, _buf: &mut Vec<u8>) -> io::Result<()> {
+        Ok(())
     }
-}
 
-#[derive(Clone)]
-struct FileServer;
-
-impl Service for FileServer {
-    type Resource = Bufs;
-
-    async fn handle(&self, mut conn: Connection, bufs: &mut Bufs) -> io::Result<()> {
-        loop {
-            // One request line: the filename.
-            let mut req = std::mem::take(&mut bufs.req);
-            req.clear();
-            let BufResult(n, req) = conn.stream.read(req).await;
-            bufs.req = req;
-            match n {
-                Ok(0) => return Ok(()),
-                Ok(_) => {}
-                Err(e) => return Err(e),
-            }
-
-            let file_path = {
-                let s = match std::str::from_utf8(&bufs.req) {
-                    Ok(s) => s.trim_end_matches(['\r', '\n']),
-                    Err(_) => {
-                        let BufResult(w, _) =
-                            conn.stream.write_all(b"ERR utf8\n".to_vec()).await;
-                        w?;
-                        continue;
-                    }
-                };
-                BASE_DIR.join(s)
-            };
-
-            let file = match compio::fs::File::open(&file_path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    let BufResult(w, _) =
-                        conn.stream.write_all(format!("ERR {e}\n").into_bytes()).await;
-                    w?;
-                    continue;
-                }
-            };
-            let size = file.metadata().await?.len();
-
-            let BufResult(w, _) = conn.stream.write_all(format!("{size}\n").into_bytes()).await;
-            w?;
-
-            // Stream the file: read_at into the pooled buffer, write to the
-            // socket, both through the ring.
-            let mut data = std::mem::take(&mut bufs.data);
-            let mut offset = 0u64;
-            while offset < size {
-                data.clear();
-                let BufResult(n, d) = file.read_at(data, offset).await;
-                data = d;
-                let n = match n {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) => {
-                        bufs.data = data;
-                        return Err(e);
-                    }
-                };
-                offset += n as u64;
-                let BufResult(w, d) = conn.stream.write_all(data).await;
-                data = d;
-                if let Err(e) = w {
-                    bufs.data = data;
-                    return Err(e);
-                }
-            }
-            bufs.data = data;
-        }
+    fn has_broken(&self, _buf: &mut Vec<u8>) -> bool {
+        false
     }
 }
 
 fn main() -> io::Result<()> {
-    let (flags, positional): (Vec<String>, Vec<String>) =
-        std::env::args().skip(1).partition(|a| a.starts_with("--"));
-    const KNOWN: [&str; 3] = ["--incoming-cpu", "--defer-taskrun", "--no-coop-taskrun"];
-    if let Some(unknown) = flags.iter().find(|f| !KNOWN.contains(&f.as_str())) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unknown flag {unknown}"),
-        ));
-    }
-    let has = |name: &str| flags.iter().any(|f| f == name);
-    let incoming_cpu = has("--incoming-cpu");
-    let uring = UringConfig {
-        defer_taskrun: has("--defer-taskrun"),
-        coop_taskrun: !has("--no-coop-taskrun"),
-        ..UringConfig::default()
-    };
-    let mut args = positional.into_iter();
-    let addr: SocketAddr = args
-        .next()
+    let addr: SocketAddr = std::env::args()
+        .nth(1)
         .unwrap_or_else(|| "0.0.0.0:7000".into())
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad address: {e}")))?;
-    let capacity: usize = args
-        .next()
-        .map(|s| s.parse())
-        .transpose()
-        .map_err(invalid)?
+    let capacity: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
-    let workers = match args
-        .next()
-        .map(|s| s.parse::<usize>())
-        .transpose()
-        .map_err(invalid)?
-    {
-        Some(n) => Workers::Count(n),
-        None => Workers::AllCores,
-    };
 
-    let server = Server::builder(FileServer)
-        .bind(addr)
-        .workers(workers)
-        .capacity(capacity)
-        .handoff_capacity(4096)
-        .incoming_cpu(incoming_cpu)
-        .uring(uring.clone())
-        .start()?;
+    let pool = Pool::builder().max_size(capacity).build(Buffers);
 
-    println!(
-        "file_server on {} serving {} — {} workers, capacity {} each",
-        server.local_addr(),
-        BASE_DIR.display(),
-        server.workers(),
-        capacity
-    );
-    for (i, core) in server.cores().iter().enumerate() {
-        println!(
-            "  worker {i:>2} -> cpu {:>3}  smp_affinity {}",
-            core.id,
-            compio_pool::cpu::affinity_mask(core.id)
-        );
+    let cores = cpu::cores();
+    if cores.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "no cores to run on"));
     }
-    println!();
+    println!(
+        "file_server on {addr} serving {}: {} workers, capacity {capacity}/worker",
+        BASE_DIR.display(),
+        cores.len()
+    );
 
+    let mut handles = Vec::new();
+    for (index, core) in cores.into_iter().enumerate() {
+        let pool = pool.clone();
+        let handle = thread::Builder::new()
+            .name(format!("worker/{index}"))
+            .spawn(move || worker(core, addr, pool))?;
+        handles.push(handle);
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    Ok(())
+}
+
+fn worker(core: cpu::CoreId, addr: SocketAddr, pool: Pool<Buffers>) {
+    cpu::pin_current(core);
+
+    let runtime = Runtime::builder().build().expect("build compio runtime");
+    runtime.block_on(async move {
+        let local = pool.local();
+
+        let std_listener = bind_reuseport(addr, 1024, None).expect("bind SO_REUSEPORT");
+        let listener = TcpListener::from_std(std_listener).expect("wrap listener in ring");
+
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                continue;
+            };
+            // The reply is a size header followed by the body — two writes. Without
+            // TCP_NODELAY, Nagle holds the body waiting for the header's ACK, which
+            // the peer delays ~40 ms, so disable it on every accepted connection.
+            let _ = stream.set_nodelay(true);
+            compio::runtime::spawn(serve(local.clone(), stream)).detach();
+        }
+    });
+}
+
+/// Serve requests on one connection until it closes. Opening the file is per
+/// request; the large transfer buffer is pooled and reused across every file.
+async fn serve(local: LocalPool<Buffers>, mut stream: TcpStream) {
+    let mut req = Vec::with_capacity(1024);
     loop {
-        std::thread::sleep(Duration::from_secs(1));
-        let s = server.stats();
-        let t = s.totals;
-        println!(
-            "active {:>5}  queued {:>4}/{:<4}  accepted {:>8}  local {:>8}  handed_off {:>6}  claimed {:>6}  bounced {:>4}  oversub {:>4}  rejected {:>4}  done {:>8}  errs {}",
-            t.active,
-            s.queued,
-            s.handoff_capacity,
-            t.accepted,
-            t.served_local,
-            t.handed_off,
-            t.claimed,
-            t.bounced,
-            t.oversubscribed,
-            t.rejected,
-            t.completed,
-            t.handler_errors + t.resource_errors + t.accept_errors
-        );
+        req.clear();
+        let BufResult(read, b) = stream.read(req).await;
+        req = b;
+        match read {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+
+        // Parse the filename and keep it inside BASE_DIR.
+        let name = match std::str::from_utf8(&req) {
+            Ok(s) => s.trim_end_matches(['\r', '\n']).to_string(),
+            Err(_) => {
+                if reply_err(&mut stream, "utf8").await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+        if name.is_empty() || name.contains('/') || name.contains("..") {
+            if reply_err(&mut stream, "bad name").await.is_err() {
+                return;
+            }
+            continue;
+        }
+
+        let path = BASE_DIR.join(&name);
+        let file = match File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => {
+                if reply_err(&mut stream, &e.to_string()).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+        let size = match file.metadata().await {
+            Ok(m) => m.len(),
+            Err(e) => {
+                if reply_err(&mut stream, &e.to_string()).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+
+        // Size header, then the body streamed through the pooled buffer.
+        let BufResult(w, _) = stream.write_all(format!("{size}\n").into_bytes()).await;
+        if w.is_err() {
+            return;
+        }
+
+        let mut lease = match local.get().await {
+            Ok(lease) => lease,
+            Err(_) => return,
+        };
+        let mut data = std::mem::take(&mut *lease);
+        let mut offset = 0u64;
+        while offset < size {
+            data.clear();
+            let BufResult(r, d) = file.read_at(data, offset).await;
+            data = d;
+            let n = match r {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => {
+                    *lease = data;
+                    return;
+                }
+            };
+            offset += n as u64;
+            let BufResult(w, d) = stream.write_all(data).await;
+            data = d;
+            if w.is_err() {
+                *lease = data;
+                return;
+            }
+        }
+        *lease = data; // return the transfer buffer to the pool
     }
 }
 
-fn invalid(e: std::num::ParseIntError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, e)
+/// Send a one-line `ERR <why>` response. Returns `Err` if the socket is gone.
+async fn reply_err(stream: &mut TcpStream, why: &str) -> io::Result<()> {
+    let BufResult(w, _) = stream.write_all(format!("ERR {why}\n").into_bytes()).await;
+    w
 }

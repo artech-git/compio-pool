@@ -1,20 +1,22 @@
-//! The per-worker `SO_REUSEPORT` listener (recipe step 9).
+//! A `SO_REUSEPORT` listener helper, for building your own thread-per-core
+//! accept loop around a [`Pool`](crate::Pool).
 
 use std::{io, net::SocketAddr};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-/// Create, configure, bind and listen a raw TCP socket for one worker.
+/// Create, configure, bind and listen a raw TCP socket that shares its address
+/// with the other threads' listeners.
 ///
 /// `SO_REUSEADDR` and `SO_REUSEPORT` are set **before** `bind`, which is what
-/// lets every worker bind the same address and makes the kernel split incoming
+/// lets every thread bind the same address and makes the kernel split incoming
 /// connections across the group by flow hash. With `incoming_cpu`, the socket
 /// also carries `SO_INCOMING_CPU = cpu`, so when packet steering delivers a flow
 /// on that CPU the kernel prefers this listener for it.
 ///
-/// The result is a plain [`std::net::TcpListener`]: the caller wraps it in its
-/// own runtime with [`compio::net::TcpListener::from_std`] (step 10), which is
-/// what attaches it to that thread's ring.
+/// The result is a plain [`std::net::TcpListener`]: wrap it in the thread's
+/// runtime with [`compio::net::TcpListener::from_std`], which attaches it to that
+/// thread's ring.
 pub fn bind_reuseport(
     addr: SocketAddr,
     backlog: i32,

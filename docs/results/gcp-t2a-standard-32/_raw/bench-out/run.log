@@ -1,0 +1,226 @@
+results directory: /home/prabhat/bench-out
+preflight: starting each server once ...
+  tokio-default: ok (108587 req/s)
+  tokio-per-core: ok (90357 req/s)
+  compio-pool: ok (301036 req/s)
+[1/20] scale512 / W=1   W=1 conns=64 bytes=512 server=0 clients=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  96944 req/s  p50 667.4us  p99 724.2us  S
+    run 1  tokio-per-core  80776 req/s  p50 786.1us  p99 854.2us  S
+    run 1  compio-pool  103880 req/s  p50 608.2us  p99 703.8us  S
+    run 2  tokio-per-core  100838 req/s  p50 628.8us  p99 698.5us  S
+    run 2  compio-pool  100983 req/s  p50 624.3us  p99 717.3us  S
+    run 2  tokio-default  78786 req/s  p50 825.4us  p99 888.8us  S
+    run 3  compio-pool  104023 req/s  p50 608.9us  p99 699.6us  S
+    run 3  tokio-default  100851 req/s  p50 642.8us  p99 695.1us  S
+    run 3  tokio-per-core  80179 req/s  p50 795.5us  p99 851.0us  S
+    point done; 0 min elapsed, about 18 min left
+[2/20] scale512 / W=2   W=2 conns=64 bytes=512 server=0,1 clients=2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  182438 req/s  p50 353.4us  p99 547.2us  S
+    run 1  tokio-per-core  172224 req/s  p50 398.8us  p99 455.0us  S
+    run 1  compio-pool  225028 req/s  p50 279.0us  p99 318.4us  S
+    run 2  tokio-per-core  174395 req/s  p50 368.2us  p99 426.2us  S
+    run 2  compio-pool  223649 req/s  p50 285.2us  p99 328.6us  S
+    run 2  tokio-default  183459 req/s  p50 351.3us  p99 544.3us  S
+    run 3  compio-pool  220506 req/s  p50 288.7us  p99 333.4us  S
+    run 3  tokio-default  155032 req/s  p50 419.6us  p99 640.6us  S
+    run 3  tokio-per-core  207698 req/s  p50 304.7us  p99 361.0us  S
+    point done; 1 min elapsed, about 17 min left
+[3/20] scale512 / W=4   W=4 conns=128 bytes=512 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  333666 req/s  p50 372.6us  p99 696.8us  S
+    run 1  tokio-per-core  417961 req/s  p50 304.3us  p99 382.6us  S
+    run 1  compio-pool  436333 req/s  p50 269.5us  p99 396.9us  S
+    run 2  tokio-per-core  344984 req/s  p50 356.7us  p99 483.2us  S
+    run 2  compio-pool  441610 req/s  p50 291.7us  p99 377.2us  S
+    run 2  tokio-default  289385 req/s  p50 429.4us  p99 806.3us  S
+    run 3  compio-pool  419048 req/s  p50 300.6us  p99 423.4us  S
+    run 3  tokio-default  330211 req/s  p50 373.8us  p99 717.2us  S
+    run 3  tokio-per-core  348429 req/s  p50 389.3us  p99 443.9us  S
+    point done; 2 min elapsed, about 16 min left
+[4/20] scale512 / W=8   W=8 conns=256 bytes=512 server=0,1,2,3,4,5,6,7 clients=8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  564058 req/s  p50 426.4us  p99 937.3us  S
+    run 1  tokio-per-core  688059 req/s  p50 368.0us  p99 482.1us  S
+    run 1  compio-pool  856025 req/s  p50 309.8us  p99 405.0us  S
+    run 2  tokio-per-core  685246 req/s  p50 370.7us  p99 442.0us  S
+    run 2  compio-pool  871389 req/s  p50 288.5us  p99 364.8us  S
+    run 2  tokio-default  632866 req/s  p50 377.2us  p99 833.5us  S
+    run 3  compio-pool  878359 req/s  p50 289.2us  p99 361.9us  S
+    run 3  tokio-default  646069 req/s  p50 369.9us  p99 814.6us  S
+    run 3  tokio-per-core  688430 req/s  p50 368.5us  p99 485.1us  S
+    point done; 3 min elapsed, about 15 min left
+[5/20] scale512 / W=12   W=12 conns=384 bytes=512 server=0,1,2,3,4,5,6,7,8,9,10,11 clients=12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  720707 req/s  p50 387.5us  p99 943.4us  
+    run 1  tokio-per-core  1082194 req/s  p50 340.0us  p99 532.9us  S
+    run 1  compio-pool  1197871 req/s  p50 322.4us  p99 417.0us  S
+    run 2  tokio-per-core  1087346 req/s  p50 352.5us  p99 501.2us  S
+    run 2  compio-pool  1208056 req/s  p50 299.8us  p99 436.9us  S
+    run 2  tokio-default  675920 req/s  p50 418.9us  p99 1006.7us  
+    run 3  compio-pool  1188072 req/s  p50 321.9us  p99 416.1us  S
+    run 3  tokio-default  715702 req/s  p50 388.9us  p99 940.8us  
+    run 3  tokio-per-core  1063374 req/s  p50 360.9us  p99 430.4us  S
+    point done; 4 min elapsed, about 14 min left
+[6/20] scale16k / W=1   W=1 conns=64 bytes=16384 server=0 clients=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  56474 req/s  p50 1137.0us  p99 1244.8us  S
+    run 1  tokio-per-core  65162 req/s  p50 975.8us  p99 1039.5us  S
+    run 1  compio-pool  66845 req/s  p50 941.3us  p99 1106.4us  S
+    run 2  tokio-per-core  56257 req/s  p50 1126.8us  p99 1228.3us  S
+    run 2  compio-pool  64434 req/s  p50 975.1us  p99 1140.1us  S
+    run 2  tokio-default  54140 req/s  p50 1193.5us  p99 1274.0us  S
+    run 3  compio-pool  64912 req/s  p50 968.8us  p99 1140.5us  S
+    run 3  tokio-default  54114 req/s  p50 1192.3us  p99 1271.6us  S
+    run 3  tokio-per-core  63797 req/s  p50 1001.6us  p99 1074.9us  S
+    point done; 5 min elapsed, about 13 min left
+[7/20] scale16k / W=2   W=2 conns=64 bytes=16384 server=0,1 clients=2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  107558 req/s  p50 603.8us  p99 907.5us  S
+    run 1  tokio-per-core  119348 req/s  p50 531.6us  p99 604.5us  S
+    run 1  compio-pool  140288 req/s  p50 451.0us  p99 516.3us  S
+    run 2  tokio-per-core  121248 req/s  p50 426.3us  p99 709.0us  S
+    run 2  compio-pool  134419 req/s  p50 438.3us  p99 598.2us  S
+    run 2  tokio-default  120477 req/s  p50 541.4us  p99 817.1us  S
+    run 3  compio-pool  137926 req/s  p50 460.0us  p99 531.5us  S
+    run 3  tokio-default  118272 req/s  p50 552.8us  p99 841.8us  S
+    run 3  tokio-per-core  114361 req/s  p50 557.3us  p99 614.4us  S
+    point done; 6 min elapsed, about 12 min left
+[8/20] scale16k / W=4   W=4 conns=128 bytes=16384 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  203540 req/s  p50 613.5us  p99 1171.8us  S
+    run 1  tokio-per-core  236606 req/s  p50 513.4us  p99 720.8us  S
+    run 1  compio-pool  271346 req/s  p50 451.4us  p99 617.9us  S
+    run 2  tokio-per-core  266049 req/s  p50 461.3us  p99 609.3us  S
+    run 2  compio-pool  268280 req/s  p50 471.7us  p99 581.5us  S
+    run 2  tokio-default  207124 req/s  p50 606.4us  p99 1130.9us  S
+    run 3  compio-pool  273789 req/s  p50 447.5us  p99 586.9us  S
+    run 3  tokio-default  226217 req/s  p50 549.6us  p99 1066.5us  S
+    run 3  tokio-per-core  236905 req/s  p50 524.6us  p99 772.4us  S
+    point done; 7 min elapsed, about 11 min left
+[9/20] scale16k / W=8   W=8 conns=256 bytes=16384 server=0,1,2,3,4,5,6,7 clients=8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  388716 req/s  p50 628.0us  p99 1363.7us  S
+    run 1  tokio-per-core  450091 req/s  p50 556.2us  p99 764.5us  S
+    run 1  compio-pool  538077 req/s  p50 469.3us  p99 611.6us  S
+    run 2  tokio-per-core  455936 req/s  p50 507.7us  p99 859.2us  S
+    run 2  compio-pool  547440 req/s  p50 430.0us  p99 629.4us  S
+    run 2  tokio-default  419580 req/s  p50 578.8us  p99 1247.9us  S
+    run 3  compio-pool  538030 req/s  p50 482.1us  p99 553.1us  S
+    run 3  tokio-default  414210 req/s  p50 586.9us  p99 1271.8us  S
+    run 3  tokio-per-core  450475 req/s  p50 588.6us  p99 711.4us  S
+    point done; 8 min elapsed, about 10 min left
+[10/20] scale16k / W=12   W=12 conns=384 bytes=16384 server=0,1,2,3,4,5,6,7,8,9,10,11 clients=12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  437777 req/s  p50 662.8us  p99 1600.7us  
+    run 1  tokio-per-core  652418 req/s  p50 601.5us  p99 868.5us  S
+    run 1  compio-pool  716264 req/s  p50 524.7us  p99 736.5us  S
+    run 2  tokio-per-core  686068 req/s  p50 523.9us  p99 814.4us  S
+    run 2  compio-pool  702850 req/s  p50 560.2us  p99 701.0us  S
+    run 2  tokio-default  436812 req/s  p50 660.3us  p99 1649.5us  
+    run 3  compio-pool  705978 req/s  p50 524.8us  p99 728.9us  S
+    run 3  tokio-default  433540 req/s  p50 660.2us  p99 1600.2us  
+    run 3  tokio-per-core  648110 req/s  p50 575.6us  p99 818.6us  S
+    point done; 9 min elapsed, about 9 min left
+[11/20] payload / 64 B   W=4 conns=128 bytes=64 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  337176 req/s  p50 367.3us  p99 684.4us  S
+    run 1  tokio-per-core  346942 req/s  p50 366.1us  p99 518.4us  S
+    run 1  compio-pool  459962 req/s  p50 279.3us  p99 336.3us  S
+    run 2  tokio-per-core  428601 req/s  p50 315.7us  p99 372.0us  S
+    run 2  compio-pool  444372 req/s  p50 285.8us  p99 332.9us  S
+    run 2  tokio-default  339975 req/s  p50 363.4us  p99 692.0us  S
+    run 3  compio-pool  458295 req/s  p50 256.6us  p99 355.6us  S
+    run 3  tokio-default  292674 req/s  p50 423.9us  p99 812.2us  S
+    run 3  tokio-per-core  355786 req/s  p50 350.3us  p99 463.8us  S
+    point done; 10 min elapsed, about 8 min left
+[12/20] payload / 512 B   W=4 conns=128 bytes=512 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  288024 req/s  p50 432.6us  p99 800.7us  S
+    run 1  tokio-per-core  343459 req/s  p50 364.2us  p99 437.6us  S
+    run 1  compio-pool  431100 req/s  p50 292.5us  p99 367.4us  S
+    run 2  tokio-per-core  344775 req/s  p50 358.5us  p99 449.7us  S
+    run 2  compio-pool  433162 req/s  p50 281.0us  p99 387.4us  S
+    run 2  tokio-default  286905 req/s  p50 434.6us  p99 806.1us  S
+    run 3  compio-pool  439645 req/s  p50 297.2us  p99 360.0us  S
+    run 3  tokio-default  286212 req/s  p50 435.4us  p99 814.4us  S
+    run 3  tokio-per-core  414058 req/s  p50 308.7us  p99 387.8us  S
+    point done; 11 min elapsed, about 7 min left
+[13/20] payload / 2048 B   W=4 conns=128 bytes=2048 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  263450 req/s  p50 472.8us  p99 884.9us  S
+    run 1  tokio-per-core  382490 req/s  p50 349.2us  p99 415.9us  S
+    run 1  compio-pool  393966 req/s  p50 321.2us  p99 371.4us  S
+    run 2  tokio-per-core  381685 req/s  p50 317.7us  p99 457.5us  S
+    run 2  compio-pool  392112 req/s  p50 341.8us  p99 413.6us  S
+    run 2  tokio-default  303853 req/s  p50 407.5us  p99 780.2us  S
+    run 3  compio-pool  393750 req/s  p50 331.0us  p99 385.4us  S
+    run 3  tokio-default  261337 req/s  p50 476.2us  p99 895.2us  S
+    run 3  tokio-per-core  381521 req/s  p50 364.3us  p99 419.4us  S
+    point done; 12 min elapsed, about 6 min left
+[14/20] payload / 8192 B   W=4 conns=128 bytes=8192 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  260154 req/s  p50 478.0us  p99 903.0us  S
+    run 1  tokio-per-core  323917 req/s  p50 410.7us  p99 468.1us  S
+    run 1  compio-pool  326021 req/s  p50 349.0us  p99 563.5us  S
+    run 2  tokio-per-core  328169 req/s  p50 390.4us  p99 480.6us  S
+    run 2  compio-pool  321319 req/s  p50 434.5us  p99 488.3us  S
+    run 2  tokio-default  264727 req/s  p50 469.4us  p99 880.5us  S
+    run 3  compio-pool  326115 req/s  p50 384.1us  p99 473.1us  S
+    run 3  tokio-default  236912 req/s  p50 527.4us  p99 979.8us  S
+    run 3  tokio-per-core  326631 req/s  p50 387.6us  p99 440.4us  S
+    point done; 13 min elapsed, about 5 min left
+[15/20] payload / 16384 B   W=4 conns=128 bytes=16384 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  229032 req/s  p50 544.8us  p99 1030.7us  S
+    run 1  tokio-per-core  236090 req/s  p50 543.9us  p99 652.8us  S
+    run 1  compio-pool  272092 req/s  p50 435.1us  p99 649.7us  S
+    run 2  tokio-per-core  271501 req/s  p50 417.4us  p99 668.4us  S
+    run 2  compio-pool  271768 req/s  p50 467.4us  p99 534.2us  S
+    run 2  tokio-default  205717 req/s  p50 607.6us  p99 1147.0us  S
+    run 3  compio-pool  270082 req/s  p50 477.2us  p99 555.6us  S
+    run 3  tokio-default  199826 req/s  p50 629.6us  p99 1145.5us  S
+    run 3  tokio-per-core  267549 req/s  p50 497.9us  p99 570.1us  S
+    point done; 14 min elapsed, about 4 min left
+[16/20] conns / 4 conns   W=4 conns=4 bytes=512 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  124001 req/s  p50 29.5us  p99 54.5us  
+    run 1  tokio-per-core  153882 req/s  p50 25.0us  p99 38.2us  
+    run 1  compio-pool  144712 req/s  p50 26.4us  p99 44.5us  
+    run 2  tokio-per-core  151812 req/s  p50 25.0us  p99 46.1us  
+    run 2  compio-pool  144683 req/s  p50 26.4us  p99 44.4us  
+    run 2  tokio-default  117355 req/s  p50 31.2us  p99 57.6us  
+    run 3  compio-pool  143993 req/s  p50 26.6us  p99 41.2us  
+    run 3  tokio-default  114350 req/s  p50 32.8us  p99 58.2us  
+    run 3  tokio-per-core  152579 req/s  p50 25.1us  p99 41.3us  
+    point done; 15 min elapsed, about 3 min left
+[17/20] conns / 16 conns   W=4 conns=16 bytes=512 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  238366 req/s  p50 65.8us  p99 118.5us  S
+    run 1  tokio-per-core  374223 req/s  p50 38.0us  p99 83.8us  S
+    run 1  compio-pool  294153 req/s  p50 49.2us  p99 84.6us  
+    run 2  tokio-per-core  343433 req/s  p50 50.6us  p99 82.0us  S
+    run 2  compio-pool  362011 req/s  p50 38.9us  p99 77.0us  S
+    run 2  tokio-default  238668 req/s  p50 65.6us  p99 118.8us  S
+    run 3  compio-pool  378919 req/s  p50 38.7us  p99 71.3us  S
+    run 3  tokio-default  248210 req/s  p50 63.3us  p99 113.7us  S
+    run 3  tokio-per-core  350386 req/s  p50 34.6us  p99 94.8us  S
+    point done; 16 min elapsed, about 2 min left
+[18/20] conns / 64 conns   W=4 conns=64 bytes=512 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  262091 req/s  p50 237.6us  p99 418.5us  S
+    run 1  tokio-per-core  355289 req/s  p50 172.7us  p99 238.9us  S
+    run 1  compio-pool  445249 req/s  p50 148.9us  p99 204.3us  S
+    run 2  tokio-per-core  423941 req/s  p50 140.4us  p99 216.1us  S
+    run 2  compio-pool  438189 req/s  p50 156.2us  p99 201.9us  S
+    run 2  tokio-default  262378 req/s  p50 237.0us  p99 421.9us  S
+    run 3  compio-pool  443048 req/s  p50 130.8us  p99 213.5us  S
+    run 3  tokio-default  305547 req/s  p50 203.4us  p99 360.5us  S
+    run 3  tokio-per-core  427640 req/s  p50 161.3us  p99 210.7us  S
+    point done; 17 min elapsed, about 1 min left
+[19/20] conns / 256 conns   W=4 conns=256 bytes=512 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  307275 req/s  p50 821.6us  p99 1472.1us  S
+    run 1  tokio-per-core  407870 req/s  p50 661.3us  p99 749.0us  S
+    run 1  compio-pool  406795 req/s  p50 601.1us  p99 803.9us  S
+    run 2  tokio-per-core  337654 req/s  p50 731.6us  p99 944.9us  S
+    run 2  compio-pool  415601 req/s  p50 611.0us  p99 743.7us  S
+    run 2  tokio-default  351968 req/s  p50 715.4us  p99 1275.2us  S
+    run 3  compio-pool  408541 req/s  p50 623.8us  p99 731.8us  S
+    run 3  tokio-default  305548 req/s  p50 829.6us  p99 1452.2us  S
+    run 3  tokio-per-core  336606 req/s  p50 756.8us  p99 915.9us  S
+    point done; 18 min elapsed, about 0 min left
+[20/20] conns / 1024 conns   W=4 conns=1024 bytes=512 server=0,1,2,3 clients=4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    run 1  tokio-default  269875 req/s  p50 2280.4us  p99 8145.7us  
+    run 1  tokio-per-core  315366 req/s  p50 3275.9us  p99 3482.4us  S
+    run 1  compio-pool  347367 req/s  p50 2893.9us  p99 3416.8us  S
+    run 2  tokio-per-core  310145 req/s  p50 3267.5us  p99 3579.4us  S
+    run 2  compio-pool  354747 req/s  p50 2823.7us  p99 3205.4us  S
+    run 2  tokio-default  239386 req/s  p50 2608.7us  p99 9411.7us  
+    run 3  compio-pool  351228 req/s  p50 2848.4us  p99 3229.4us  S
+    run 3  tokio-default  275233 req/s  p50 2281.4us  p99 7860.4us  
+    run 3  tokio-per-core  310689 req/s  p50 3273.0us  p99 3512.8us  S
+    point done; 19 min elapsed, about 0 min left
+finished in 19 min

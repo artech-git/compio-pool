@@ -2,13 +2,13 @@
 name = "compio-pool"
 version = "0.1.0"
 edition = "2024"
-description = "Thread-per-core io_uring accept server for compio: one SO_REUSEPORT listener per pinned core, a thread-local resource pool, and lock-free fd handoff for overflow"
+description = "A bb8-style connection pool for compio: build once, clone the handle onto each thread-per-core io_uring runtime, and lease ring-local connections that never cross threads"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/artech-git/compio-pool"
 documentation = "https://docs.rs/compio-pool"
 homepage = "https://github.com/artech-git/compio-pool"
 readme = "README.md"
-keywords = ["compio", "io-uring", "thread-per-core", "reuseport", "server"]
+keywords = ["compio", "io-uring", "pool", "bb8", "thread-per-core"]
 categories = ["asynchronous", "network-programming", "concurrency"]
 # Bisected, not guessed: compio 0.19's executor uses `cfg_select!`, stable
 # since 1.95. 1.88 through 1.94 fail to build the dependency tree. Enforced by
@@ -31,8 +31,8 @@ exclude = ["crates/compio-redis", "crates/deadpool-baseline"]
 
 [dependencies]
 # `default-features = false` drops `io-uring`, which is the whole point, so it
-# is named explicitly. `time` is for the drain timeout and accept back-off,
-# `io` for the AsyncRead/AsyncWrite traits the examples and tests use.
+# is named explicitly. `time` is what `LocalPool::get` uses for the connection
+# timeout; `net`/`io`/`fs` are for the examples' own accept loops and handlers.
 compio = { version = "0.19.2", default-features = false, features = [
     "runtime",
     "net",
@@ -41,8 +41,8 @@ compio = { version = "0.19.2", default-features = false, features = [
     "io-uring",
     "fs",
 ] }
-# `all` is what gates `Socket::set_cpu_affinity` (SO_INCOMING_CPU) on Linux.
+# `all` is what gates `Socket::set_cpu_affinity` (SO_INCOMING_CPU) on Linux,
+# used by `listener::bind_reuseport`.
 socket2 = { version = "0.6.5", features = ["all"] }
+# Core enumeration and thread pinning for the `cpu` helper module.
 core_affinity = "0.8.3"
-# Only the async API is used; `select` and `eventual-fairness` are not.
-flume = { version = "0.12.0", default-features = false, features = ["async"] }

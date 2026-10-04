@@ -1,175 +1,134 @@
-//! The reference server: one pinned worker per core, each with its own ring,
-//! its own `SO_REUSEPORT` listener and a thread-local pool of buffers. Echoes
-//! whatever it is sent, and prints the counters once a second so the handoff
-//! path can be watched under load.
+//! The reference server for the bb8-style pool. Unlike the old `Server`, the
+//! crate owns none of the runtime here: *this example* spawns one pinned thread
+//! per core, builds a `compio` runtime on each, binds its own `SO_REUSEPORT`
+//! listener, and borrows a per-connection buffer from the crate's [`Pool`].
+//!
+//! That is the whole point of the redesign — the pool is a component you pull
+//! into your own thread-per-core loop, not a framework that runs the loop for
+//! you.
 //!
 //! ```text
-//! cargo run --release --example echo -- [ADDR] [CAPACITY] [WORKERS] [FLAGS]
-//!   ADDR              bind address        default 0.0.0.0:7000
-//!   CAPACITY          connections/worker  default 1024
-//!   WORKERS           worker count        default: one per core
-//!   --incoming-cpu    set SO_INCOMING_CPU on each listener. Only after
-//!                     scripts/tune-nic.sh has steered the NIC queues; on an
-//!                     untuned host it sends every connection to one worker.
-//!   --defer-taskrun   IORING_SETUP_DEFER_TASKRUN on each ring (Linux 6.1+):
-//!                     completions are processed only when the worker asks.
-//!   --no-coop-taskrun turn off IORING_SETUP_COOP_TASKRUN, which is on by
-//!                     default, to see what it buys.
+//! cargo run --release --example echo -- [ADDR] [CAPACITY]
+//!   ADDR       bind address               default 0.0.0.0:7000
+//!   CAPACITY   max connections per worker default 1024
 //! ```
 //!
-//! Drive it with `examples/load.rs`. A small CAPACITY (say 2) with many
-//! concurrent clients is what makes `handed_off`, `claimed` and `bounced` move.
+//! Drive it with `examples/load.rs`.
 
-use std::{io, net::SocketAddr, time::Duration};
+use std::{io, net::SocketAddr, thread};
 
 use compio::{
     BufResult,
     io::{AsyncRead, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    runtime::Runtime,
 };
-use compio_pool::{Connection, Resource, Server, Service, UringConfig, WorkerContext, Workers};
+use compio_pool::{LocalPool, ManageConnection, Pool, bind_reuseport, cpu};
 
-/// The resource each in-flight connection leases: one read buffer, allocated
-/// on the core that will use it and reused for every connection it serves.
-struct Buf(Vec<u8>);
+/// Hands out reusable 16 KiB read buffers, one per in-flight connection. A real
+/// manager would open a backend connection (Redis, Postgres, an upstream socket)
+/// in `connect` instead.
+struct Buffers;
 
-impl Resource for Buf {
-    async fn create(_cx: &WorkerContext) -> io::Result<Self> {
-        Ok(Buf(Vec::with_capacity(16 * 1024)))
+impl ManageConnection for Buffers {
+    type Connection = Vec<u8>;
+    type Error = io::Error;
+
+    async fn connect(&self) -> io::Result<Vec<u8>> {
+        Ok(Vec::with_capacity(16 * 1024))
     }
-}
 
-#[derive(Clone)]
-struct Echo;
+    async fn is_valid(&self, _buf: &mut Vec<u8>) -> io::Result<()> {
+        Ok(())
+    }
 
-impl Service for Echo {
-    type Resource = Buf;
-
-    async fn handle(&self, mut conn: Connection, buf: &mut Buf) -> io::Result<()> {
-        loop {
-            // compio reads into the spare capacity after `len`, so the buffer
-            // is cleared before every read and comes back with `len == n`.
-            let mut b = std::mem::take(&mut buf.0);
-            b.clear();
-            let BufResult(read, b) = conn.stream.read(b).await;
-            match read {
-                Ok(0) => {
-                    buf.0 = b;
-                    return Ok(());
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    buf.0 = b;
-                    return Err(e);
-                }
-            }
-            let BufResult(written, b) = conn.stream.write_all(b).await;
-            buf.0 = b;
-            written?;
-        }
+    fn has_broken(&self, _buf: &mut Vec<u8>) -> bool {
+        false
     }
 }
 
 fn main() -> io::Result<()> {
-    let (flags, positional): (Vec<String>, Vec<String>) =
-        std::env::args().skip(1).partition(|a| a.starts_with("--"));
-    const KNOWN: [&str; 3] = ["--incoming-cpu", "--defer-taskrun", "--no-coop-taskrun"];
-    if let Some(unknown) = flags.iter().find(|f| !KNOWN.contains(&f.as_str())) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unknown flag {unknown}"),
-        ));
-    }
-    let has = |name: &str| flags.iter().any(|f| f == name);
-    let incoming_cpu = has("--incoming-cpu");
-    let uring = UringConfig {
-        defer_taskrun: has("--defer-taskrun"),
-        coop_taskrun: !has("--no-coop-taskrun"),
-        ..UringConfig::default()
-    };
-    let mut args = positional.into_iter();
-    let addr: SocketAddr = args
-        .next()
+    let addr: SocketAddr = std::env::args()
+        .nth(1)
         .unwrap_or_else(|| "0.0.0.0:7000".into())
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad address: {e}")))?;
-    let capacity: usize = args
-        .next()
-        .map(|s| s.parse())
-        .transpose()
-        .map_err(invalid)?
+    let capacity: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
-    let workers = match args
-        .next()
-        .map(|s| s.parse::<usize>())
-        .transpose()
-        .map_err(invalid)?
-    {
-        Some(n) => Workers::Count(n),
-        None => Workers::AllCores,
-    };
 
-    let server = Server::builder(Echo)
-        .bind(addr)
-        .workers(workers)
-        .capacity(capacity)
-        .handoff_capacity(4096)
-        .incoming_cpu(incoming_cpu)
-        .uring(uring.clone())
-        .start()?;
+    // Build the pool once. `Pool` is `Send + Clone`; every worker gets a clone.
+    let pool = Pool::builder().max_size(capacity).build(Buffers);
 
+    let cores = cpu::cores();
+    if cores.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "no cores to run on"));
+    }
     println!(
-        "echo on {} — {} workers, capacity {} each",
-        server.local_addr(),
-        server.workers(),
-        capacity
+        "echo on {addr}: {} workers, capacity {capacity}/worker",
+        cores.len()
     );
-    for (i, core) in server.cores().iter().enumerate() {
-        println!(
-            "  worker {i:>2} -> cpu {:>3}  smp_affinity {}",
-            core.id,
-            compio_pool::cpu::affinity_mask(core.id)
-        );
-    }
-    if incoming_cpu {
-        println!("SO_INCOMING_CPU is on: each listener prefers flows that arrive on its core");
-    }
-    if uring != UringConfig::default() {
-        println!("io_uring setup: {uring:?}");
-    }
-    println!("tune the NIC for this layout with:");
-    println!(
-        "  sudo scripts/tune-nic.sh --cpus {}",
-        server
-            .cores()
-            .iter()
-            .map(|c| c.id.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    println!();
 
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
-        let s = server.stats();
-        let t = s.totals;
-        println!(
-            "active {:>5}  queued {:>4}/{:<4}  accepted {:>8}  local {:>8}  handed_off {:>6}  claimed {:>6}  bounced {:>4}  oversub {:>4}  rejected {:>4}  done {:>8}  errs {}",
-            t.active,
-            s.queued,
-            s.handoff_capacity,
-            t.accepted,
-            t.served_local,
-            t.handed_off,
-            t.claimed,
-            t.bounced,
-            t.oversubscribed,
-            t.rejected,
-            t.completed,
-            t.handler_errors + t.resource_errors + t.accept_errors
-        );
+    let mut handles = Vec::new();
+    for (index, core) in cores.into_iter().enumerate() {
+        let pool = pool.clone();
+        let handle = thread::Builder::new()
+            .name(format!("worker/{index}"))
+            .spawn(move || worker(core, addr, pool))?;
+        handles.push(handle);
     }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    Ok(())
 }
 
-fn invalid(e: std::num::ParseIntError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, e)
+/// One pinned thread: its own `compio` runtime, its own `SO_REUSEPORT` listener,
+/// and its own [`LocalPool`] carved from the shared [`Pool`].
+fn worker(core: cpu::CoreId, addr: SocketAddr, pool: Pool<Buffers>) {
+    cpu::pin_current(core);
+
+    let runtime = Runtime::builder().build().expect("build compio runtime");
+    runtime.block_on(async move {
+        // This thread's pool. `!Send`, so it — and its ring-bound buffers —
+        // cannot escape the thread.
+        let local = pool.local();
+
+        let std_listener = bind_reuseport(addr, 1024, None).expect("bind SO_REUSEPORT");
+        let listener = TcpListener::from_std(std_listener).expect("wrap listener in ring");
+
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                continue;
+            };
+            compio::runtime::spawn(serve(local.clone(), stream)).detach();
+        }
+    });
+}
+
+/// Borrow a buffer from this thread's pool for the life of the connection and
+/// echo until the peer closes. Dropping the lease returns the buffer.
+async fn serve(local: LocalPool<Buffers>, mut stream: TcpStream) {
+    let mut lease = match local.get().await {
+        Ok(lease) => lease,
+        Err(_) => return,
+    };
+    loop {
+        let mut buf = std::mem::take(&mut *lease);
+        buf.clear();
+        let BufResult(read, buf) = stream.read(buf).await;
+        match read {
+            Ok(0) | Err(_) => {
+                *lease = buf;
+                return;
+            }
+            Ok(_) => {}
+        }
+        let BufResult(written, buf) = stream.write_all(buf).await;
+        *lease = buf;
+        if written.is_err() {
+            return;
+        }
+    }
 }

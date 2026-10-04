@@ -1,49 +1,64 @@
-//! `LocalPool` accounting, run inside a single compio runtime.
+//! Behaviour of the bb8-style pool, each test inside its own compio runtime.
+//!
+//! The connection is just its own `u32` id, so a test can tell a reused
+//! connection from a fresh one. Thread-locals let each test steer the manager;
+//! every `#[test]` runs on its own thread, so the state is naturally isolated.
 
-use std::{
-    cell::Cell,
-    future::Future,
-    io,
-    pin::pin,
-    task::{Context, Poll, Waker},
-};
+use std::{cell::Cell, fmt, future::Future, time::Duration};
 
-use compio_pool::{CoreId, LocalPool, Resource, WorkerContext};
+use compio_pool::{ManageConnection, Pool, RunError};
 
 thread_local! {
     static CREATED: Cell<u32> = const { Cell::new(0) };
-    static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    static FAIL_CONNECT: Cell<bool> = const { Cell::new(false) };
+    static INVALID_ONCE: Cell<bool> = const { Cell::new(false) };
+    static BROKEN: Cell<bool> = const { Cell::new(false) };
 }
 
-struct Item {
-    id: u32,
-    reusable: bool,
+fn reset() {
+    CREATED.with(|c| c.set(0));
+    FAIL_CONNECT.with(|c| c.set(false));
+    INVALID_ONCE.with(|c| c.set(false));
+    BROKEN.with(|c| c.set(false));
 }
 
-impl Resource for Item {
-    async fn create(_cx: &WorkerContext) -> io::Result<Self> {
-        if FAIL_NEXT.with(|f| f.replace(false)) {
-            return Err(io::Error::other("boom"));
+#[derive(Debug)]
+struct TestError(&'static str);
+
+impl fmt::Display for TestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for TestError {}
+
+struct Mgr;
+
+impl ManageConnection for Mgr {
+    type Connection = u32;
+    type Error = TestError;
+
+    async fn connect(&self) -> Result<u32, TestError> {
+        if FAIL_CONNECT.with(|f| f.replace(false)) {
+            return Err(TestError("connect failed"));
         }
         let id = CREATED.with(|c| {
             c.set(c.get() + 1);
             c.get()
         });
-        Ok(Item { id, reusable: true })
+        Ok(id)
     }
 
-    fn recycle(&mut self) -> bool {
-        self.reusable
+    async fn is_valid(&self, _conn: &mut u32) -> Result<(), TestError> {
+        if INVALID_ONCE.with(|f| f.replace(false)) {
+            return Err(TestError("not valid"));
+        }
+        Ok(())
     }
-}
 
-fn cx(capacity: usize) -> WorkerContext {
-    WorkerContext {
-        index: 0,
-        core: CoreId { id: 0 },
-        pinned: false,
-        workers: 1,
-        capacity,
+    fn has_broken(&self, _conn: &mut u32) -> bool {
+        BROKEN.with(|b| b.get())
     }
 }
 
@@ -51,189 +66,122 @@ fn run<F: Future>(f: F) -> F::Output {
     compio::runtime::Runtime::new().unwrap().block_on(f)
 }
 
-/// Poll once with a no-op waker.
-fn poll_once<F: Future>(f: &mut std::pin::Pin<&mut F>) -> Poll<F::Output> {
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    f.as_mut().poll(&mut cx)
-}
+// Compile-time: the blueprint crosses threads, the per-thread pool does not.
+const _: fn() = || {
+    fn is_send<T: Send + Sync + Clone>() {}
+    is_send::<Pool<Mgr>>();
+};
 
 #[test]
-fn permits_count_against_capacity_and_refund_on_drop() {
+fn reuses_an_idle_connection() {
+    reset();
     run(async {
-        let pool = LocalPool::<Item>::new(cx(2), 2);
-        assert!(pool.has_capacity());
-        let a = pool.try_reserve().expect("slot 1");
-        let b = pool.try_reserve().expect("slot 2");
-        assert!(pool.try_reserve().is_none(), "capacity 2 means two permits");
-        assert_eq!(pool.taken(), 2);
-        assert_eq!(pool.available(), 0);
-        drop(a);
-        assert_eq!(pool.taken(), 1);
-        let _c = pool.try_reserve().expect("refunded slot");
-        drop(b);
-        assert_eq!(pool.taken(), 1);
+        let pool = Pool::builder()
+            .max_size(2)
+            .test_on_check_out(false)
+            .build(Mgr);
+        let local = pool.local();
+
+        let first = *local.get().await.unwrap(); // dropped here → returned idle
+        let second = *local.get().await.unwrap();
+
+        assert_eq!(first, second, "the same connection should come back");
+        assert_eq!(CREATED.with(|c| c.get()), 1, "only one was ever opened");
     });
 }
 
 #[test]
-fn leases_create_lazily_and_reuse_idle_resources() {
+fn enforces_max_size_then_times_out() {
+    reset();
     run(async {
-        CREATED.with(|c| c.set(0));
-        let pool = LocalPool::<Item>::new(cx(2), 2);
-        assert_eq!(pool.created(), 0);
+        let pool = Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .connection_timeout(Duration::from_millis(50))
+            .build(Mgr);
+        let local = pool.local();
 
-        let lease = pool.try_reserve().unwrap().acquire().await.unwrap();
-        let first = lease.id;
-        assert_eq!(pool.created(), 1);
-        assert_eq!(pool.idle(), 0);
-        drop(lease);
-        assert_eq!(pool.idle(), 1, "recycled onto the idle list");
-        assert_eq!(pool.taken(), 0);
+        let held = local.get().await.unwrap();
+        assert_eq!(local.state().connections, 1);
 
-        let lease = pool.try_reserve().unwrap().acquire().await.unwrap();
-        assert_eq!(
-            lease.id, first,
-            "the idle resource is reused, not recreated"
-        );
-        assert_eq!(pool.created(), 1);
-    });
-}
-
-#[test]
-fn recycle_false_drops_the_resource() {
-    run(async {
-        let pool = LocalPool::<Item>::new(cx(1), 1);
-        let mut lease = pool.try_reserve().unwrap().acquire().await.unwrap();
-        lease.reusable = false;
-        drop(lease);
-        assert_eq!(pool.idle(), 0);
-        assert_eq!(pool.taken(), 0);
-    });
-}
-
-#[test]
-fn discard_drops_the_resource_and_frees_the_slot() {
-    run(async {
-        let pool = LocalPool::<Item>::new(cx(1), 1);
-        let lease = pool.try_reserve().unwrap().acquire().await.unwrap();
-        lease.discard();
-        assert_eq!(pool.idle(), 0);
-        assert_eq!(pool.taken(), 0);
-        assert!(pool.has_capacity());
-    });
-}
-
-#[test]
-fn create_failure_releases_the_permit() {
-    run(async {
-        let pool = LocalPool::<Item>::new(cx(1), 1);
-        FAIL_NEXT.with(|f| f.set(true));
-        let err = pool
-            .try_reserve()
-            .unwrap()
-            .acquire()
-            .await
-            .expect_err("creation fails");
-        assert_eq!(err.to_string(), "boom");
-        assert_eq!(pool.taken(), 0, "the slot is not leaked");
-        assert!(pool.try_reserve().is_some());
-    });
-}
-
-#[test]
-fn reserve_waits_until_a_slot_is_released() {
-    run(async {
-        let pool = LocalPool::<Item>::new(cx(1), 1);
-        let held = pool.try_reserve().unwrap();
-
-        let mut waiting = pin!(pool.reserve());
-        assert!(
-            poll_once(&mut waiting).is_pending(),
-            "full pool: reserve waits"
-        );
+        // At capacity with the only connection checked out: the next get waits
+        // and then times out.
+        let blocked = local.get().await;
+        assert!(matches!(blocked, Err(RunError::TimedOut)));
 
         drop(held);
-        match poll_once(&mut waiting) {
-            Poll::Ready(permit) => {
-                assert_eq!(pool.taken(), 1);
-                drop(permit);
-            }
-            Poll::Pending => panic!("released slot should satisfy the waiter"),
-        }
+        assert!(local.get().await.is_ok(), "a freed slot lets get succeed");
     });
 }
 
 #[test]
-fn wait_available_does_not_take_the_slot() {
+fn drops_a_broken_connection() {
+    reset();
     run(async {
-        let pool = LocalPool::<Item>::new(cx(1), 1);
-        let held = pool.try_reserve().unwrap();
-        let mut waiting = pin!(pool.wait_available());
-        assert!(poll_once(&mut waiting).is_pending());
-        drop(held);
-        assert!(poll_once(&mut waiting).is_ready());
-        assert_eq!(pool.taken(), 0, "wait_available only observes");
-        assert!(pool.has_capacity());
+        let pool = Pool::builder()
+            .max_size(2)
+            .test_on_check_out(false)
+            .build(Mgr);
+        let local = pool.local();
+
+        BROKEN.with(|b| b.set(true));
+        drop(local.get().await.unwrap()); // opened id 1, broken on return → dropped
+        assert_eq!(local.state().connections, 0);
+        assert_eq!(local.state().idle_connections, 0);
+
+        BROKEN.with(|b| b.set(false));
+        let fresh = *local.get().await.unwrap();
+        assert_eq!(fresh, 2, "a new connection replaces the broken one");
     });
 }
 
 #[test]
-fn drained_resolves_when_nothing_is_outstanding() {
+fn replaces_a_connection_that_fails_validation() {
+    reset();
     run(async {
-        let pool = LocalPool::<Item>::new(cx(2), 2);
-        let mut drained = pin!(pool.drained());
-        assert!(poll_once(&mut drained).is_ready(), "empty pool is drained");
+        let pool = Pool::builder()
+            .max_size(2)
+            .test_on_check_out(true)
+            .build(Mgr);
+        let local = pool.local();
 
-        let lease = pool.try_reserve().unwrap().acquire().await.unwrap();
-        let mut drained = pin!(pool.drained());
-        assert!(poll_once(&mut drained).is_pending());
-        drop(lease);
-        assert!(poll_once(&mut drained).is_ready());
+        drop(local.get().await.unwrap()); // id 1 → idle
+
+        INVALID_ONCE.with(|f| f.set(true)); // idle id 1 fails is_valid once
+        let fresh = *local.get().await.unwrap();
+        assert_eq!(fresh, 2, "the stale idle connection is discarded, a fresh one opened");
+        assert_eq!(CREATED.with(|c| c.get()), 2);
     });
 }
 
 #[test]
-fn unbounded_reservation_goes_over_capacity_and_does_not_grow_the_idle_list() {
+fn surfaces_a_connect_error_and_frees_the_slot() {
+    reset();
     run(async {
-        let pool = LocalPool::<Item>::new(cx(1), 1);
-        let a = pool.try_reserve().unwrap().acquire().await.unwrap();
-        let b = pool.reserve_unbounded().acquire().await.unwrap();
-        assert_eq!(pool.taken(), 2);
-        assert_eq!(pool.available(), 0);
-        assert!(!pool.has_capacity());
+        let pool = Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .build(Mgr);
+        let local = pool.local();
 
-        // Returning the extra one: capacity is 1 and one lease is still out, so
-        // there is no room on the idle list; it is dropped.
-        drop(b);
-        assert_eq!(pool.idle(), 0);
-        assert_eq!(pool.taken(), 1);
-        drop(a);
-        assert_eq!(pool.idle(), 1);
-        assert_eq!(pool.taken(), 0);
+        FAIL_CONNECT.with(|f| f.set(true));
+        assert!(matches!(local.get().await, Err(RunError::User(_))));
+        assert_eq!(local.state().connections, 0, "the reserved slot was released");
+
+        assert!(local.get().await.is_ok(), "the pool recovers after a connect error");
     });
 }
 
 #[test]
-fn prewarm_is_capped_at_capacity() {
+fn warm_opens_min_idle_up_front() {
+    reset();
     run(async {
-        CREATED.with(|c| c.set(0));
-        let pool = LocalPool::<Item>::new(cx(3), 3);
-        assert_eq!(pool.prewarm(10).await.unwrap(), 3);
-        assert_eq!(pool.idle(), 3);
-        assert_eq!(pool.prewarm(10).await.unwrap(), 0, "already full");
-        let _lease = pool.try_reserve().unwrap().acquire().await.unwrap();
-        assert_eq!(pool.created(), 3, "lease came from the warm list");
-    });
-}
+        let pool = Pool::builder().max_size(5).min_idle(3).build(Mgr);
+        let local = pool.local();
 
-#[test]
-fn pool_handles_share_state() {
-    run(async {
-        let pool = LocalPool::<Item>::new(cx(1), 1);
-        let other = pool.clone();
-        let _p = pool.try_reserve().unwrap();
-        assert!(other.try_reserve().is_none());
-        assert_eq!(other.taken(), 1);
+        assert_eq!(local.warm().await.unwrap(), 3);
+        let state = local.state();
+        assert_eq!(state.connections, 3);
+        assert_eq!(state.idle_connections, 3);
     });
 }

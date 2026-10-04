@@ -1,21 +1,25 @@
-//! Write-ahead-log benchmark: every request is appended to a log file and
-//! fsynced before the ack. Socket read → file append → fdatasync → socket
-//! write: the durability path of a database or message queue.
+//! Durable **file I/O**: a write-ahead-log server. Every request is appended to a
+//! log file and `fdatasync`'d before the ack — the socket-read -> file-append ->
+//! fdatasync -> socket-write path of a database or a message queue.
 //!
-//! On compio the append and the fdatasync are io_uring submissions from the
-//! pinned worker thread. The tokio baseline must push both through its
-//! blocking thread pool — two thread handoffs per request — which is the
-//! cost this example exists to measure.
+//! The append and the `sync_data` are both `io_uring` submissions from the pinned
+//! worker, so the whole durable-commit path stays on one ring. This is also where
+//! the pool's `!Send` guarantee matters most: each pooled resource owns its own
+//! open log segment (an fd bound to this thread's ring), so appends from different
+//! connections never contend and a segment can never be touched from another
+//! thread.
 //!
-//! Protocol, persistent connections: client sends one payload per request,
-//! server appends it and replies `OK\n`. Each pooled resource owns its own
-//! log file (a per-connection segment), so appends never contend.
+//! Protocol: persistent connection, one payload per request; the server appends
+//! it and replies `OK\n`. One socket read is treated as one record — fine for the
+//! loopback benchmark driver.
 //!
 //! ```text
 //! WAL_DIR=/tmp/bench-wal WAL_SYNC=1 \
-//! cargo run --release --example wal -- [ADDR] [CAPACITY] [WORKERS] [FLAGS]
+//! cargo run --release --example wal -- [ADDR] [CAPACITY]
+//!   ADDR       bind address               default 0.0.0.0:7000
+//!   CAPACITY   log segments per worker    default 1024
+//!   WAL_SYNC=0 skips the fdatasync, isolating raw append throughput
 //! ```
-//! `WAL_SYNC=0` skips the fdatasync, isolating pure append throughput.
 //!
 //! Drive it with `examples/load_wal.rs`.
 
@@ -27,177 +31,159 @@ use std::{
         LazyLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    thread,
 };
 
 use compio::{
     BufResult,
+    fs::{File, OpenOptions},
     io::{AsyncRead, AsyncWriteAtExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    runtime::Runtime,
 };
-use compio_pool::{Connection, Resource, Server, Service, UringConfig, WorkerContext, Workers};
+use compio_pool::{LocalPool, ManageConnection, Pool, bind_reuseport, cpu};
 
+/// Where log segments are written.
 static WAL_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
     PathBuf::from(std::env::var("WAL_DIR").unwrap_or_else(|_| "/tmp/bench-wal".into()))
 });
+
+/// Whether to `fdatasync` after every append. On by default; the whole point of
+/// a WAL is that the ack means "on disk".
 static SYNC: LazyLock<bool> =
     LazyLock::new(|| std::env::var("WAL_SYNC").map(|v| v != "0").unwrap_or(true));
+
+/// Names segment files uniquely across every worker thread.
 static NEXT_SEGMENT: AtomicU64 = AtomicU64::new(0);
 
+/// One append-only log segment and the offset of its tail.
 struct Wal {
-    file: compio::fs::File,
+    file: File,
     offset: u64,
-    buf: Vec<u8>,
 }
 
-impl Resource for Wal {
-    async fn create(cx: &WorkerContext) -> io::Result<Self> {
+/// Opens a fresh log segment per pooled slot. Writing at an explicit offset
+/// (rather than relying on `O_APPEND`) keeps the append a single positional
+/// submission.
+struct WalManager;
+
+impl ManageConnection for WalManager {
+    type Connection = Wal;
+    type Error = io::Error;
+
+    async fn connect(&self) -> io::Result<Wal> {
         let id = NEXT_SEGMENT.fetch_add(1, Ordering::Relaxed);
-        let path = WAL_DIR.join(format!("w{}-{id}.wal", cx.index));
-        let file = compio::fs::File::create(&path).await?;
-        Ok(Wal {
-            file,
-            offset: 0,
-            buf: Vec::with_capacity(16 * 1024),
-        })
+        let path = WAL_DIR.join(format!("seg-{id}.log"));
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .await?;
+        Ok(Wal { file, offset: 0 })
     }
 
-    fn recycle(&mut self) -> bool {
-        if self.buf.capacity() == 0 {
-            self.buf = Vec::with_capacity(16 * 1024);
-        }
-        true
+    async fn is_valid(&self, _wal: &mut Wal) -> io::Result<()> {
+        Ok(())
     }
-}
 
-#[derive(Clone)]
-struct WalService;
-
-impl Service for WalService {
-    type Resource = Wal;
-
-    async fn handle(&self, mut conn: Connection, wal: &mut Wal) -> io::Result<()> {
-        loop {
-            // One payload from the client.
-            let mut b = std::mem::take(&mut wal.buf);
-            b.clear();
-            let BufResult(n, b) = conn.stream.read(b).await;
-            match n {
-                Ok(0) => {
-                    wal.buf = b;
-                    return Ok(());
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    wal.buf = b;
-                    return Err(e);
-                }
-            }
-            let len = b.len() as u64;
-
-            // Append at the current offset, then make it durable.
-            let BufResult(w, b) = wal.file.write_all_at(b, wal.offset).await;
-            wal.buf = b;
-            w?;
-            wal.offset += len;
-            if *SYNC {
-                wal.file.sync_data().await?;
-            }
-
-            let BufResult(w, _) = conn.stream.write_all(b"OK\n".to_vec()).await;
-            w?;
-        }
+    fn has_broken(&self, _wal: &mut Wal) -> bool {
+        false
     }
 }
 
 fn main() -> io::Result<()> {
-    std::fs::create_dir_all(&*WAL_DIR)?;
-
-    let (flags, positional): (Vec<String>, Vec<String>) =
-        std::env::args().skip(1).partition(|a| a.starts_with("--"));
-    const KNOWN: [&str; 3] = ["--incoming-cpu", "--defer-taskrun", "--no-coop-taskrun"];
-    if let Some(unknown) = flags.iter().find(|f| !KNOWN.contains(&f.as_str())) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unknown flag {unknown}"),
-        ));
-    }
-    let has = |name: &str| flags.iter().any(|f| f == name);
-    let incoming_cpu = has("--incoming-cpu");
-    let uring = UringConfig {
-        defer_taskrun: has("--defer-taskrun"),
-        coop_taskrun: !has("--no-coop-taskrun"),
-        ..UringConfig::default()
-    };
-    let mut args = positional.into_iter();
-    let addr: SocketAddr = args
-        .next()
+    let addr: SocketAddr = std::env::args()
+        .nth(1)
         .unwrap_or_else(|| "0.0.0.0:7000".into())
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad address: {e}")))?;
-    let capacity: usize = args
-        .next()
-        .map(|s| s.parse())
-        .transpose()
-        .map_err(invalid)?
+    let capacity: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
-    let workers = match args
-        .next()
-        .map(|s| s.parse::<usize>())
-        .transpose()
-        .map_err(invalid)?
-    {
-        Some(n) => Workers::Count(n),
-        None => Workers::AllCores,
-    };
 
-    let server = Server::builder(WalService)
-        .bind(addr)
-        .workers(workers)
-        .capacity(capacity)
-        .handoff_capacity(4096)
-        .incoming_cpu(incoming_cpu)
-        .uring(uring.clone())
-        .start()?;
+    std::fs::create_dir_all(&*WAL_DIR)?;
+    let pool = Pool::builder().max_size(capacity).build(WalManager);
 
+    let cores = cpu::cores();
+    if cores.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "no cores to run on"));
+    }
     println!(
-        "wal on {} writing {} (sync {}) — {} workers, capacity {} each",
-        server.local_addr(),
+        "wal on {addr} -> {} (fdatasync: {}): {} workers, capacity {capacity}/worker",
         WAL_DIR.display(),
-        if *SYNC { "every record" } else { "off" },
-        server.workers(),
-        capacity
+        if *SYNC { "on" } else { "off" },
+        cores.len()
     );
-    for (i, core) in server.cores().iter().enumerate() {
-        println!(
-            "  worker {i:>2} -> cpu {:>3}  smp_affinity {}",
-            core.id,
-            compio_pool::cpu::affinity_mask(core.id)
-        );
-    }
-    println!();
 
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
-        let s = server.stats();
-        let t = s.totals;
-        println!(
-            "active {:>5}  queued {:>4}/{:<4}  accepted {:>8}  local {:>8}  handed_off {:>6}  claimed {:>6}  bounced {:>4}  oversub {:>4}  rejected {:>4}  done {:>8}  errs {}",
-            t.active,
-            s.queued,
-            s.handoff_capacity,
-            t.accepted,
-            t.served_local,
-            t.handed_off,
-            t.claimed,
-            t.bounced,
-            t.oversubscribed,
-            t.rejected,
-            t.completed,
-            t.handler_errors + t.resource_errors + t.accept_errors
-        );
+    let mut handles = Vec::new();
+    for (index, core) in cores.into_iter().enumerate() {
+        let pool = pool.clone();
+        let handle = thread::Builder::new()
+            .name(format!("worker/{index}"))
+            .spawn(move || worker(core, addr, pool))?;
+        handles.push(handle);
     }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    Ok(())
 }
 
-fn invalid(e: std::num::ParseIntError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, e)
+fn worker(core: cpu::CoreId, addr: SocketAddr, pool: Pool<WalManager>) {
+    cpu::pin_current(core);
+
+    let runtime = Runtime::builder().build().expect("build compio runtime");
+    runtime.block_on(async move {
+        let local = pool.local();
+
+        let std_listener = bind_reuseport(addr, 1024, None).expect("bind SO_REUSEPORT");
+        let listener = TcpListener::from_std(std_listener).expect("wrap listener in ring");
+
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                continue;
+            };
+            compio::runtime::spawn(serve(local.clone(), stream)).detach();
+        }
+    });
+}
+
+/// Lease one log segment for the life of the connection; append and sync every
+/// record before acking it.
+async fn serve(local: LocalPool<WalManager>, mut stream: TcpStream) {
+    let mut lease = match local.get().await {
+        Ok(lease) => lease,
+        Err(_) => return,
+    };
+    let mut buf = Vec::with_capacity(64 * 1024);
+    loop {
+        buf.clear();
+        let BufResult(read, b) = stream.read(buf).await;
+        buf = b;
+        let n = match read {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+
+        // Append the record at the segment tail. Read `offset` into a local so the
+        // expression does not borrow `lease` twice.
+        let offset = lease.offset;
+        let BufResult(w, b) = lease.file.write_all_at(buf, offset).await;
+        buf = b;
+        if w.is_err() {
+            return;
+        }
+        lease.offset += n as u64;
+
+        if *SYNC && lease.file.sync_data().await.is_err() {
+            return;
+        }
+
+        let BufResult(w, _) = stream.write_all(b"OK\n".to_vec()).await;
+        if w.is_err() {
+            return;
+        }
+    }
 }
