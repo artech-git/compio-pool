@@ -71,7 +71,7 @@ jobs:
       - uses: actions/checkout@v4
       # Keep in step with `rust-version` in Cargo.toml and the note in README.md.
       # 1.95 is where `cfg_select!`, used by compio's executor, became stable.
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       # `--lib` only: dev-dependencies do not bind downstream users.
       - run: cargo build --lib --locked
