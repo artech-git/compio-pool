@@ -33,8 +33,10 @@ pub trait ManageConnection: Send + Sync + 'static {
     /// [`test_on_check_out`](crate::Builder::test_on_check_out) is set. Returning
     /// `Err` discards the connection; the pool then opens a fresh one in its
     /// place.
-    fn is_valid(&self, conn: &mut Self::Connection)
-    -> impl Future<Output = Result<(), Self::Error>>;
+    fn is_valid(
+        &self,
+        conn: &mut Self::Connection,
+    ) -> impl Future<Output = Result<(), Self::Error>>;
 
     /// A synchronous, infallible liveness check run as a connection is returned.
     /// Returning `true` drops it instead of putting it back on the idle list.
@@ -49,6 +51,9 @@ pub enum RunError<E> {
     /// No connection became available within
     /// [`connection_timeout`](crate::Builder::connection_timeout).
     TimedOut,
+    /// The pool was shut down with [`Pool::close`](crate::Pool::close); it hands
+    /// out no more connections.
+    Closed,
 }
 
 impl<E: fmt::Display> fmt::Display for RunError<E> {
@@ -56,6 +61,7 @@ impl<E: fmt::Display> fmt::Display for RunError<E> {
         match self {
             RunError::User(e) => write!(f, "{e}"),
             RunError::TimedOut => f.write_str("timed out waiting for a pooled connection"),
+            RunError::Closed => f.write_str("the connection pool is closed"),
         }
     }
 }
@@ -64,7 +70,7 @@ impl<E: Error + 'static> Error for RunError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             RunError::User(e) => Some(e),
-            RunError::TimedOut => None,
+            RunError::TimedOut | RunError::Closed => None,
         }
     }
 }

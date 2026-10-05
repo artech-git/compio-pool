@@ -28,6 +28,22 @@
 //! [`max_size`]: Builder::max_size
 //! [`min_idle`]: Builder::min_idle
 //!
+//! # Running it in production
+//!
+//! Three things a long-lived server needs are built on the same split:
+//!
+//! * **Metrics.** Each [`LocalPool`] keeps its own counters and registers them
+//!   with the [`Pool`]. [`LocalPool::state`] / [`LocalPool::statistics`] read one
+//!   thread's lock-free; [`Pool::state`] / [`Pool::statistics`] sum every thread's
+//!   for a process-wide [`State`] and [`Statistics`] to feed a metrics endpoint.
+//! * **Maintenance.** Expiry is lazy, so a quiet pool would hold dead backend
+//!   connections open. Call [`LocalPool::maintain`] on a timer on each worker — it
+//!   reaps expired idle connections ([`LocalPool::reap`]) and tops back up to
+//!   [`min_idle`] — since thread-per-core has no shared reaper thread.
+//! * **Shutdown.** [`Pool::close`] makes every thread's [`get`](LocalPool::get)
+//!   fail with [`RunError::Closed`] and stops recycling; [`LocalPool::clear`]
+//!   drains a thread's idle connections for a prompt drain.
+//!
 //! # Quickstart
 //!
 //! Define a manager, build the pool, and use it from a compio task:
@@ -100,4 +116,4 @@ pub use builder::Builder;
 pub use cpu::CoreId;
 pub use listener::bind_reuseport;
 pub use manage::{ManageConnection, RunError};
-pub use pool::{LocalPool, Pool, PooledConnection, State};
+pub use pool::{LocalPool, Pool, PooledConnection, State, Statistics};

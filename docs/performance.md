@@ -8,7 +8,7 @@ accounting harness from [`crates/deadpool-baseline`](../crates/deadpool-baseline
 
 ## The machine
 
-A `limactl` VM on an Apple Silicon host: Ubuntu 25.04, kernel 6.14, 12 vCPUs, 20 GiB, Apple
+A Linux VM on an Apple Silicon host: Ubuntu 25.04, kernel 6.14, 12 vCPUs, 20 GiB, Apple
 Virtualization framework, `virtio_net` with a single combined queue and receive hashing fixed
 off. Traffic is loopback. **The load generator's 64 client threads run on the same 12 vCPUs as
 the 12 workers**, so every number below includes contention with the thing measuring it. Treat
