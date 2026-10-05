@@ -48,9 +48,9 @@ steered.
 
 ### What the script does on hardware it cannot tune
 
-It never fails a step it can skip. On a single-queue virtual NIC (lima/vz virtio, many cloud
-instances) it leaves the queue count alone, pins nothing, enables software RFS only, and says
-so. The server runs fine there; it just does not get the per-core packet steering the hardware
+It never fails a step it can skip. On a single-queue virtual NIC (virtio-net under virtualisation,
+many cloud instances) it leaves the queue count alone, pins nothing, enables software RFS only, and
+says so. The server runs fine there; it just does not get the per-core packet steering the hardware
 steps exist for. The test VM is such a machine — see [performance.md](performance.md#the-machine).
 
 ## Sizing

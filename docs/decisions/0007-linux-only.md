@@ -10,8 +10,8 @@ and the IRQ-affinity recipe in `scripts/tune-nic.sh`.
 
 The crate compiles on any Unix so that rust-analyzer and `cargo check` work on a macOS laptop,
 and `compile_error!`s on non-Unix. Nothing is built, tested or benchmarked anywhere but Linux;
-CI is Ubuntu only; docs.rs builds the two Linux targets. The author's Linux is a `limactl` VM,
-and every `cargo` command in this repository's history ran there.
+CI is Ubuntu only; docs.rs builds the two Linux targets. Every `cargo` command in this
+repository's history ran on Linux.
 
 ## Rejected
 

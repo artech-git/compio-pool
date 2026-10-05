@@ -4,22 +4,21 @@ What the tests prove, how to run them, and what CI does.
 
 ## Where tests run
 
-Linux only, in practice a `limactl` VM. The repository is mounted read-only inside the VM, so
-the loop is: edit on the host, mirror into the VM, build there.
+Linux only (`io_uring`); when the host is not Linux, a Linux VM works fine. The repository may be
+mounted read-only, so the loop is: edit on the host, mirror into the build machine, build there.
 
 ```sh
-limactl shell rust -- bash -lc '
-  rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock \
-        /path/to/compio-pool/ ~/compio-pool/ &&
-  cd ~/compio-pool &&
-  cargo fmt --all --check &&
-  cargo clippy --all-targets -- -D warnings &&
-  cargo test --all-targets &&
-  cargo test --doc'
+rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock \
+      /path/to/compio-pool/ ~/compio-pool/ &&
+cd ~/compio-pool &&
+cargo fmt --all --check &&
+cargo clippy --all-targets -- -D warnings &&
+cargo test --all-targets &&
+cargo test --doc
 ```
 
-`Cargo.lock` is generated in the VM against current crates and copied back, so the lockfile
-that is committed is the one that was built.
+`Cargo.lock` is generated on the build machine against current crates and copied back, so the
+lockfile that is committed is the one that was built.
 
 ## The suites
 
