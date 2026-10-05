@@ -32,7 +32,7 @@
 #                     nothing. Exits 0 if the hardware can take the recipe, 2 if not.
 #   --self-test       check the mask and CPU-list helpers against known values
 #
-# Virtualised NICs (virtio-net under lima/vz, many cloud instances) often expose a
+# Virtualised NICs (virtio-net under virtualisation, many cloud instances) often expose a
 # single combined queue with receive hashing fixed off. `--check` says so, and the
 # recipe cannot be applied there; the server still works, it just cannot get the
 # per-core packet steering the hardware steps are for.
