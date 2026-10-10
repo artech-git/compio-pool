@@ -19,7 +19,7 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -29,7 +29,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -48,7 +48,7 @@ jobs:
       # failures, not for a lint that does not exist on stable yet.
       RUSTFLAGS: ${{ matrix.toolchain == 'stable' && '-D warnings' || '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
@@ -68,7 +68,7 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Keep in step with `rust-version` in Cargo.toml and the note in README.md.
       # 1.95 is where `cfg_select!`, used by compio's executor, became stable.
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -82,7 +82,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings --cfg docsrs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps --locked
@@ -91,7 +91,7 @@ jobs:
     name: Tuning script parses and passes shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck ethtool
       - run: bash -n scripts/tune-nic.sh
       - run: shellcheck scripts/tune-nic.sh
@@ -104,7 +104,7 @@ jobs:
     name: Doc cross-links resolve
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # README and docs/ link into each other heavily; a renamed file is
       # otherwise invisible until a reader hits the 404. `--offline` checks
       # relative paths only, so this never fails on a flaky external host.

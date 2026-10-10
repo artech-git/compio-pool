@@ -92,7 +92,9 @@ fn parse() -> io::Result<Opts> {
             .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
         match flag.as_str() {
             "--conns" => opts.conns = val.parse().map_err(|e| bad(&format!("--conns: {e}")))?,
-            "--seconds" => opts.seconds = val.parse().map_err(|e| bad(&format!("--seconds: {e}")))?,
+            "--seconds" => {
+                opts.seconds = val.parse().map_err(|e| bad(&format!("--seconds: {e}")))?
+            }
             "--value" => opts.value = val.parse().map_err(|e| bad(&format!("--value: {e}")))?,
             "--keys" => opts.keys = val.parse().map_err(|e| bad(&format!("--keys: {e}")))?,
             "--pipeline" => {
@@ -150,7 +152,10 @@ impl Conn {
             scratch.clear();
             let got = self.r.read_line(scratch)?;
             if got == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "server closed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "server closed",
+                ));
             }
         }
         Ok(())
@@ -166,7 +171,7 @@ struct ConnResult {
 fn run_conn(id: usize, opts: &Opts, barrier: &Barrier) -> io::Result<ConnResult> {
     let addr = opts.addrs[id % opts.addrs.len()];
     let mut c = Conn::open(addr)?;
-    let mut rng = Rng(0x9e3779b97f4a7c15 ^ (id as u64).wrapping_mul(0xd1b54a32d192 ) ^ 1);
+    let mut rng = Rng(0x9e3779b97f4a7c15 ^ (id as u64).wrapping_mul(0xd1b54a32d192) ^ 1);
     let value: String = "x".repeat(opts.value);
     let key = |i: u64| format!("{id}:{}", i % opts.keys as u64);
 
@@ -231,7 +236,9 @@ fn run_conn(id: usize, opts: &Opts, barrier: &Barrier) -> io::Result<ConnResult>
         }
 
         let t = Instant::now();
-        if c.round(batch.as_bytes(), opts.pipeline, &mut scratch).is_err() {
+        if c.round(batch.as_bytes(), opts.pipeline, &mut scratch)
+            .is_err()
+        {
             // Hard failure mid-run: report what we have, flag the conn failed.
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "round failed"));
         }
@@ -302,7 +309,15 @@ fn main() -> io::Result<()> {
     };
     println!(
         "conns {}  workload {}  value {}  keys {}  pipeline {}  seconds {}  shards {}  mismatches {}  failed {}",
-        opts.conns, wl, opts.value, opts.keys, opts.pipeline, opts.seconds, opts.addrs.len(), mismatches, failed
+        opts.conns,
+        wl,
+        opts.value,
+        opts.keys,
+        opts.pipeline,
+        opts.seconds,
+        opts.addrs.len(),
+        mismatches,
+        failed
     );
     println!("requests {ops}  ({:.0} req/s)", ops as f64 / secs);
     println!(

@@ -76,7 +76,10 @@ impl ManageConnection for Backend {
         if conn.healthy {
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "upstream marked dead"))
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "upstream marked dead",
+            ))
         }
     }
 
@@ -101,7 +104,10 @@ fn main() -> io::Result<()> {
 
     let cores = cpu::cores();
     if cores.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "no cores to run on"));
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no cores to run on",
+        ));
     }
     println!(
         "tcp_pool on {addr} -> upstream {}: {} workers, {capacity} upstreams/worker",

@@ -124,9 +124,12 @@ fn main() -> io::Result<()> {
                     if line.starts_with("ERR") {
                         return Err(io::Error::other(line.to_string()));
                     }
-                    let size: usize = line
-                        .parse()
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad size {line:?}: {e}")))?;
+                    let size: usize = line.parse().map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("bad size {line:?}: {e}"),
+                        )
+                    })?;
                     if size != opts.bytes {
                         return Err(io::Error::other(format!(
                             "size mismatch: sent {}B file, got {size}",
