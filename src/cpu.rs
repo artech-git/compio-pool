@@ -19,7 +19,7 @@ pub fn cores() -> Vec<CoreId> {
 ///
 /// Call it inside each thread's closure before you build that thread's runtime,
 /// so the ring and everything allocated after it belong to that core.
-pub fn pin_current(core: CoreId) -> bool {
+pub fn pin_current_core(core: CoreId) -> bool {
     core_affinity::set_for_current(core)
 }
 

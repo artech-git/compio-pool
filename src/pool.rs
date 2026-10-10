@@ -55,6 +55,7 @@ pub(crate) struct Shared<M: ManageConnection> {
     closed: AtomicBool,
     /// One metrics block per [`LocalPool`] ever created, for process-wide
     /// aggregation. Locked only when a pool is created or stats are read.
+    // TODO: configure this under metrics feature flag ! 
     metrics: Mutex<Vec<Arc<Metrics>>>,
 }
 
@@ -84,7 +85,7 @@ impl<M: ManageConnection> Pool<M> {
     }
 
     /// The per-thread ceiling on open connections.
-    pub fn max_size(&self) -> u32 {
+    pub fn per_thread_max_size(&self) -> u32 {
         self.shared.config.max_size
     }
 
@@ -169,6 +170,7 @@ impl<M: ManageConnection> Pool<M> {
         stats.total_wait_time = Duration::from_micros(micros);
         stats
     }
+    
 }
 
 impl<M: ManageConnection> fmt::Debug for Pool<M> {
@@ -420,7 +422,7 @@ impl<M: ManageConnection> LocalPool<M> {
 
     /// The per-thread ceiling on open connections.
     pub fn max_size(&self) -> u32 {
-        self.inner.shared.config.max_size
+        self.inner.shared.config.max_size   
     }
 
     /// A snapshot of **this thread's** open, idle and waiting counts. Lock-free.
@@ -588,7 +590,7 @@ impl<M: ManageConnection> LocalPool<M> {
 
             // Prefer a live idle connection.
             if let Some(mut held) = self.pop_fresh_idle() {
-                if self.inner.shared.config.test_on_check_out {
+                if self.inner.shared.config.test_on_state_check_out {
                     // Scope the borrow of `held` so it ends before the `drop`.
                     let valid = {
                         let conn = held.conn.as_mut().expect("idle held carries a connection");

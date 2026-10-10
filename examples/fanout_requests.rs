@@ -95,7 +95,7 @@ fn main() -> io::Result<()> {
 
         // 2. One pool of upstreams to the backend, and this thread's LocalPool.
         let pool = Pool::builder()
-            .max_size(capacity)
+            .max_size_per_thread(capacity)
             .build(Upstreams { addr: backend_addr });
         let local = pool.local();
 

@@ -14,7 +14,7 @@ pub(crate) struct PoolConfig {
     pub connection_timeout: Duration,
     pub idle_timeout: Option<Duration>,
     pub max_lifetime: Option<Duration>,
-    pub test_on_check_out: bool,
+    pub test_on_state_check_out: bool,
 }
 
 impl Default for PoolConfig {
@@ -25,7 +25,7 @@ impl Default for PoolConfig {
             connection_timeout: Duration::from_secs(30),
             idle_timeout: Some(Duration::from_secs(10 * 60)),
             max_lifetime: Some(Duration::from_secs(30 * 60)),
-            test_on_check_out: true,
+            test_on_state_check_out: true,
         }
     }
 }
@@ -61,7 +61,7 @@ impl<M: ManageConnection> Builder<M> {
 
     /// The most connections one thread's pool keeps open at once (idle plus
     /// checked out). Default 10.
-    pub fn max_size(mut self, n: u32) -> Self {
+    pub fn max_size_per_thread(mut self, n: u32) -> Self {
         self.config.max_size = n;
         self
     }
@@ -69,7 +69,7 @@ impl<M: ManageConnection> Builder<M> {
     /// How many connections each thread opens up front and keeps idle, created
     /// by [`LocalPool::warm`](crate::LocalPool::warm). Capped at
     /// [`max_size`](Self::max_size). Default 0.
-    pub fn min_idle(mut self, n: u32) -> Self {
+    pub fn min_idle_per_thread(mut self, n: u32) -> Self {
         self.config.min_idle = n;
         self
     }
@@ -84,22 +84,22 @@ impl<M: ManageConnection> Builder<M> {
 
     /// Drop an idle connection that has gone unused for this long. `None` keeps
     /// idle connections forever. Default 10 minutes.
-    pub fn idle_timeout(mut self, d: Option<Duration>) -> Self {
+    pub fn idle_timeout_per_thread(mut self, d: Option<Duration>) -> Self {
         self.config.idle_timeout = d;
         self
     }
 
     /// Drop a connection older than this, idle or not, the next time it is
     /// checked out or returned. `None` never retires on age. Default 30 minutes.
-    pub fn max_lifetime(mut self, d: Option<Duration>) -> Self {
+    pub fn max_lifetime_per_thread(mut self, d: Option<Duration>) -> Self {
         self.config.max_lifetime = d;
         self
     }
 
     /// Call [`ManageConnection::is_valid`] on a reused connection as it is
     /// checked out. Default `true`.
-    pub fn test_on_check_out(mut self, yes: bool) -> Self {
-        self.config.test_on_check_out = yes;
+    pub fn test_on_state_check_out(mut self, yes: bool) -> Self {
+        self.config.test_on_state_check_out = yes;
         self
     }
 
@@ -109,6 +109,7 @@ impl<M: ManageConnection> Builder<M> {
     ///
     /// If `max_size` is 0.
     pub fn build(self, manager: M) -> Pool<M> {
+        //TODO: assert invariance of current_max_size should instead return Result type returned after abrupt panic!
         assert!(self.config.max_size > 0, "max_size must be at least 1");
         let mut config = self.config;
         config.min_idle = config.min_idle.min(config.max_size);

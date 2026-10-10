@@ -100,7 +100,7 @@ fn main() -> io::Result<()> {
         .unwrap_or(64);
 
     // Build the pool once; every worker gets a clone of the `Send` handle.
-    let pool = Pool::builder().max_size(capacity).build(Backend);
+    let pool = Pool::builder().max_size_per_thread(capacity).build(Backend);
 
     let cores = cpu::cores();
     if cores.is_empty() {
@@ -132,7 +132,7 @@ fn main() -> io::Result<()> {
 /// One pinned thread: its own runtime, its own `SO_REUSEPORT` listener, and its
 /// own [`LocalPool`] of upstream connections carved from the shared [`Pool`].
 fn worker(core: cpu::CoreId, addr: SocketAddr, pool: Pool<Backend>) {
-    cpu::pin_current(core);
+    cpu::pin_current_core(core);
 
     let runtime = Runtime::builder().build().expect("build compio runtime");
     runtime.block_on(async move {
