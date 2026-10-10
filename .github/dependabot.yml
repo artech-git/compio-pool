@@ -8,3 +8,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Its ref names the toolchain to install, not a version of the action:
+      # `@1.95.0` is the MSRV pin, kept in step with `rust-version` in
+      # Cargo.toml, so a "bump" to a newer ref would silently move the MSRV.
+      - dependency-name: dtolnay/rust-toolchain

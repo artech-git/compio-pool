@@ -112,7 +112,10 @@ impl ManageConnection for Shard {
         if conn.healthy {
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "shard conn marked dead"))
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "shard conn marked dead",
+            ))
         }
     }
 
@@ -126,7 +129,9 @@ fn main() -> io::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9000".into())
         .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad listen addr: {e}")))?;
+        .map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("bad listen addr: {e}"))
+        })?;
     let shard_count: usize = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())

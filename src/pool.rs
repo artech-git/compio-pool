@@ -10,7 +10,7 @@
 //!
 //! # Metrics across threads
 //!
-//! Each [`LocalPool`] owns one [`Metrics`] block and registers a clone of it with
+//! Each [`LocalPool`] owns one `Metrics` block and registers a clone of it with
 //! the [`Pool`]. Only the owning thread ever writes its block, so the counters are
 //! plain relaxed atomics with no cross-thread contention. [`Pool::state`] and
 //! [`Pool::statistics`] lock the registry — a cold path — and sum every block to
@@ -207,7 +207,7 @@ pub struct Statistics {
     /// served.
     pub get_waited: u64,
     /// [`get`](LocalPool::get) calls that gave up with
-    /// [`RunError::TimedOut`](crate::RunError::TimedOut).
+    /// [`RunError::TimedOut`].
     pub get_timed_out: u64,
     /// Connections opened by the manager.
     pub connections_created: u64,
