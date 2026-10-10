@@ -77,7 +77,7 @@ fn reuses_an_idle_connection() {
     reset();
     run(async {
         let pool = Pool::builder()
-            .max_size(2)
+            .max_size_per_thread(2)
             .test_on_check_out(false)
             .build(Mgr);
         let local = pool.local();
@@ -95,7 +95,7 @@ fn enforces_max_size_then_times_out() {
     reset();
     run(async {
         let pool = Pool::builder()
-            .max_size(1)
+            .max_size_per_thread(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_millis(50))
             .build(Mgr);
@@ -119,7 +119,7 @@ fn drops_a_broken_connection() {
     reset();
     run(async {
         let pool = Pool::builder()
-            .max_size(2)
+            .max_size_per_thread(2)
             .test_on_check_out(false)
             .build(Mgr);
         let local = pool.local();
@@ -140,7 +140,7 @@ fn replaces_a_connection_that_fails_validation() {
     reset();
     run(async {
         let pool = Pool::builder()
-            .max_size(2)
+            .max_size_per_thread(2)
             .test_on_check_out(true)
             .build(Mgr);
         let local = pool.local();
@@ -162,7 +162,7 @@ fn surfaces_a_connect_error_and_frees_the_slot() {
     reset();
     run(async {
         let pool = Pool::builder()
-            .max_size(1)
+            .max_size_per_thread(1)
             .test_on_check_out(false)
             .build(Mgr);
         let local = pool.local();
@@ -186,7 +186,7 @@ fn surfaces_a_connect_error_and_frees_the_slot() {
 fn warm_opens_min_idle_up_front() {
     reset();
     run(async {
-        let pool = Pool::builder().max_size(5).min_idle(3).build(Mgr);
+        let pool = Pool::builder().max_size_per_thread(5).min_idle(3).build(Mgr);
         let local = pool.local();
 
         assert_eq!(local.warm().await.unwrap(), 3);
@@ -201,7 +201,7 @@ fn statistics_count_direct_reuse_and_creation() {
     reset();
     run(async {
         let pool = Pool::builder()
-            .max_size(2)
+            .max_size_per_thread(2)
             .test_on_check_out(false)
             .build(Mgr);
         let local = pool.local();
@@ -225,7 +225,7 @@ fn statistics_count_timeouts() {
     reset();
     run(async {
         let pool = Pool::builder()
-            .max_size(1)
+            .max_size_per_thread(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_millis(50))
             .build(Mgr);
@@ -242,7 +242,7 @@ fn a_waiter_is_counted_and_then_served() {
     reset();
     run(async {
         let pool = Pool::builder()
-            .max_size(1)
+            .max_size_per_thread(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_secs(5))
             .build(Mgr);
@@ -272,7 +272,7 @@ fn reap_and_maintain_retire_then_refill() {
     reset();
     run(async {
         let pool = Pool::builder()
-            .max_size(3)
+            .max_size_per_thread(3)
             .min_idle(2)
             .test_on_check_out(false)
             .idle_timeout(None)
@@ -300,7 +300,7 @@ fn clear_drains_idle_connections() {
     reset();
     run(async {
         let pool = Pool::builder()
-            .max_size(3)
+            .max_size_per_thread(3)
             .min_idle(3)
             .test_on_check_out(false)
             .build(Mgr);
@@ -320,7 +320,7 @@ fn close_rejects_gets_and_drops_returns() {
     reset();
     run(async {
         let pool = Pool::builder()
-            .max_size(2)
+            .max_size_per_thread(2)
             .test_on_check_out(false)
             .build(Mgr);
         let local = pool.local();

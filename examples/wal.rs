@@ -104,7 +104,7 @@ fn main() -> io::Result<()> {
         .unwrap_or(1024);
 
     std::fs::create_dir_all(&*WAL_DIR)?;
-    let pool = Pool::builder().max_size(capacity).build(WalManager);
+    let pool = Pool::builder().max_size_per_thread(capacity).build(WalManager);
 
     let cores = cpu::cores();
     if cores.is_empty() {
@@ -135,7 +135,7 @@ fn main() -> io::Result<()> {
 }
 
 fn worker(core: cpu::CoreId, addr: SocketAddr, pool: Pool<WalManager>) {
-    cpu::pin_current(core);
+    cpu::pin_current_core(core);
 
     let runtime = Runtime::builder().build().expect("build compio runtime");
     runtime.block_on(async move {

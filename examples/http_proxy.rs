@@ -185,7 +185,7 @@ fn main() -> io::Result<()> {
         };
 
         let pool = Pool::builder()
-            .max_size(capacity)
+            .max_size_per_thread(capacity)
             .build(Origin { addr: origin_addr });
         let local = pool.local();
 

@@ -73,7 +73,7 @@ fn opened() -> u64 {
 
 fn main() -> io::Result<()> {
     // Keep at most 8 per thread; warm 4 of them ahead of demand.
-    let pool = Pool::builder().max_size(8).min_idle(4).build(Manager);
+    let pool = Pool::builder().max_size_per_thread(8).min_idle(4).build(Manager);
 
     // One runtime, one thread — the pool's natural unit.
     let runtime = Runtime::builder().build().expect("build compio runtime");

@@ -61,13 +61,13 @@ fn main() -> io::Result<()> {
     // EADDRINUSE, so clear it first.
     let _ = std::fs::remove_file(&path);
 
-    let pool = Pool::builder().max_size(capacity).build(Buffers);
+    let pool = Pool::builder().max_size_per_thread(capacity).build(Buffers);
 
     // One listener, so one worker. Pin it to the first permitted core so the ring
     // and the socket share a CPU, the same discipline the fan-out examples apply
     // per thread.
     if let Some(core) = cpu::cores().into_iter().next() {
-        cpu::pin_current(core);
+        cpu::pin_current_core(core);
     }
     println!("unix_echo on {path}: 1 worker, capacity {capacity}");
 
