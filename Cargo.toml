@@ -6,7 +6,6 @@ description = "A bb8-style connection pool for compio: build once, clone the han
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/artech-git/compio-pool"
 documentation = "https://docs.rs/compio-pool"
-homepage = "https://github.com/artech-git/compio-pool"
 readme = "README.md"
 keywords = ["compio", "io-uring", "pool", "bb8", "thread-per-core"]
 categories = ["asynchronous", "network-programming", "concurrency"]
