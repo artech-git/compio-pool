@@ -70,7 +70,7 @@ fn main() -> io::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
 
-    let pool = Pool::builder().max_size(capacity).build(Buffers);
+    let pool = Pool::builder().max_size_per_thread(capacity).build(Buffers);
 
     let cores = cpu::cores();
     if cores.is_empty() {
@@ -100,7 +100,7 @@ fn main() -> io::Result<()> {
 }
 
 fn worker(core: cpu::CoreId, addr: SocketAddr, pool: Pool<Buffers>) {
-    cpu::pin_current(core);
+    cpu::pin_current_core(core);
 
     let runtime = Runtime::builder().build().expect("build compio runtime");
     runtime.block_on(async move {

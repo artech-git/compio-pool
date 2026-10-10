@@ -64,7 +64,7 @@ fn main() -> io::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
 
-    let pool = Pool::builder().max_size(capacity).build(Buffers);
+    let pool = Pool::builder().max_size_per_thread(capacity).build(Buffers);
 
     // One runtime, one ring. Everything below runs on this single thread.
     let runtime = Runtime::builder().build().expect("build compio runtime");
