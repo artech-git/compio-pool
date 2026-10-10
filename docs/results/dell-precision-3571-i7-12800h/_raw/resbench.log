@@ -1,0 +1,25 @@
+== workers 4 (server cpus 0-3) ==
+  compio-pool     W=4     592407 req/s  rss    5.6MB  thr   5  sys/req  0.03  ctx/req  0.00  migr/req 0.000
+  tokio-per-core  W=4     626327 req/s  rss    8.0MB  thr   5  sys/req  1.99  ctx/req  0.00  migr/req 0.000
+  tokio-default   W=4     608020 req/s  rss   11.8MB  thr   5  sys/req  1.98  ctx/req  0.00  migr/req 0.000
+== workers 8 (server cpus 0-7) ==
+  compio-pool     W=8     875586 req/s  rss    5.9MB  thr   9  sys/req  0.03  ctx/req  0.00  migr/req 0.000
+  tokio-per-core  W=8     749772 req/s  rss    8.2MB  thr   9  sys/req  2.00  ctx/req  0.00  migr/req 0.000
+  tokio-default   W=8     725592 req/s  rss   11.8MB  thr   9  sys/req  1.99  ctx/req  0.00  migr/req 0.000
+== workers 12 (server cpus 0-11) ==
+  compio-pool     W=12    527238 req/s  rss    6.5MB  thr  13  sys/req  1.26  ctx/req  0.46  migr/req 0.000
+  tokio-per-core  W=12    525624 req/s  rss    8.6MB  thr  13  sys/req  2.78  ctx/req  0.52  migr/req 0.000
+  tokio-default   W=12    537270 req/s  rss   11.9MB  thr  13  sys/req  2.90  ctx/req  0.35  migr/req 0.001
+== workers 16 (server cpus 0-15) ==
+  compio-pool     W=16    303851 req/s  rss    7.0MB  thr  17  sys/req  1.72  ctx/req  0.79  migr/req 0.000
+  tokio-per-core  W=16    305894 req/s  rss    8.7MB  thr  17  sys/req  2.91  ctx/req  0.82  migr/req 0.000
+  tokio-default   W=16    312094 req/s  rss   11.9MB  thr  17  sys/req  3.46  ctx/req  0.74  migr/req 0.000
+== workers 18 (server cpus 0-17) ==
+  compio-pool     W=18    171129 req/s  rss    7.2MB  thr  19  sys/req  1.88  ctx/req  0.91  migr/req 0.000
+  tokio-per-core  W=18    170234 req/s  rss    8.9MB  thr  19  sys/req  2.95  ctx/req  0.92  migr/req 0.000
+  tokio-default   W=18    194767 req/s  rss   12.0MB  thr  19  sys/req  4.03  ctx/req  1.15  migr/req 0.000
+== workers 20 (server cpus 0-19) ==
+  compio-pool     W=20    805629 req/s  rss    7.5MB  thr  21  sys/req  0.10  ctx/req  0.46  migr/req 0.000
+  tokio-per-core  W=20    792246 req/s  rss    9.1MB  thr  21  sys/req  2.03  ctx/req  0.48  migr/req 0.000
+  tokio-default   W=20    710949 req/s  rss   12.1MB  thr  21  sys/req  1.99  ctx/req  0.40  migr/req 0.001
+DONE -> /home/prabhat/resbench-out/res.tsv
