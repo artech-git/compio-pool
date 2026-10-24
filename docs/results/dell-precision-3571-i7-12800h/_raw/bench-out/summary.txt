@@ -1,0 +1,102 @@
+Legend: S = server CPUs >=85% busy (server-bound). C = client CPUs >=85% busy (client-bound:
+the number mostly measures the load generator; read it as a lower bound). B = whole box
+>=90% busy (shared / onecpu placement). No flag = neither saturated. '+-N%' is half the
+min-max spread over repeats. Each cell is the median run by req/s.
+
+=== scale512 ===
+
+median req/s [flag] +-spread
+                              tokio-default              tokio-per-core             compio-pool                pc/default   compio/pc    
+W=1                           251776 [S] +-0%            253776 [S] +-0%            242416 [S] +-0%            1.01x        0.96x        
+W=2                           462825 [S] +-0%            499914 [S] +-0%            479592 [S] +-0%            1.08x        0.96x        
+W=4                           780899 [S] +-0%            860116 [S] +-3%            834685 [S] +-5%            1.10x        0.97x        
+W=5                           733801 [SC] +-0%           756421 [SC] +-0%           740043 [SC] +-0%           1.03x        0.98x        
+
+p50 / p99 latency, us
+                              tokio-default              tokio-per-core             compio-pool                
+W=1                           257 / 274                  250 / 267                  259 / 411                  
+W=2                           137 / 204                  127 / 141                  128 / 216                  
+W=4                           161 / 286                  149 / 195                  146 / 265                  
+W=5                           207 / 452                  212 / 313                  206 / 405                  
+
+CPU us per request: server(user+sys) / client
+                              tokio-default              tokio-per-core             compio-pool                
+W=1                           4.0 / 8.2                  3.9 / 7.5                  4.1 / 7.8                  
+W=2                           4.2 / 8.3                  4.0 / 8.2                  4.2 / 8.0                  
+W=4                           4.8 / 10.4                 4.6 / 10.4                 4.7 / 9.9                  
+W=5                           6.3 / 12.5                 6.5 / 13.1                 6.7 / 13.0                 
+
+=== scale16k ===
+
+median req/s [flag] +-spread
+                              tokio-default              tokio-per-core             compio-pool                pc/default   compio/pc    
+W=1                           147929 [S] +-1%            147773 [S] +-1%            156279 [S] +-0%            1.00x        1.06x        
+W=2                           301753 [S] +-0%            311598 [S] +-0%            325584 [S] +-0%            1.03x        1.04x        
+W=4                           492280 [S] +-8%            603427 [S] +-6%            517872 [S] +-8%            1.23x        0.86x        
+W=5                           460130 [SC] +-3%           495213 [SC] +-2%           470268 [SC] +-5%           1.08x        0.95x        
+
+p50 / p99 latency, us
+                              tokio-default              tokio-per-core             compio-pool                
+W=1                           437 / 507                  431 / 497                  400 / 622                  
+W=2                           212 / 321                  230 / 281                  188 / 327                  
+W=4                           248 / 520                  202 / 330                  235 / 433                  
+W=5                           339 / 589                  316 / 514                  324 / 586                  
+
+CPU us per request: server(user+sys) / client
+                              tokio-default              tokio-per-core             compio-pool                
+W=1                           6.7 / 13.8                 6.7 / 13.4                 6.4 / 10.7                 
+W=2                           6.5 / 12.3                 6.4 / 12.3                 6.1 / 11.4                 
+W=4                           7.8 / 17.5                 6.5 / 16.0                 7.7 / 17.2                 
+W=5                           10.2 / 21.5                9.6 / 20.1                 10.3 / 21.0                
+
+=== payload ===
+
+median req/s [flag] +-spread
+                              tokio-default              tokio-per-core             compio-pool                pc/default   compio/pc    
+64 B                          706121 [S] +-2%            776946 [S] +-0%            740504 [S] +-0%            1.10x        0.95x        
+512 B                         700778 [S] +-0%            764619 [S] +-0%            736551 [S] +-1%            1.09x        0.96x        
+2048 B                        665507 [S] +-0%            718610 [S] +-1%            699401 [S] +-0%            1.08x        0.97x        
+8192 B                        577224 [S] +-0%            632427 [S] +-0%            607348 [S] +-0%            1.10x        0.96x        
+16384 B                       485774 [S] +-0%            528149 [S] +-0%            517468 [S] +-0%            1.09x        0.98x        
+
+p50 / p99 latency, us
+                              tokio-default              tokio-per-core             compio-pool                
+64 B                          174 / 356                  156 / 238                  165 / 325                  
+512 B                         176 / 354                  167 / 257                  164 / 328                  
+2048 B                        185 / 381                  175 / 274                  174 / 349                  
+8192 B                        212 / 436                  190 / 302                  200 / 387                  
+16384 B                       252 / 522                  237 / 374                  235 / 441                  
+
+CPU us per request: server(user+sys) / client
+                              tokio-default              tokio-per-core             compio-pool                
+64 B                          5.3 / 11.2                 5.1 / 11.3                 5.4 / 11.0                 
+512 B                         5.3 / 11.3                 5.2 / 11.4                 5.4 / 11.1                 
+2048 B                        5.6 / 12.0                 5.5 / 12.4                 5.7 / 11.9                 
+8192 B                        6.5 / 14.3                 6.3 / 14.8                 6.5 / 14.0                 
+16384 B                       7.8 / 17.6                 7.5 / 17.9                 7.6 / 17.1                 
+
+=== conns ===
+
+median req/s [flag] +-spread
+                              tokio-default              tokio-per-core             compio-pool                pc/default   compio/pc    
+4 conns                       275394 +-1%                325472 +-3%                311361 +-2%                1.18x        0.96x        
+16 conns                      636613 [S] +-1%            691914 [S] +-4%            662385 [S] +-3%            1.09x        0.96x        
+64 conns                      674095 [S] +-0%            757483 [S] +-0%            723029 [S] +-0%            1.12x        0.95x        
+256 conns                     719705 [S] +-0%            763452 [S] +-0%            742862 [S] +-0%            1.06x        0.97x        
+1024 conns                    600330 +-3%                651774 [S] +-1%            641075 [S] +-0%            1.09x        0.98x        
+
+p50 / p99 latency, us
+                              tokio-default              tokio-per-core             compio-pool                
+4 conns                       14 / 23                    13 / 18                    13 / 17                    
+16 conns                      24 / 44                    20 / 46                    22 / 44                    
+64 conns                      91 / 189                   77 / 145                   85 / 161                   
+256 conns                     340 / 719                  310 / 468                  323 / 657                  
+1024 conns                    938 / 4474                 1443 / 2649                1485 / 2219                
+
+CPU us per request: server(user+sys) / client
+                              tokio-default              tokio-per-core             compio-pool                
+4 conns                       5.6 / 8.2                  4.8 / 7.4                  4.9 / 7.6                  
+16 conns                      5.8 / 10.6                 5.4 / 10.7                 5.9 / 11.1                 
+64 conns                      5.4 / 11.1                 5.2 / 11.4                 5.5 / 11.0                 
+256 conns                     5.3 / 11.5                 5.2 / 11.7                 5.3 / 11.2                 
+1024 conns                    5.2 / 11.3                 6.0 / 13.1                 6.1 / 12.5                 
