@@ -61,7 +61,7 @@ shutdown signal that wakes a `compio` task must follow [0006](0006-shutdown-and-
 panicking-thread detour.
 
 This record takes number **0009**, not the next-free `0008`: the
-[reuseport feature plan](../reuseport-feature-plan.md) reserves `0008` on paper for
+reuseport feature plan reserves `0008` on paper for
 `0008-cbpf-cpu-steering.md`.
 
 ## Related
