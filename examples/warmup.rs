@@ -16,8 +16,11 @@
 //!  * a burst reuses the idle ones first, then opens more only up to
 //!    [`max_size`], which is the ceiling.
 //!
+//! The live [`State`] counts it prints come from the optional `metrics` feature,
+//! so run it with that feature on:
+//!
 //! ```text
-//! cargo run --release --example warmup
+//! cargo run --release --features metrics --example warmup
 //! ```
 //!
 //! [`min_idle`]: compio_pool::Builder::min_idle
@@ -27,28 +30,35 @@
 //! [`state`]: compio_pool::LocalPool::state
 //! [`State`]: compio_pool::State
 
+#[cfg(feature = "metrics")]
 use std::{
     io,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(feature = "metrics")]
 use compio::runtime::Runtime;
+#[cfg(feature = "metrics")]
 use compio_pool::{ManageConnection, Pool};
 
 /// How many resources the manager has ever opened — the number `warm` and reuse
 /// exist to hold down.
+#[cfg(feature = "metrics")]
 static OPENS: AtomicU64 = AtomicU64::new(0);
 
 /// One pooled resource. A real manager would open a socket or a client here; this
 /// one just stamps an id so `connect` does something observable.
+#[cfg(feature = "metrics")]
 struct Resource {
     #[allow(dead_code)]
     id: u64,
 }
 
 /// Opens abstract resources and counts every open.
+#[cfg(feature = "metrics")]
 struct Manager;
 
+#[cfg(feature = "metrics")]
 impl ManageConnection for Manager {
     type Connection = Resource;
     type Error = io::Error;
@@ -67,10 +77,12 @@ impl ManageConnection for Manager {
     }
 }
 
+#[cfg(feature = "metrics")]
 fn opened() -> u64 {
     OPENS.load(Ordering::Relaxed)
 }
 
+#[cfg(feature = "metrics")]
 fn main() -> io::Result<()> {
     // Keep at most 8 per thread; warm 4 of them ahead of demand.
     let pool = Pool::builder().max_size(8).min_idle(4).build(Manager);
@@ -113,4 +125,14 @@ fn main() -> io::Result<()> {
     });
 
     Ok(())
+}
+
+/// Without the `metrics` feature the pool keeps no live counts, so there is
+/// nothing for this tour to show. Re-run it with the feature enabled.
+#[cfg(not(feature = "metrics"))]
+fn main() {
+    eprintln!(
+        "the `warmup` example needs the `metrics` feature:\n    \
+         cargo run --release --features metrics --example warmup"
+    );
 }

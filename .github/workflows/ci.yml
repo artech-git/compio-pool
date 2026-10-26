@@ -34,9 +34,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # The default build and each optional feature are separate code paths, so
+      # lint them all — a lint only one configuration trips is still a failure.
       - run: cargo clippy --all-targets --locked -- -D warnings
-      # Exercise the optional features too, so a lint only they trip is caught.
       - run: cargo clippy --all-targets --features affinity --locked -- -D warnings
+      - run: cargo clippy --all-targets --features metrics --locked -- -D warnings
 
   test:
     name: Test (${{ matrix.toolchain }})
@@ -55,6 +57,9 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
+      # The steps below are the default build (all optional features off); the
+      # per-feature steps after them are the feature-on paths. Each must stay
+      # green — nothing else exercises these configurations against each other.
       - name: Build (all targets, incl. examples)
         run: cargo build --all-targets --locked
       # The integration tests bind SO_REUSEPORT listeners on 127.0.0.1 and
@@ -63,14 +68,18 @@ jobs:
         run: cargo test --all-targets --locked
       - name: Doc tests
         run: cargo test --doc --locked
-      # The default jobs above are the feature-off path; these run the same
-      # three with `affinity` on, so both configurations stay green.
       - name: Build (affinity)
         run: cargo build --all-targets --features affinity --locked
       - name: Test (affinity)
         run: cargo test --all-targets --features affinity --locked
       - name: Doc tests (affinity)
         run: cargo test --doc --features affinity --locked
+      - name: Build (metrics)
+        run: cargo build --all-targets --features metrics --locked
+      - name: Test (metrics)
+        run: cargo test --all-targets --features metrics --locked
+      - name: Doc tests (metrics)
+        run: cargo test --doc --features metrics --locked
 
   msrv:
     name: MSRV (1.95)
@@ -95,6 +104,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+      # `--all-features` matches docs.rs (see `[package.metadata.docs.rs]`), so the
+      # feature-gated APIs and their `doc(cfg)` annotations are built and checked here too.
       - run: cargo doc --no-deps --all-features --locked
 
   shell:

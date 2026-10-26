@@ -10,9 +10,10 @@
 //!
 //! # Metrics across threads
 //!
-//! Each [`LocalPool`] owns one `Metrics` block and registers a clone of it with
-//! the [`Pool`]. Only the owning thread ever writes its block, so the counters are
-//! plain relaxed atomics with no cross-thread contention. [`Pool::state`] and
+//! With the `metrics` feature enabled, each [`LocalPool`] owns one `Metrics` block
+//! and registers a clone of it with the [`Pool`]. Only the owning thread ever
+//! writes its block, so the counters are plain relaxed atomics with no
+//! cross-thread contention. [`Pool::state`] and
 //! [`Pool::statistics`] lock the registry — a cold path — and sum every block to
 //! give a process-wide view; [`LocalPool::state`] and [`LocalPool::statistics`]
 //! read only this thread's block.

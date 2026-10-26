@@ -22,6 +22,10 @@ product; spawning threads, pinning them and running an accept loop are yours (th
 compio-pool = "0.1"
 ```
 
+The per-thread counters behind `State` / `Statistics` live behind an off-by-default
+`metrics` feature, so the default build pays nothing for them; add `features = ["metrics"]`
+to scrape them.
+
 📖 **[API documentation on docs.rs](https://docs.rs/compio-pool)**
 
 **Design notes** — [architecture](docs/architecture.md) · [design decisions](docs/decisions/) ·
@@ -75,10 +79,11 @@ back onto the idle list; anything else is dropped and its slot freed. Either way
 is woken. None of this touches an atomic or a lock — it is a `Vec` push/pop and a counter bump on
 a single thread.
 
-The only atomics in the crate are the **per-thread metric counters** behind `State` /
-`Statistics`, kept relaxed so an off-thread scrape can sum every worker's view without disturbing
-the hot path. Expiry is **lazy** — a connection's age is checked only as it is handed out or
-returned — so a pool that goes quiet keeps its connections until you run
+The per-thread slot count is a plain `Cell`, so the default build has no atomics on this path at
+all. The optional **`metrics`** feature (off by default) adds the per-thread counters behind
+`State` / `Statistics`, kept relaxed so an off-thread scrape can sum every worker's view without
+disturbing the hot path. Expiry is **lazy** — a connection's age is checked only as it is handed
+out or returned — so a pool that goes quiet keeps its connections until you run
 [`maintain`](#maintenance) on a timer.
 
 ---
@@ -310,8 +315,10 @@ Three things a long-lived server needs are built on the same `Send` / `!Send` sp
 
 ### Metrics
 
-Each `LocalPool` keeps its own lock-free counters and registers them with the `Pool`. Read one
-thread's, or sum every thread's for a process-wide view to feed a metrics endpoint:
+Metrics are opt-in: enable the `metrics` feature (off by default, so the default build keeps no
+counters). With it on, each `LocalPool` keeps its own lock-free counters and registers them with
+the `Pool`. Read one thread's, or sum every thread's for a process-wide view to feed a metrics
+endpoint:
 
 ```rust
 let here = local.state();       // this thread: State { connections, idle_connections, pending_waiters }
@@ -326,6 +333,8 @@ let s = pool.statistics();      // cumulative Statistics across every thread
 
 `Pool::state` / `Pool::statistics` take a lock to walk the registry, so call them off the hot
 path (a scrape, a health check). `LocalPool::state` / `LocalPool::statistics` are lock-free.
+Without the `metrics` feature all four still compile but report zeroes, so downstream code that
+calls them builds in either configuration.
 
 ### Maintenance
 
