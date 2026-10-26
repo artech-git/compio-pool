@@ -46,3 +46,7 @@ compio = { version = "0.19.2", default-features = false, features = [
 socket2 = { version = "0.6.5", features = ["all"] }
 # Core enumeration and thread pinning for the `cpu` helper module.
 core_affinity = "0.8.3"
+
+[features]
+metrics = []
+

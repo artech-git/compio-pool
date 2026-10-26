@@ -10,7 +10,7 @@
 //!
 //! # Metrics across threads
 //!
-//! Each [`LocalPool`] owns one [`Metrics`] block and registers a clone of it with
+//! Each [`LocalPool`] owns one `Metrics` block and registers a clone of it with
 //! the [`Pool`]. Only the owning thread ever writes its block, so the counters are
 //! plain relaxed atomics with no cross-thread contention. [`Pool::state`] and
 //! [`Pool::statistics`] lock the registry — a cold path — and sum every block to
@@ -25,11 +25,19 @@ use std::{
     pin::Pin,
     rc::Rc,
     sync::{
-        Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
+        Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
     },
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
+};
+
+// Registry lock and the atomic counter types are only touched by the metrics
+// machinery, so they drop out of the build when the feature is off.
+#[cfg(feature = "metrics")]
+use std::sync::{
+    Mutex, PoisonError,
+    atomic::{AtomicU32, AtomicU64},
 };
 
 use crate::{
@@ -55,6 +63,7 @@ pub(crate) struct Shared<M: ManageConnection> {
     closed: AtomicBool,
     /// One metrics block per [`LocalPool`] ever created, for process-wide
     /// aggregation. Locked only when a pool is created or stats are read.
+    #[cfg(feature = "metrics")]
     metrics: Mutex<Vec<Arc<Metrics>>>,
 }
 
@@ -73,6 +82,7 @@ impl<M: ManageConnection> Pool<M> {
                 manager,
                 config,
                 closed: AtomicBool::new(false),
+                #[cfg(feature = "metrics")]
                 metrics: Mutex::new(Vec::new()),
             }),
         }
@@ -128,18 +138,23 @@ impl<M: ManageConnection> Pool<M> {
     /// the hot path (a metrics scrape, a health endpoint). For one thread's numbers
     /// use [`LocalPool::state`].
     pub fn state(&self) -> State {
-        let registry = self
-            .shared
-            .metrics
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut state = State::default();
-        for m in registry.iter() {
-            state.connections += m.connections.load(Relaxed);
-            state.idle_connections += m.idle.load(Relaxed);
-            state.pending_waiters += m.waiters.load(Relaxed);
+        #[cfg(feature = "metrics")]
+        {
+            let registry = self
+                .shared
+                .metrics
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut state = State::default();
+            for m in registry.iter() {
+                state.connections += m.connections.load(Relaxed);
+                state.idle_connections += m.idle.load(Relaxed);
+                state.pending_waiters += m.waiters.load(Relaxed);
+            }
+            state
         }
-        state
+        #[cfg(not(feature = "metrics"))]
+        State::default()
     }
 
     /// Process-wide cumulative counters summed across every thread's
@@ -147,27 +162,32 @@ impl<M: ManageConnection> Pool<M> {
     /// meant for a scrape, not the hot path. For one thread's totals use
     /// [`LocalPool::statistics`].
     pub fn statistics(&self) -> Statistics {
-        let registry = self
-            .shared
-            .metrics
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut stats = Statistics::default();
-        let mut micros = 0u64;
-        for m in registry.iter() {
-            stats.get_direct += m.get_direct.load(Relaxed);
-            stats.get_waited += m.get_waited.load(Relaxed);
-            stats.get_timed_out += m.get_timed_out.load(Relaxed);
-            stats.connections_created += m.connections_created.load(Relaxed);
-            stats.connections_closed_broken += m.connections_closed_broken.load(Relaxed);
-            stats.connections_closed_idle_timeout +=
-                m.connections_closed_idle_timeout.load(Relaxed);
-            stats.connections_closed_max_lifetime +=
-                m.connections_closed_max_lifetime.load(Relaxed);
-            micros += m.wait_micros.load(Relaxed);
+        #[cfg(feature = "metrics")]
+        {
+            let registry = self
+                .shared
+                .metrics
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut stats = Statistics::default();
+            let mut micros = 0u64;
+            for m in registry.iter() {
+                stats.get_direct += m.get_direct.load(Relaxed);
+                stats.get_waited += m.get_waited.load(Relaxed);
+                stats.get_timed_out += m.get_timed_out.load(Relaxed);
+                stats.connections_created += m.connections_created.load(Relaxed);
+                stats.connections_closed_broken += m.connections_closed_broken.load(Relaxed);
+                stats.connections_closed_idle_timeout +=
+                    m.connections_closed_idle_timeout.load(Relaxed);
+                stats.connections_closed_max_lifetime +=
+                    m.connections_closed_max_lifetime.load(Relaxed);
+                micros += m.wait_micros.load(Relaxed);
+            }
+            stats.total_wait_time = Duration::from_micros(micros);
+            stats
         }
-        stats.total_wait_time = Duration::from_micros(micros);
-        stats
+        #[cfg(not(feature = "metrics"))]
+        Statistics::default()
     }
 }
 
@@ -207,7 +227,7 @@ pub struct Statistics {
     /// served.
     pub get_waited: u64,
     /// [`get`](LocalPool::get) calls that gave up with
-    /// [`RunError::TimedOut`](crate::RunError::TimedOut).
+    /// [`RunError::TimedOut`].
     pub get_timed_out: u64,
     /// Connections opened by the manager.
     pub connections_created: u64,
@@ -236,6 +256,7 @@ impl Statistics {
 /// atomics suffice) and summed across threads by [`Pool::state`] /
 /// [`Pool::statistics`]. The live gauges are zeroed when the owning thread's
 /// [`Inner`] drops; the cumulative counters outlive it.
+#[cfg(feature = "metrics")]
 #[derive(Default)]
 struct Metrics {
     // Live gauges.
@@ -253,6 +274,7 @@ struct Metrics {
     wait_micros: AtomicU64,
 }
 
+#[cfg(feature = "metrics")]
 impl Metrics {
     fn inc_conn(&self) {
         self.connections.fetch_add(1, Relaxed);
@@ -336,15 +358,38 @@ fn expiry<C>(conn: &Conn<C>, now: Instant, cfg: &PoolConfig) -> Option<Expiry> {
 struct Inner<M: ManageConnection> {
     shared: Arc<Shared<M>>,
     idle: RefCell<Vec<Conn<M::Connection>>>,
-    /// This thread's counters, also held (cloned `Arc`) in the pool's registry.
+    /// Open slots this thread holds: idle + checked out + reserved. The count the
+    /// pool enforces against `max_size` and its source of truth, tracked whether or
+    /// not the `metrics` feature is on.
+    slots: Cell<u32>,
+    #[cfg(feature = "metrics")]
+    /// This thread's counters, also held (cloned `Arc`) in the pool's registry. The
+    /// live gauges mirror `slots`/`idle`/`waiters` so [`Pool::state`] can read them
+    /// from another thread; nothing here is read by pool logic.
     metrics: Arc<Metrics>,
     /// Woken when a slot frees or a connection returns to the idle list.
     waiters: Waiters,
 }
 
 impl<M: ManageConnection> Inner<M> {
+    /// Open slots this thread holds (idle + checked out + reserved), the count
+    /// enforced against `max_size`.
     fn connections(&self) -> u32 {
-        self.metrics.connections.load(Relaxed)
+        self.slots.get()
+    }
+
+    /// Reserve a slot. Mirrors the live gauge when metrics are on.
+    fn take_slot(&self) {
+        self.slots.set(self.slots.get() + 1);
+        #[cfg(feature = "metrics")]
+        self.metrics.inc_conn();
+    }
+
+    /// Release `n` slots. Mirrors the live gauge when metrics are on.
+    fn release_slots(&self, n: u32) {
+        self.slots.set(self.slots.get().saturating_sub(n));
+        #[cfg(feature = "metrics")]
+        self.metrics.dec_conn(n);
     }
 
     fn closed(&self) -> bool {
@@ -353,22 +398,48 @@ impl<M: ManageConnection> Inner<M> {
 
     /// Give back one slot and wake anyone waiting for capacity.
     fn release_slot(&self) {
-        self.metrics.dec_conn(1);
+        self.release_slots(1);
         self.waiters.wake_all();
     }
 
     fn push_idle(&self, conn: Conn<M::Connection>) {
         self.idle.borrow_mut().push(conn);
+        #[cfg(feature = "metrics")]
         self.metrics.inc_idle();
     }
 
     fn pop_idle(&self) -> Option<Conn<M::Connection>> {
         let conn = self.idle.borrow_mut().pop();
+        #[cfg(feature = "metrics")]
         if conn.is_some() {
             self.metrics.dec_idle(1);
         }
         conn
     }
+
+    /// Count a connection retired for `reason`. Metrics-only; a no-op otherwise.
+    #[cfg(feature = "metrics")]
+    fn note_expired(&self, reason: Expiry) {
+        self.metrics.note_expired(reason);
+    }
+    #[cfg(not(feature = "metrics"))]
+    fn note_expired(&self, _reason: Expiry) {}
+
+    /// Count a connection the manager opened. Metrics-only; a no-op otherwise.
+    #[cfg(feature = "metrics")]
+    fn note_created(&self) {
+        self.metrics.connections_created.fetch_add(1, Relaxed);
+    }
+    #[cfg(not(feature = "metrics"))]
+    fn note_created(&self) {}
+
+    /// Count a connection dropped as broken. Metrics-only; a no-op otherwise.
+    #[cfg(feature = "metrics")]
+    fn note_broken(&self) {
+        self.metrics.connections_closed_broken.fetch_add(1, Relaxed);
+    }
+    #[cfg(not(feature = "metrics"))]
+    fn note_broken(&self) {}
 }
 
 impl<M: ManageConnection> Drop for Inner<M> {
@@ -376,9 +447,12 @@ impl<M: ManageConnection> Drop for Inner<M> {
         // The connections this thread held drop with `idle`; zero the live gauges
         // so a finished worker no longer shows up in `Pool::state`. The cumulative
         // counters stay, so lifetime totals survive the thread.
-        self.metrics.connections.store(0, Relaxed);
-        self.metrics.idle.store(0, Relaxed);
-        self.metrics.waiters.store(0, Relaxed);
+        #[cfg(feature = "metrics")]
+        {
+            self.metrics.connections.store(0, Relaxed);
+            self.metrics.idle.store(0, Relaxed);
+            self.metrics.waiters.store(0, Relaxed);
+        }
     }
 }
 
@@ -402,17 +476,26 @@ impl<M: ManageConnection> Clone for LocalPool<M> {
 impl<M: ManageConnection> LocalPool<M> {
     pub(crate) fn new(shared: Arc<Shared<M>>) -> Self {
         let cap = shared.config.max_size.min(1024) as usize;
-        let metrics = Arc::new(Metrics::default());
-        shared
-            .metrics
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(metrics.clone());
+        #[cfg(feature = "metrics")]
+        let metrics = {
+            let metrics = Arc::new(Metrics::default());
+            shared
+                .metrics
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(metrics.clone());
+            metrics
+        };
         Self {
             inner: Rc::new(Inner {
                 shared,
                 idle: RefCell::new(Vec::with_capacity(cap)),
-                waiters: Waiters::new(metrics.clone()),
+                slots: Cell::new(0),
+                waiters: Waiters::new(
+                    #[cfg(feature = "metrics")]
+                    metrics.clone(),
+                ),
+                #[cfg(feature = "metrics")]
                 metrics,
             }),
         }
@@ -424,15 +507,27 @@ impl<M: ManageConnection> LocalPool<M> {
     }
 
     /// A snapshot of **this thread's** open, idle and waiting counts. Lock-free.
-    /// For the process-wide sum use [`Pool::state`].
+    /// For the process-wide sum use [`Pool::state`]. Without the `metrics` feature
+    /// it reports [`State::default`] (zeroes).
     pub fn state(&self) -> State {
-        self.inner.metrics.snapshot_state()
+        #[cfg(feature = "metrics")]
+        {
+            self.inner.metrics.snapshot_state()
+        }
+        #[cfg(not(feature = "metrics"))]
+        State::default()
     }
 
     /// **This thread's** cumulative counters. Lock-free. For the process-wide sum
-    /// use [`Pool::statistics`].
+    /// use [`Pool::statistics`]. Without the `metrics` feature it reports
+    /// [`Statistics::default`] (zeroes).
     pub fn statistics(&self) -> Statistics {
-        self.inner.metrics.snapshot_statistics()
+        #[cfg(feature = "metrics")]
+        {
+            self.inner.metrics.snapshot_statistics()
+        }
+        #[cfg(not(feature = "metrics"))]
+        Statistics::default()
     }
 
     /// Open connections up to [`min_idle`](Builder::min_idle) and park them on the
@@ -459,7 +554,7 @@ impl<M: ManageConnection> LocalPool<M> {
                         created_at: now,
                         last_used: now,
                     });
-                    self.inner.metrics.connections_created.fetch_add(1, Relaxed);
+                    self.inner.note_created();
                     held.into_idle();
                     made += 1;
                 }
@@ -482,13 +577,12 @@ impl<M: ManageConnection> LocalPool<M> {
     pub fn reap(&self) -> u32 {
         let now = Instant::now();
         let cfg = &self.inner.shared.config;
-        let metrics = &self.inner.metrics;
         let mut reaped = 0u32;
         {
             let mut idle = self.inner.idle.borrow_mut();
             idle.retain(|conn| match expiry(conn, now, cfg) {
                 Some(reason) => {
-                    metrics.note_expired(reason);
+                    self.inner.note_expired(reason);
                     reaped += 1;
                     false
                 }
@@ -496,8 +590,9 @@ impl<M: ManageConnection> LocalPool<M> {
             });
         }
         if reaped > 0 {
-            metrics.dec_idle(reaped);
-            metrics.dec_conn(reaped);
+            #[cfg(feature = "metrics")]
+            self.inner.metrics.dec_idle(reaped);
+            self.inner.release_slots(reaped);
             self.inner.waiters.wake_all();
         }
         reaped
@@ -540,6 +635,7 @@ impl<M: ManageConnection> LocalPool<M> {
             idle.clear();
             n
         };
+        #[cfg(feature = "metrics")]
         if n > 0 {
             self.inner.metrics.dec_idle(n);
             self.inner.metrics.dec_conn(n);
@@ -565,6 +661,7 @@ impl<M: ManageConnection> LocalPool<M> {
         match compio::time::timeout(timeout, self.get_inner()).await {
             Ok(result) => result,
             Err(_elapsed) => {
+                #[cfg(feature = "metrics")]
                 self.inner.metrics.get_timed_out.fetch_add(1, Relaxed);
                 Err(RunError::TimedOut)
             }
@@ -602,10 +699,7 @@ impl<M: ManageConnection> LocalPool<M> {
                     if !valid {
                         // Stale: count it closed, drop it (which frees the slot),
                         // and try again rather than failing.
-                        self.inner
-                            .metrics
-                            .connections_closed_broken
-                            .fetch_add(1, Relaxed);
+                        self.inner.note_broken();
                         drop(held);
                         continue;
                     }
@@ -624,7 +718,7 @@ impl<M: ManageConnection> LocalPool<M> {
                             created_at: now,
                             last_used: now,
                         });
-                        self.inner.metrics.connections_created.fetch_add(1, Relaxed);
+                        self.inner.note_created();
                         self.record_acquire(waited, start);
                         return Ok(held.into_pooled());
                     }
@@ -638,22 +732,27 @@ impl<M: ManageConnection> LocalPool<M> {
 
     /// Record a successful checkout: direct, or waited-with-elapsed.
     fn record_acquire(&self, waited: bool, start: Instant) {
-        if waited {
-            self.inner.metrics.get_waited.fetch_add(1, Relaxed);
-            self.inner
-                .metrics
-                .wait_micros
-                .fetch_add(start.elapsed().as_micros() as u64, Relaxed);
-        } else {
-            self.inner.metrics.get_direct.fetch_add(1, Relaxed);
+        #[cfg(feature = "metrics")]
+        {
+            if waited {
+                self.inner.metrics.get_waited.fetch_add(1, Relaxed);
+                self.inner
+                    .metrics
+                    .wait_micros
+                    .fetch_add(start.elapsed().as_micros() as u64, Relaxed);
+            } else {
+                self.inner.metrics.get_direct.fetch_add(1, Relaxed);
+            }
         }
+        #[cfg(not(feature = "metrics"))]
+        let _ = (waited, start);
     }
 
     /// Reserve a slot for a new connection, if under `max_size`.
     fn try_reserve(&self) -> Option<Held<M>> {
         let taken = self.inner.connections();
         if taken < self.inner.shared.config.max_size {
-            self.inner.metrics.inc_conn();
+            self.inner.take_slot();
             Some(Held {
                 inner: self.inner.clone(),
                 conn: None,
@@ -672,7 +771,7 @@ impl<M: ManageConnection> LocalPool<M> {
             let conn = self.inner.pop_idle()?;
             if let Some(reason) = expiry(&conn, now, &self.inner.shared.config) {
                 drop(conn);
-                self.inner.metrics.note_expired(reason);
+                self.inner.note_expired(reason);
                 self.inner.release_slot();
                 continue;
             }
@@ -686,7 +785,7 @@ impl<M: ManageConnection> LocalPool<M> {
 
     fn ready_now(&self) -> bool {
         self.inner.closed()
-            || self.inner.metrics.idle.load(Relaxed) > 0
+            || !self.inner.idle.borrow().is_empty()
             || self.inner.connections() < self.inner.shared.config.max_size
     }
 
@@ -795,14 +894,11 @@ impl<M: ManageConnection> Drop for PooledConnection<M> {
             }
             if self.inner.shared.manager.has_broken(&mut conn.raw) {
                 drop(conn);
-                self.inner
-                    .metrics
-                    .connections_closed_broken
-                    .fetch_add(1, Relaxed);
+                self.inner.note_broken();
                 self.inner.release_slot();
             } else if let Some(reason) = expiry(&conn, Instant::now(), &self.inner.shared.config) {
                 drop(conn);
-                self.inner.metrics.note_expired(reason);
+                self.inner.note_expired(reason);
                 self.inner.release_slot();
             } else {
                 conn.last_used = Instant::now();
@@ -825,16 +921,18 @@ impl<M: ManageConnection> fmt::Debug for PooledConnection<M> {
 /// Wakers of futures waiting for the pool to be ready to hand out a connection.
 /// Each waiter owns an id so it can withdraw its waker if it is dropped first;
 /// nothing stale is ever woken. The registered count is mirrored into
-/// [`Metrics::waiters`] so [`Pool::state`] can see it from another thread.
+/// `Metrics::waiters` so [`Pool::state`] can see it from another thread.
 struct Waiters {
+    #[cfg(feature = "metrics")]
     metrics: Arc<Metrics>,
     next_id: Cell<u64>,
     entries: RefCell<Vec<(u64, Waker)>>,
 }
 
 impl Waiters {
-    fn new(metrics: Arc<Metrics>) -> Self {
+    fn new(#[cfg(feature = "metrics")] metrics: Arc<Metrics>) -> Self {
         Self {
+            #[cfg(feature = "metrics")]
             metrics,
             next_id: Cell::new(0),
             entries: RefCell::new(Vec::new()),
@@ -854,6 +952,7 @@ impl Waiters {
         let new_id = self.next_id.get();
         self.next_id.set(new_id.wrapping_add(1));
         entries.push((new_id, waker.clone()));
+        #[cfg(feature = "metrics")]
         self.metrics.waiters.store(entries.len() as u32, Relaxed);
         *id = Some(new_id);
     }
@@ -862,6 +961,7 @@ impl Waiters {
         if let Some(id) = id {
             let mut entries = self.entries.borrow_mut();
             entries.retain(|(i, _)| *i != id);
+            #[cfg(feature = "metrics")]
             self.metrics.waiters.store(entries.len() as u32, Relaxed);
         }
     }
@@ -875,6 +975,7 @@ impl Waiters {
             .drain(..)
             .map(|(_, w)| w)
             .collect();
+        #[cfg(feature = "metrics")]
         self.metrics.waiters.store(0, Relaxed);
         for waker in wakers {
             waker.wake();

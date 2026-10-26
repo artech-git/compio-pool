@@ -102,6 +102,7 @@ fn enforces_max_size_then_times_out() {
         let local = pool.local();
 
         let held = local.get().await.unwrap();
+        #[cfg(feature = "metrics")]
         assert_eq!(local.state().connections, 1);
 
         // At capacity with the only connection checked out: the next get waits
@@ -126,8 +127,11 @@ fn drops_a_broken_connection() {
 
         BROKEN.with(|b| b.set(true));
         drop(local.get().await.unwrap()); // opened id 1, broken on return → dropped
-        assert_eq!(local.state().connections, 0);
-        assert_eq!(local.state().idle_connections, 0);
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(local.state().connections, 0);
+            assert_eq!(local.state().idle_connections, 0);
+        }
 
         BROKEN.with(|b| b.set(false));
         let fresh = *local.get().await.unwrap();
@@ -169,6 +173,7 @@ fn surfaces_a_connect_error_and_frees_the_slot() {
 
         FAIL_CONNECT.with(|f| f.set(true));
         assert!(matches!(local.get().await, Err(RunError::User(_))));
+        #[cfg(feature = "metrics")]
         assert_eq!(
             local.state().connections,
             0,
@@ -190,12 +195,16 @@ fn warm_opens_min_idle_up_front() {
         let local = pool.local();
 
         assert_eq!(local.warm().await.unwrap(), 3);
-        let state = local.state();
-        assert_eq!(state.connections, 3);
-        assert_eq!(state.idle_connections, 3);
+        #[cfg(feature = "metrics")]
+        {
+            let state = local.state();
+            assert_eq!(state.connections, 3);
+            assert_eq!(state.idle_connections, 3);
+        }
     });
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn statistics_count_direct_reuse_and_creation() {
     reset();
@@ -220,6 +229,7 @@ fn statistics_count_direct_reuse_and_creation() {
     });
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn statistics_count_timeouts() {
     reset();
@@ -255,15 +265,19 @@ fn a_waiter_is_counted_and_then_served() {
 
         // Let the spawned task park on the full pool.
         compio::time::sleep(Duration::from_millis(20)).await;
+        #[cfg(feature = "metrics")]
         assert_eq!(local.state().pending_waiters, 1, "the getter is parked");
 
         drop(held); // frees the slot and wakes the waiter
         let got = task.await.unwrap();
 
         assert_eq!(got, 1, "the waiter reused the freed connection");
-        let s = local.statistics();
-        assert_eq!(s.get_waited, 1);
-        assert_eq!(local.state().pending_waiters, 0);
+        #[cfg(feature = "metrics")]
+        {
+            let s = local.statistics();
+            assert_eq!(s.get_waited, 1);
+            assert_eq!(local.state().pending_waiters, 0);
+        }
     });
 }
 
@@ -285,13 +299,19 @@ fn reap_and_maintain_retire_then_refill() {
 
         // Both idle connections are now past max_lifetime.
         assert_eq!(local.reap(), 2);
-        assert_eq!(local.state().connections, 0);
-        assert_eq!(local.statistics().connections_closed_max_lifetime, 2);
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(local.state().connections, 0);
+            assert_eq!(local.statistics().connections_closed_max_lifetime, 2);
+        }
 
         // maintain reaps (nothing left) then warms back up to min_idle.
         assert_eq!(local.maintain().await.unwrap(), 2);
-        assert_eq!(local.state().idle_connections, 2);
-        assert_eq!(local.statistics().connections_created, 4);
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(local.state().idle_connections, 2);
+            assert_eq!(local.statistics().connections_created, 4);
+        }
     });
 }
 
@@ -307,11 +327,15 @@ fn clear_drains_idle_connections() {
         let local = pool.local();
 
         local.warm().await.unwrap();
+        #[cfg(feature = "metrics")]
         assert_eq!(local.state().idle_connections, 3);
 
         assert_eq!(local.clear(), 3);
-        assert_eq!(local.state().connections, 0);
-        assert_eq!(local.state().idle_connections, 0);
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(local.state().connections, 0);
+            assert_eq!(local.state().idle_connections, 0);
+        }
     });
 }
 
@@ -326,6 +350,7 @@ fn close_rejects_gets_and_drops_returns() {
         let local = pool.local();
 
         let held = local.get().await.unwrap();
+        #[cfg(feature = "metrics")]
         assert_eq!(local.state().connections, 1);
 
         pool.close();
@@ -338,7 +363,10 @@ fn close_rejects_gets_and_drops_returns() {
         );
 
         drop(held); // a closing pool keeps nothing
-        assert_eq!(local.state().connections, 0);
-        assert_eq!(local.state().idle_connections, 0);
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(local.state().connections, 0);
+            assert_eq!(local.state().idle_connections, 0);
+        }
     });
 }
