@@ -120,5 +120,9 @@ jobs:
       # relative paths only, so this never fails on a flaky external host.
       - uses: lycheeverse/lychee-action@v2
         with:
-          args: --offline --no-progress --verbose "**/*.md"
+          # Only this crate's own docs. The `crates/*` sub-projects are excluded
+          # from the workspace (see Cargo.toml) and carry their own READMEs, so
+          # they must not gate this repo's CI. Both `docs/*.md` and `docs/**/*.md`
+          # are listed so top-level docs and nested ones are all covered.
+          args: --offline --no-progress --verbose "README.md" "docs/*.md" "docs/**/*.md"
           fail: true

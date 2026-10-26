@@ -68,7 +68,7 @@ behind one off-by-default flag** — the same zero-cost ethos as `metrics`:
 * **`experimental` now carries `[features] metrics = []`** (merged in #15 at `760401a`), so
   `affinity` is the **second** feature and follows the metrics precedent exactly. (This plan was
   first drafted against `2acfb41`, before #15 merged, when it noted — like the
-  [reuseport plan](reuseport-feature-plan.md#L26) — that it would add the *first* `[features]`
+  the reuseport feature plan — that it would add the *first* `[features]`
   section. The CI feature-matrix wiring #15 planned had not landed, so the `affinity` jobs added
   here are the first to exercise a feature on *and* off.)
 * **Line numbers are `experimental`'s.** `cpu.rs`, `listener.rs`, `builder.rs` and the three examples
@@ -83,7 +83,7 @@ behind one off-by-default flag** — the same zero-cost ethos as `metrics`:
   `handoff.rs`, `shutdown.rs`, `config.rs` — **none exist** (`tests/` is only `pool.rs`). This
   feature adds only current-model content next to those; it does not attempt the wider cleanup.
 * **ADR number collides with the reuseport plan.** The highest ADR on disk is `0007`, so the next
-  free number is `0008` — but [reuseport-feature-plan.md:57](reuseport-feature-plan.md#L57) already
+  free number is `0008` — but the reuseport feature plan already
   reserves `0008` on paper for `0008-cbpf-cpu-steering.md`. This plan takes **`0009`** to avoid the
   clash (§3-F).
 
@@ -228,7 +228,7 @@ Pure `std::fs` parsing of `/sys` adds zero crates and keeps `#![forbid(unsafe_co
 (verification **confirmed** it is root-free, FFI-free, unsafe-free). An `hwloc`/`hwlocality` dep
 would give richer, battle-tested topology (including cache islands) but is a heavy C-library build
 dependency that pulls FFI — and would force exactly the `forbid`→`deny` relaxation the
-[reuseport plan §3-B](reuseport-feature-plan.md#L88) needs for its cBPF `setsockopt`.
+the reuseport feature plan's §3-B needs for its cBPF `setsockopt`.
 
 > **Recommendation:** pure sysfs. Zero deps, zero `unsafe`, same story as `metrics` — and the clean
 > contrast with the reuseport feature, which cannot stay `unsafe`-free. Reconsider `hwloc` only if

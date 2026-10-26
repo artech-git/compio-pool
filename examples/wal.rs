@@ -108,7 +108,10 @@ fn main() -> io::Result<()> {
 
     let cores = cpu::cores();
     if cores.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "no cores to run on"));
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no cores to run on",
+        ));
     }
     println!(
         "wal on {addr} -> {} (fdatasync: {}): {} workers, capacity {capacity}/worker",
