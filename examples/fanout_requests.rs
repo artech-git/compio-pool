@@ -135,11 +135,20 @@ fn main() -> io::Result<()> {
             requests as f64 / elapsed.as_secs_f64(),
             bytes.get(),
         );
+        // The final `State` readout comes from the optional `metrics` feature;
+        // without it the pool keeps no live counts, so drop that part of the line.
+        #[cfg(feature = "metrics")]
         println!(
             "pool: opened {} upstreams total, peak {} in use at once (cap {capacity}); final {:?}",
             OPENS.load(Ordering::Relaxed),
             peak.get(),
             local.state(),
+        );
+        #[cfg(not(feature = "metrics"))]
+        println!(
+            "pool: opened {} upstreams total, peak {} in use at once (cap {capacity})",
+            OPENS.load(Ordering::Relaxed),
+            peak.get(),
         );
         Ok(())
     })

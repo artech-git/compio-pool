@@ -34,7 +34,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # The default build (metrics off) and the optional `metrics` feature are
+      # separate code paths, so lint both.
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-targets --features metrics --locked -- -D warnings
 
   test:
     name: Test (${{ matrix.toolchain }})
@@ -53,6 +56,9 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
+      # The steps below are the default build (metrics off); the `metrics` ones
+      # after them are the feature-on path. Both must stay green — nothing else
+      # exercises the two configurations against each other.
       - name: Build (all targets, incl. examples)
         run: cargo build --all-targets --locked
       # The integration tests bind SO_REUSEPORT listeners on 127.0.0.1 and
@@ -61,6 +67,12 @@ jobs:
         run: cargo test --all-targets --locked
       - name: Doc tests
         run: cargo test --doc --locked
+      - name: Build (metrics feature)
+        run: cargo build --all-targets --features metrics --locked
+      - name: Test (metrics feature)
+        run: cargo test --all-targets --features metrics --locked
+      - name: Doc tests (metrics feature)
+        run: cargo test --doc --features metrics --locked
 
   msrv:
     name: MSRV (1.95)
@@ -85,7 +97,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --locked
+      # `--all-features` matches docs.rs (see `[package.metadata.docs.rs]`), so the
+      # `metrics` API and its `doc(cfg)` annotations are built and checked here too.
+      - run: cargo doc --no-deps --all-features --locked
 
   shell:
     name: Tuning script parses and passes shellcheck
