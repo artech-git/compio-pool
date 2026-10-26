@@ -34,9 +34,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The default build (metrics off) and the optional `metrics` feature are
-      # separate code paths, so lint both.
+      # The default build and each optional feature are separate code paths, so
+      # lint them all — a lint only one configuration trips is still a failure.
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-targets --features affinity --locked -- -D warnings
       - run: cargo clippy --all-targets --features metrics --locked -- -D warnings
 
   test:
@@ -56,9 +57,9 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
-      # The steps below are the default build (metrics off); the `metrics` ones
-      # after them are the feature-on path. Both must stay green — nothing else
-      # exercises the two configurations against each other.
+      # The steps below are the default build (all optional features off); the
+      # per-feature steps after them are the feature-on paths. Each must stay
+      # green — nothing else exercises these configurations against each other.
       - name: Build (all targets, incl. examples)
         run: cargo build --all-targets --locked
       # The integration tests bind SO_REUSEPORT listeners on 127.0.0.1 and
@@ -67,11 +68,17 @@ jobs:
         run: cargo test --all-targets --locked
       - name: Doc tests
         run: cargo test --doc --locked
-      - name: Build (metrics feature)
+      - name: Build (affinity)
+        run: cargo build --all-targets --features affinity --locked
+      - name: Test (affinity)
+        run: cargo test --all-targets --features affinity --locked
+      - name: Doc tests (affinity)
+        run: cargo test --doc --features affinity --locked
+      - name: Build (metrics)
         run: cargo build --all-targets --features metrics --locked
-      - name: Test (metrics feature)
+      - name: Test (metrics)
         run: cargo test --all-targets --features metrics --locked
-      - name: Doc tests (metrics feature)
+      - name: Doc tests (metrics)
         run: cargo test --doc --features metrics --locked
 
   msrv:
@@ -98,7 +105,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       # `--all-features` matches docs.rs (see `[package.metadata.docs.rs]`), so the
-      # `metrics` API and its `doc(cfg)` annotations are built and checked here too.
+      # feature-gated APIs and their `doc(cfg)` annotations are built and checked here too.
       - run: cargo doc --no-deps --all-features --locked
 
   shell:
@@ -124,5 +131,9 @@ jobs:
       # relative paths only, so this never fails on a flaky external host.
       - uses: lycheeverse/lychee-action@v2
         with:
-          args: --offline --no-progress --verbose "**/*.md"
+          # Only this crate's own docs. The `crates/*` sub-projects are excluded
+          # from the workspace (see Cargo.toml) and carry their own READMEs, so
+          # they must not gate this repo's CI. Both `docs/*.md` and `docs/**/*.md`
+          # are listed so top-level docs and nested ones are all covered.
+          args: --offline --no-progress --verbose "README.md" "docs/*.md" "docs/**/*.md"
           fail: true

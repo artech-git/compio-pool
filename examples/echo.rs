@@ -14,16 +14,14 @@
 //! ```
 //!
 //! Drive it with `examples/load.rs`.
-
-use std::{io, net::SocketAddr, thread};
+use std::{io, net::SocketAddr};
 
 use compio::{
     BufResult,
     io::{AsyncRead, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    runtime::Runtime,
 };
-use compio_pool::{LocalPool, ManageConnection, Pool, bind_reuseport, cpu};
+use compio_pool::{LocalPool, ManageConnection, PerCore, Pool, bind_reuseport, cpu};
 
 /// Hands out reusable 16 KiB read buffers, one per in-flight connection. A real
 /// manager would open a backend connection (Redis, Postgres, an upstream socket)
@@ -61,50 +59,36 @@ fn main() -> io::Result<()> {
     // Build the pool once. `Pool` is `Send + Clone`; every worker gets a clone.
     let pool = Pool::builder().max_size(capacity).build(Buffers);
 
-    let cores = cpu::cores();
-    if cores.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "no cores to run on"));
-    }
+    // `PerCore` owns the per-core boilerplate: it spawns one thread per core,
+    // pins it, and builds that thread's `compio` runtime. Each worker still binds
+    // its own `SO_REUSEPORT` listener and runs its own accept loop (ADR 0001). To
+    // place workers by topology, swap `cpu::cores()` for a selection such as
+    // `cpu::CoreSet::permitted().physical_only().spread()`.
+    let workers =
+        PerCore::new(cpu::cores())
+            .name("echo")
+            .block_on_each(move |_ctx| async move {
+                // This thread's pool. `!Send`, so it — and its ring-bound buffers —
+                // cannot escape the thread.
+                let local = pool.local();
+
+                let std_listener = bind_reuseport(addr, 1024, None).expect("bind SO_REUSEPORT");
+                let listener = TcpListener::from_std(std_listener).expect("wrap listener in ring");
+
+                loop {
+                    let Ok((stream, _peer)) = listener.accept().await else {
+                        continue;
+                    };
+                    compio::runtime::spawn(serve(local.clone(), stream)).detach();
+                }
+            })?;
+
     println!(
         "echo on {addr}: {} workers, capacity {capacity}/worker",
-        cores.len()
+        workers.len()
     );
-
-    let mut handles = Vec::new();
-    for (index, core) in cores.into_iter().enumerate() {
-        let pool = pool.clone();
-        let handle = thread::Builder::new()
-            .name(format!("worker/{index}"))
-            .spawn(move || worker(core, addr, pool))?;
-        handles.push(handle);
-    }
-    for handle in handles {
-        let _ = handle.join();
-    }
+    workers.join();
     Ok(())
-}
-
-/// One pinned thread: its own `compio` runtime, its own `SO_REUSEPORT` listener,
-/// and its own [`LocalPool`] carved from the shared [`Pool`].
-fn worker(core: cpu::CoreId, addr: SocketAddr, pool: Pool<Buffers>) {
-    cpu::pin_current(core);
-
-    let runtime = Runtime::builder().build().expect("build compio runtime");
-    runtime.block_on(async move {
-        // This thread's pool. `!Send`, so it — and its ring-bound buffers —
-        // cannot escape the thread.
-        let local = pool.local();
-
-        let std_listener = bind_reuseport(addr, 1024, None).expect("bind SO_REUSEPORT");
-        let listener = TcpListener::from_std(std_listener).expect("wrap listener in ring");
-
-        loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                continue;
-            };
-            compio::runtime::spawn(serve(local.clone(), stream)).detach();
-        }
-    });
 }
 
 /// Borrow a buffer from this thread's pool for the life of the connection and

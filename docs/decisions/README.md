@@ -17,6 +17,7 @@ the accept-side recipe. Nothing below inherits from them.
 | [0005](0005-incoming-cpu-opt-in.md) | `SO_INCOMING_CPU` is off until the NIC is tuned | You flip one switch after running the script |
 | [0006](0006-shutdown-and-the-unwinding-thread.md) | Shutdown is a channel disconnect, detoured through a helper thread when the caller is panicking | One short-lived thread on a panic path |
 | [0007](0007-linux-only.md) | Linux is the only supported target | No macOS or Windows runs; CI is Ubuntu only |
+| [0009](0009-core-affinity-harness.md) | Core affinity is an opt-in, feature-gated harness (`cpu::CoreSet` + `workers::PerCore`) that spawns and pins workers but leaves the bind to the body | A sysfs topology reader to maintain; graceful shutdown stays yours; `0008` is reserved for the reuseport plan |
 
 Related reading: [../architecture.md](../architecture.md) for what the code does, and
 [../performance.md](../performance.md) for the measurements 0003 and 0004 rest on.

@@ -25,15 +25,14 @@
 //! cargo run --release --example load -- 127.0.0.1:7000 --conns 64 --seconds 5
 //! ```
 
-use std::{io, net::SocketAddr, sync::LazyLock, thread};
+use std::{io, net::SocketAddr, sync::LazyLock};
 
 use compio::{
     BufResult,
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    runtime::Runtime,
 };
-use compio_pool::{LocalPool, ManageConnection, Pool, bind_reuseport, cpu};
+use compio_pool::{LocalPool, ManageConnection, PerCore, Pool, bind_reuseport, cpu};
 
 /// The backend every worker's pool connects to.
 static UPSTREAM: LazyLock<SocketAddr> = LazyLock::new(|| {
@@ -76,7 +75,10 @@ impl ManageConnection for Backend {
         if conn.healthy {
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "upstream marked dead"))
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "upstream marked dead",
+            ))
         }
     }
 
@@ -99,49 +101,34 @@ fn main() -> io::Result<()> {
     // Build the pool once; every worker gets a clone of the `Send` handle.
     let pool = Pool::builder().max_size(capacity).build(Backend);
 
-    let cores = cpu::cores();
-    if cores.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "no cores to run on"));
-    }
+    // `PerCore` spawns one pinned worker per core and builds each thread's
+    // runtime; each worker binds its own `SO_REUSEPORT` listener and carves its
+    // own `LocalPool` of upstream connections from the shared `Pool` (ADR 0001).
+    // Swap `cpu::cores()` for a `cpu::CoreSet` selection to place by topology.
+    let workers =
+        PerCore::new(cpu::cores())
+            .name("tcp_pool")
+            .block_on_each(move |_ctx| async move {
+                let local = pool.local();
+
+                let std_listener = bind_reuseport(addr, 1024, None).expect("bind SO_REUSEPORT");
+                let listener = TcpListener::from_std(std_listener).expect("wrap listener in ring");
+
+                loop {
+                    let Ok((stream, _peer)) = listener.accept().await else {
+                        continue;
+                    };
+                    compio::runtime::spawn(serve(local.clone(), stream)).detach();
+                }
+            })?;
+
     println!(
         "tcp_pool on {addr} -> upstream {}: {} workers, {capacity} upstreams/worker",
         *UPSTREAM,
-        cores.len()
+        workers.len()
     );
-
-    let mut handles = Vec::new();
-    for (index, core) in cores.into_iter().enumerate() {
-        let pool = pool.clone();
-        let handle = thread::Builder::new()
-            .name(format!("worker/{index}"))
-            .spawn(move || worker(core, addr, pool))?;
-        handles.push(handle);
-    }
-    for handle in handles {
-        let _ = handle.join();
-    }
+    workers.join();
     Ok(())
-}
-
-/// One pinned thread: its own runtime, its own `SO_REUSEPORT` listener, and its
-/// own [`LocalPool`] of upstream connections carved from the shared [`Pool`].
-fn worker(core: cpu::CoreId, addr: SocketAddr, pool: Pool<Backend>) {
-    cpu::pin_current(core);
-
-    let runtime = Runtime::builder().build().expect("build compio runtime");
-    runtime.block_on(async move {
-        let local = pool.local();
-
-        let std_listener = bind_reuseport(addr, 1024, None).expect("bind SO_REUSEPORT");
-        let listener = TcpListener::from_std(std_listener).expect("wrap listener in ring");
-
-        loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                continue;
-            };
-            compio::runtime::spawn(serve(local.clone(), stream)).detach();
-        }
-    });
 }
 
 /// Forward each client request through a freshly leased upstream and hand the

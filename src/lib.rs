@@ -46,6 +46,12 @@
 //! * **Shutdown.** [`Pool::close`] makes every thread's [`get`](LocalPool::get)
 //!   fail with [`RunError::Closed`] and stops recycling; [`LocalPool::clear`]
 //!   drains a thread's idle connections for a prompt drain.
+//! * **Core affinity** *(optional — the `affinity` feature, off by default)*.
+//!   With it on, `cpu::CoreSet` picks cores by topology (physical cores vs SMT
+//!   siblings, NUMA, spread or pack) and `workers::PerCore` spawns one pinned
+//!   worker per core — folding the thread-per-core boilerplate the examples
+//!   repeat into the crate. With the feature off neither compiles in, and the
+//!   raw [`cpu`] helpers are unchanged.
 //!
 //! # Quickstart
 //!
@@ -92,7 +98,10 @@
 //!
 //! The crate also ships the two helpers that building your own thread-per-core
 //! loop needs: [`cpu`] for core enumeration and pinning, and
-//! [`listener::bind_reuseport`] for a shared-address `SO_REUSEPORT` socket.
+//! [`listener::bind_reuseport`] for a shared-address `SO_REUSEPORT` socket. The
+//! optional `affinity` feature adds the layer above them — `cpu::CoreSet` for
+//! topology-aware core selection and `workers::PerCore` to spawn the pinned
+//! thread-per-core loop itself.
 //!
 //! # Platform
 //!
@@ -114,9 +123,16 @@ pub mod cpu;
 pub mod listener;
 pub mod manage;
 pub mod pool;
+#[cfg(feature = "affinity")]
+#[cfg_attr(docsrs, doc(cfg(feature = "affinity")))]
+pub mod workers;
 
 pub use builder::Builder;
 pub use cpu::CoreId;
+#[cfg(feature = "affinity")]
+pub use cpu::{CoreInfo, CoreSet};
 pub use listener::bind_reuseport;
 pub use manage::{ManageConnection, RunError};
 pub use pool::{LocalPool, Pool, PooledConnection, State, Statistics};
+#[cfg(feature = "affinity")]
+pub use workers::{PerCore, WorkerCtx, Workers};

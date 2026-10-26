@@ -23,16 +23,15 @@
 //!
 //! Drive it with `examples/load_file.rs`, which creates the test files first.
 
-use std::{io, net::SocketAddr, path::PathBuf, sync::LazyLock, thread};
+use std::{io, net::SocketAddr, path::PathBuf, sync::LazyLock};
 
 use compio::{
     BufResult,
     fs::File,
     io::{AsyncRead, AsyncReadAt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    runtime::Runtime,
 };
-use compio_pool::{LocalPool, ManageConnection, Pool, bind_reuseport, cpu};
+use compio_pool::{LocalPool, ManageConnection, PerCore, Pool, bind_reuseport, cpu};
 
 /// The directory requested files are resolved inside.
 static BASE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -72,51 +71,37 @@ fn main() -> io::Result<()> {
 
     let pool = Pool::builder().max_size(capacity).build(Buffers);
 
-    let cores = cpu::cores();
-    if cores.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "no cores to run on"));
-    }
+    // `PerCore` spawns one pinned worker per core and builds each thread's
+    // runtime; the accept loop and its own `SO_REUSEPORT` listener stay here
+    // (ADR 0001). Swap `cpu::cores()` for a `cpu::CoreSet` selection to place
+    // workers by topology.
+    let workers = PerCore::new(cpu::cores())
+        .name("file_server")
+        .block_on_each(move |_ctx| async move {
+            let local = pool.local();
+
+            let std_listener = bind_reuseport(addr, 1024, None).expect("bind SO_REUSEPORT");
+            let listener = TcpListener::from_std(std_listener).expect("wrap listener in ring");
+
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    continue;
+                };
+                // The reply is a size header followed by the body — two writes. Without
+                // TCP_NODELAY, Nagle holds the body waiting for the header's ACK, which
+                // the peer delays ~40 ms, so disable it on every accepted connection.
+                let _ = stream.set_nodelay(true);
+                compio::runtime::spawn(serve(local.clone(), stream)).detach();
+            }
+        })?;
+
     println!(
         "file_server on {addr} serving {}: {} workers, capacity {capacity}/worker",
         BASE_DIR.display(),
-        cores.len()
+        workers.len()
     );
-
-    let mut handles = Vec::new();
-    for (index, core) in cores.into_iter().enumerate() {
-        let pool = pool.clone();
-        let handle = thread::Builder::new()
-            .name(format!("worker/{index}"))
-            .spawn(move || worker(core, addr, pool))?;
-        handles.push(handle);
-    }
-    for handle in handles {
-        let _ = handle.join();
-    }
+    workers.join();
     Ok(())
-}
-
-fn worker(core: cpu::CoreId, addr: SocketAddr, pool: Pool<Buffers>) {
-    cpu::pin_current(core);
-
-    let runtime = Runtime::builder().build().expect("build compio runtime");
-    runtime.block_on(async move {
-        let local = pool.local();
-
-        let std_listener = bind_reuseport(addr, 1024, None).expect("bind SO_REUSEPORT");
-        let listener = TcpListener::from_std(std_listener).expect("wrap listener in ring");
-
-        loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                continue;
-            };
-            // The reply is a size header followed by the body — two writes. Without
-            // TCP_NODELAY, Nagle holds the body waiting for the header's ACK, which
-            // the peer delays ~40 ms, so disable it on every accepted connection.
-            let _ = stream.set_nodelay(true);
-            compio::runtime::spawn(serve(local.clone(), stream)).detach();
-        }
-    });
 }
 
 /// Serve requests on one connection until it closes. Opening the file is per

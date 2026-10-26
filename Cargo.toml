@@ -49,4 +49,24 @@ core_affinity = "0.8.3"
 
 [features]
 metrics = []
+# Topology-aware core selection (`cpu::CoreSet`) plus the pinned-worker harness
+# (`workers::PerCore`). Off by default and zero-cost when off: pure-std sysfs
+# parsing, no new dependency, and `#![forbid(unsafe_code)]` stays intact.
+affinity = []
+
+# The three reference servers below use the `affinity` harness, so they only
+# build with that feature on. `cargo build --all-targets` (feature off) skips
+# them; the raw-path examples (udp_echo, unix_echo, wal, …) stay auto-discovered
+# and keep building by default.
+[[example]]
+name = "echo"
+required-features = ["affinity"]
+
+[[example]]
+name = "file_server"
+required-features = ["affinity"]
+
+[[example]]
+name = "tcp_pool"
+required-features = ["affinity"]
 
