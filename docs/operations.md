@@ -72,6 +72,16 @@ buffers.
 connections; the default 4096 is high on purpose because a burst at accept time is the normal
 case for this design.
 
+## Worker placement (the `affinity` feature)
+
+With the optional `affinity` feature on, `cpu::CoreSet` chooses which cores to run on and
+`workers::PerCore` spawns one pinned worker per core. `CoreSet::permitted()` starts from the
+process affinity mask — so `taskset -c 2-11 ./server` already keeps cores 0–1 for the kernel and
+the NIC — and `.physical_only()`, `.on_numa_node(n)`, `.on_package(n)`, `.spread()` / `.pack()`
+and `.take(n)` narrow or order it from the sysfs topology. Each worker is handed its `CoreId` as
+`WorkerCtx::core`, which is the value to pass as `SO_INCOMING_CPU` (below) once the NIC is tuned.
+See [Decision 0009](decisions/0009-core-affinity-harness.md).
+
 ## `SO_INCOMING_CPU`
 
 Off by default. The kernel picks the listener whose `SO_INCOMING_CPU` matches the CPU the SYN

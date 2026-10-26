@@ -220,6 +220,36 @@ for core in cpu::cores() {
 }
 ```
 
+With the optional **`affinity`** feature (off by default), `workers::PerCore` owns that whole
+spawn / pin / build-runtime loop and `cpu::CoreSet` selects cores by topology, so the block above
+collapses to:
+
+```rust
+use compio::net::TcpListener;
+use compio_pool::{PerCore, bind_reuseport, cpu};
+
+// `cpu::cores()`, or `cpu::CoreSet::permitted().physical_only().spread()` to
+// drop SMT siblings and spread workers across sockets.
+let workers = PerCore::new(cpu::cores())
+    .name("echo")
+    .block_on_each(move |_ctx| {
+        let pool = pool.clone();
+        async move {
+            let local = pool.local();
+            let std = bind_reuseport(addr, 1024, None).expect("SO_REUSEPORT");
+            let listener = TcpListener::from_std(std).expect("wrap in ring");
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { continue };
+                compio::runtime::spawn(serve(local.clone(), stream)).detach();
+            }
+        }
+    })?;
+workers.join();
+```
+
+Each worker still binds its own listener and runs its own accept loop — the harness removes the
+boilerplate, it does not take the loop ([ADR 0009](docs/decisions/0009-core-affinity-harness.md)).
+
 For a thread pool that *dispatches* work onto a set of background rings rather than owning an
 accept loop, compio also ships [`compio::dispatcher`](https://docs.rs/compio-dispatcher) — build
 one `Pool` and call `pool.local()` on each dispatched runtime exactly as above.
@@ -329,7 +359,7 @@ parked `get` live on each worker's own thread.
 
 ## The thread-per-core half
 
-The crate ships the two helpers that building your own accept loop needs, so the pool and the
+The crate ships the helpers that building your own accept loop needs, so the pool and the
 runtime around it come from one place:
 
 * **`cpu`** — `cpu::cores()` returns the affinity mask (honours `taskset` / cgroup cpusets),
@@ -337,6 +367,10 @@ runtime around it come from one place:
 * **`listener::bind_reuseport`** — a raw TCP socket with `SO_REUSEADDR` + `SO_REUSEPORT` set
   before `bind` (so every thread binds the same address and the kernel splits connections by flow
   hash), and optional `SO_INCOMING_CPU`.
+* **`affinity` feature** *(optional, off by default)* — one layer up: `cpu::CoreSet` selects cores
+  by topology (physical cores vs SMT siblings, NUMA node, spread or pack) and `workers::PerCore`
+  spawns the pinned thread-per-core loop for you, returning joinable `Workers`. Zero-cost and
+  unchanged default build when off. See [ADR 0009](docs/decisions/0009-core-affinity-harness.md).
 
 Worked examples:
 

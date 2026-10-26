@@ -143,7 +143,10 @@ impl ManageConnection for Origin {
         if conn.healthy {
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "upstream marked dead"))
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "upstream marked dead",
+            ))
         }
     }
 
@@ -157,7 +160,9 @@ fn main() -> io::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:8080".into())
         .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad listen addr: {e}")))?;
+        .map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("bad listen addr: {e}"))
+        })?;
     let capacity: u32 = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
@@ -217,7 +222,9 @@ async fn handle_client(local: LocalPool<Origin>, client_stream: TcpStream) {
         let mut up = match local.get().await {
             Ok(up) => up,
             Err(_) => {
-                let _ = client.write_all_bytes(bad_gateway("no upstream available")).await;
+                let _ = client
+                    .write_all_bytes(bad_gateway("no upstream available"))
+                    .await;
                 return;
             }
         };
@@ -226,7 +233,10 @@ async fn handle_client(local: LocalPool<Origin>, client_stream: TcpStream) {
         let response = if up.write_all_bytes(request).await.is_ok() {
             up.read_message().await
         } else {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "upstream write failed"))
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "upstream write failed",
+            ))
         };
 
         match response {

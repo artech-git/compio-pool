@@ -25,16 +25,10 @@ lockfile that is committed is the one that was built.
 | file | proves |
 |---|---|
 | [`tests/pool.rs`](../tests/pool.rs) | `LocalPool` accounting in isolation, inside one compio runtime: permits count against capacity and refund on drop; leases create lazily and reuse idle resources; `recycle() == false` and `discard` drop; a failed `create` releases the slot; `reserve` and `wait_available` wake on release and `wait_available` does not take the slot; `drained` resolves at zero; `reserve_unbounded` goes over capacity without growing the idle list; `prewarm` is capped |
-| [`tests/server.rs`](../tests/server.rs) | A server binds one concrete port, echoes, counts; 64 connections spread over 4 listeners; `Workers::Cores` is honoured in order; pinning is reported; `prewarm` works; a taken port is an error, not a panic |
-| [`tests/handoff.rs`](../tests/handoff.rs) | Six connections against two single-slot workers: exactly two in service, four parked, all six served, every parked one claimed and seen by the handler as `Route::Claimed` on a working stream; a full channel serves over capacity by default and rejects on request; four waves of 24 clients against 6 slots complete with `claimed + oversubscribed == handed_off` |
-| [`tests/shutdown.rs`](../tests/shutdown.rs) | `join` returns within `drain_timeout` with an idle connection open and the port is free afterwards; `Drop` stops the workers; a request during the drain window is still answered; dropping a server while unwinding fails the test instead of aborting the process |
-| [`tests/config.rs`](../tests/config.rs) | Validation rejects zero capacity, zero workers, empty or out-of-mask core lists, zero channel capacity and `defer_taskrun` without `single_issuer`; more workers than cores wrap; `affinity_mask` matches `smp_affinity`'s format |
-
-The tests share [`tests/common/mod.rs`](../tests/common/mod.rs): an echo `Service` that counts
-connections by `Route`, and plain `std::net` clients. They bind `127.0.0.1:0`, leave CPU pinning
-off (the suite may run under a restricted affinity mask) and leave `incoming_cpu` off (on
-loopback it steers every connection to the client thread's core — see
-[decision 0005](decisions/0005-incoming-cpu-opt-in.md)).
+| [`tests/affinity.rs`](../tests/affinity.rs) | *(the `affinity` feature)* `CoreSet` selection on synthetic topologies — `physical_only` drops SMT siblings and keeps distinct `(package, core)` across packages, `spread` round-robins packages while `pack` groups them, filters and `take` narrow the set; `permitted()` is a subset of the affinity mask; an empty core set is rejected; and `PerCore::spawn_each` / `block_on_each` pin, run and join one worker per core |
+Both `tests/pool.rs` and `tests/affinity.rs` are self-contained; the harness tests build a compio
+runtime on each pinned worker, and the suite keeps CPU pinning best-effort since it may run under a
+restricted affinity mask.
 
 ### Things the tests had to learn
 
