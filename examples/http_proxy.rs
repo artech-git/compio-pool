@@ -24,7 +24,13 @@
 //! The message framing here is deliberately small: request/response heads are
 //! read to the blank line, bodies are taken from `Content-Length` (the bundled
 //! origin always sets it). That is enough to forward real `curl` traffic and to
-//! show the pool working; it is not a conformant HTTP implementation.
+//! show the pool working; it is not a conformant HTTP implementation. What it
+//! does insist on is being *unambiguous*, because the upstream is shared: a
+//! message the proxy and the origin could frame differently (`Transfer-Encoding`,
+//! conflicting or missing lengths) is refused rather than forwarded, since a
+//! disagreement about where one message ends would splice one client's bytes
+//! into the next client's exchange on that pooled connection. Heads and bodies
+//! are also capped, so a peer cannot grow a buffer without bound.
 //!
 //! ```text
 //! cargo run --release --example http_proxy -- [LISTEN] [CAPACITY]
@@ -52,6 +58,26 @@ use compio_pool::{LocalPool, ManageConnection, Pool};
 
 /// Gives each in-process origin connection a distinct id, so reuse is visible.
 static ORIGIN_CONN_ID: AtomicU64 = AtomicU64::new(0);
+
+/// The most a header block may occupy before the peer is cut off.
+const MAX_HEAD: usize = 64 * 1024;
+/// The largest body the proxy will buffer for one message.
+const MAX_BODY: usize = 16 * 1024 * 1024;
+
+/// Which side of an exchange a message is. It decides what a missing
+/// `Content-Length` means: a request without one has no body; a response without
+/// one is delimited by the origin closing the connection, which cannot be read
+/// off a connection the proxy intends to keep and reuse.
+#[derive(Clone, Copy)]
+enum Kind {
+    Request,
+    Response,
+}
+
+/// A message the proxy refuses to frame (too large, ambiguous, or malformed).
+fn bad(why: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, why.to_string())
+}
 
 /// A TCP stream plus a read buffer and a health flag: one `io_uring`-bound
 /// connection framed as HTTP messages. Used for both ends and, when pooled, as
@@ -90,12 +116,16 @@ impl Framed {
 
     /// Read one whole HTTP message — head to the blank line, then `Content-Length`
     /// bytes of body — and drain it out of the buffer. `Ok(None)` at a clean
-    /// message boundary means the peer is done.
-    async fn read_message(&mut self) -> io::Result<Option<Vec<u8>>> {
-        // 1. Read until the end of the header block.
+    /// message boundary means the peer is done; `Err` with `InvalidData` means
+    /// the message cannot be framed safely and the connection should be dropped.
+    async fn read_message(&mut self, kind: Kind) -> io::Result<Option<Vec<u8>>> {
+        // 1. Read until the end of the header block, within MAX_HEAD.
         let head_end = loop {
             if let Some(pos) = find(&self.buf, b"\r\n\r\n") {
                 break pos + 4;
+            }
+            if self.buf.len() >= MAX_HEAD {
+                return Err(bad("header block too large"));
             }
             if !self.read_more().await? {
                 // Clean close at a boundary -> done; mid-head close -> give up too.
@@ -103,8 +133,12 @@ impl Framed {
             }
         };
 
-        // 2. Read the body named by Content-Length (0 when the header is absent).
-        let total = head_end + content_length(&self.buf[..head_end]);
+        // 2. Size the body — unambiguously, or not at all (see `body_length`).
+        let body = body_length(&self.buf[..head_end], kind)?;
+        if body > MAX_BODY {
+            return Err(bad("body too large"));
+        }
+        let total = head_end + body;
         while self.buf.len() < total {
             if !self.read_more().await? {
                 return Ok(None); // truncated body
@@ -212,9 +246,15 @@ fn main() -> io::Result<()> {
 async fn handle_client(local: LocalPool<Origin>, client_stream: TcpStream) {
     let mut client = Framed::new(client_stream);
     loop {
-        let request = match client.read_message().await {
+        let request = match client.read_message(Kind::Request).await {
             Ok(Some(req)) => req,
-            _ => return, // client closed or sent a malformed head
+            Ok(None) => return, // client closed
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                // Refused rather than forwarded: say why, then hang up.
+                let _ = client.write_all_bytes(bad_request(&e.to_string())).await;
+                return;
+            }
+            Err(_) => return,
         };
 
         // Lease one upstream for this round trip. The same few upstreams are
@@ -231,7 +271,7 @@ async fn handle_client(local: LocalPool<Origin>, client_stream: TcpStream) {
 
         // Forward the request and read one response back.
         let response = if up.write_all_bytes(request).await.is_ok() {
-            up.read_message().await
+            up.read_message(Kind::Response).await
         } else {
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -241,7 +281,14 @@ async fn handle_client(local: LocalPool<Origin>, client_stream: TcpStream) {
 
         match response {
             Ok(Some(resp)) => {
-                drop(up); // healthy: return it to the pool before touching the client
+                // Exactly one response must have come back. Anything left over
+                // means the origin framed the exchange differently than we did;
+                // such an upstream is retired rather than handed to the next
+                // client with another client's bytes still in it.
+                if !up.buf.is_empty() {
+                    up.healthy = false;
+                }
+                drop(up); // return it to the pool before touching the client
                 if client.write_all_bytes(resp).await.is_err() {
                     return;
                 }
@@ -274,7 +321,7 @@ async fn origin_conn(stream: TcpStream, id: u64) {
     let mut conn = Framed::new(stream);
     let mut served: u64 = 0;
     loop {
-        match conn.read_message().await {
+        match conn.read_message(Kind::Request).await {
             Ok(Some(_req)) => {
                 served += 1;
                 let body = format!("served by upstream connection #{id}, request #{served}\n");
@@ -308,16 +355,62 @@ fn bad_gateway(why: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// The `Content-Length` of an HTTP head, or 0 if it has none. Header names are
-/// case-insensitive, so match on a lowercased copy.
-fn content_length(head: &[u8]) -> usize {
+/// A minimal `400` for a request the proxy refuses to frame.
+fn bad_request(why: &str) -> Vec<u8> {
+    let body = format!("400 Bad Request: {why}\n");
+    format!(
+        "HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// The body length an HTTP head announces, if it can be trusted.
+///
+/// Only `Content-Length` framing is supported, and it has to be the *only*
+/// possible reading of the message: a `Transfer-Encoding` header (which a
+/// conformant origin would honour over `Content-Length`), two lengths that
+/// disagree, or a malformed length are all refused. A request with no length has
+/// no body. A response with no length has one delimited by the origin closing
+/// the connection — except for `1xx`, `204` and `304`, which never carry one —
+/// and cannot be read off a connection the pool is about to reuse, so it is
+/// refused too. Header names are case-insensitive, so match on a lowercased copy.
+fn body_length(head: &[u8], kind: Kind) -> io::Result<usize> {
     let text = String::from_utf8_lossy(head).to_ascii_lowercase();
-    for line in text.split("\r\n") {
-        if let Some(value) = line.strip_prefix("content-length:") {
-            return value.trim().parse().unwrap_or(0);
+    let mut lines = text.split("\r\n");
+    let start_line = lines.next().unwrap_or_default();
+    let mut length: Option<usize> = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name.trim() {
+            "transfer-encoding" => return Err(bad("transfer-encoding is not supported")),
+            "content-length" => {
+                let n: usize = value
+                    .trim()
+                    .parse()
+                    .map_err(|_| bad("malformed content-length"))?;
+                if length.is_some_and(|seen| seen != n) {
+                    return Err(bad("conflicting content-length headers"));
+                }
+                length = Some(n);
+            }
+            _ => {}
         }
     }
-    0
+    match (length, kind) {
+        (Some(n), _) => Ok(n),
+        (None, Kind::Request) => Ok(0),
+        (None, Kind::Response) => {
+            let status = start_line.split_whitespace().nth(1).unwrap_or_default();
+            if status.starts_with('1') || status == "204" || status == "304" {
+                Ok(0)
+            } else {
+                Err(bad("response without content-length cannot be framed"))
+            }
+        }
+    }
 }
 
 /// Find the first occurrence of `needle` in `hay`.

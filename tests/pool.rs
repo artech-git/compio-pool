@@ -4,7 +4,14 @@
 //! connection from a fresh one. Thread-locals let each test steer the manager;
 //! every `#[test]` runs on its own thread, so the state is naturally isolated.
 
-use std::{cell::Cell, fmt, future::Future, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    fmt,
+    future::Future,
+    rc::Rc,
+    task::{Context, Waker},
+    time::Duration,
+};
 
 use compio_pool::{ManageConnection, Pool, RunError};
 
@@ -316,13 +323,14 @@ fn reap_and_maintain_retire_then_refill() {
 }
 
 #[test]
-fn clear_drains_idle_connections() {
+fn clear_drains_idle_connections_and_frees_their_slots() {
     reset();
     run(async {
         let pool = Pool::builder()
             .max_size(3)
             .min_idle(3)
             .test_on_check_out(false)
+            .connection_timeout(Duration::from_millis(100))
             .build(Mgr);
         let local = pool.local();
 
@@ -336,6 +344,177 @@ fn clear_drains_idle_connections() {
             assert_eq!(local.state().connections, 0);
             assert_eq!(local.state().idle_connections, 0);
         }
+
+        // Nothing is open now, so every slot must be usable again: `get` opens
+        // fresh connections rather than timing out on capacity never given back.
+        // (Regression: `clear` used to drop the connections but keep their slots,
+        // wedging the thread's pool for good.)
+        let a = local.get().await.expect("first get after clear");
+        let b = local.get().await.expect("second get after clear");
+        let c = local.get().await.expect("third get after clear");
+        assert_eq!((*a, *b, *c), (4, 5, 6), "all three are fresh connections");
+    });
+}
+
+#[test]
+fn clear_hands_the_freed_capacity_to_a_parked_waiter() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .connection_timeout(Duration::from_millis(300))
+            .build(Mgr);
+        let local = pool.local();
+
+        let held = local.get().await.unwrap();
+        let waiter = local.clone();
+        let task = compio::runtime::spawn(async move { waiter.get().await.map(|c| *c) });
+        compio::time::sleep(Duration::from_millis(20)).await; // parked
+
+        // Return the connection (it goes idle and the waiter is woken for it),
+        // then drain the idle list before the waiter runs — a failover drain.
+        // The waiter must open a fresh connection, not time out on a leaked slot.
+        drop(held);
+        assert_eq!(local.clear(), 1);
+        let got = task.await.unwrap().expect("waiter served after clear");
+        assert_eq!(got, 2, "a fresh connection replaced the cleared one");
+    });
+}
+
+#[test]
+fn waiters_are_served_in_arrival_order() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .connection_timeout(Duration::from_secs(5))
+            .build(Mgr);
+        let local = pool.local();
+        let held = local.get().await.unwrap();
+
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for i in 0..4 {
+            let local = local.clone();
+            let order = order.clone();
+            tasks.push(compio::runtime::spawn(async move {
+                let _conn = local.get().await.unwrap();
+                order.borrow_mut().push(i);
+            }));
+            // Park them one at a time so the arrival order is unambiguous.
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Each return wakes the oldest waiter only, so the one connection is
+        // passed down the queue in FIFO order.
+        drop(held);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(*order.borrow(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            CREATED.with(|c| c.get()),
+            1,
+            "one connection served them all"
+        );
+    });
+}
+
+#[test]
+fn a_woken_waiter_that_gives_up_passes_the_wake_on() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .connection_timeout(Duration::from_millis(300))
+            .build(Mgr);
+        let local = pool.local();
+        let held = local.get().await.unwrap();
+
+        // First in line: a `get` driven by hand with a waker that does nothing,
+        // so it is woken but never runs — the shape of a waiter whose timeout
+        // fires in the same instant a connection comes back.
+        let first = local.clone();
+        let mut first_get = Box::pin(first.get());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(first_get.as_mut().poll(&mut cx).is_pending(), "parked");
+
+        // Second in line: a real task.
+        let second = local.clone();
+        let task = compio::runtime::spawn(async move { second.get().await.map(|c| *c) });
+        compio::time::sleep(Duration::from_millis(20)).await; // parked behind
+
+        drop(held); // the connection goes to the first waiter...
+        drop(first_get); // ...which gives up without taking it.
+
+        // The wake must be handed on, or the second waiter times out while a
+        // connection sits idle.
+        let got = task.await.unwrap().expect("second waiter served");
+        assert_eq!(got, 1, "it got the returned connection");
+    });
+}
+
+#[test]
+fn a_task_that_panics_holding_a_lease_returns_it() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .connection_timeout(Duration::from_secs(5))
+            .build(Mgr);
+        let local = pool.local();
+
+        let holder = local.clone();
+        let panicking = compio::runtime::spawn(async move {
+            let _lease = holder.get().await.unwrap();
+            compio::time::sleep(Duration::from_millis(20)).await;
+            panic!("handler bug while holding a pooled connection");
+        });
+        compio::time::sleep(Duration::from_millis(5)).await; // it holds the only slot
+
+        let waiter = local.clone();
+        let parked = compio::runtime::spawn(async move { waiter.get().await.map(|c| *c) });
+
+        // The lease drops during the panic's unwind, on this thread, and wakes
+        // the waiter from there. That must neither abort the process (the
+        // executor's abort-on-unwinding guard, ADR 0006, is on the cross-thread
+        // path) nor lose the slot.
+        assert!(
+            panicking.await.is_err(),
+            "the panic surfaces on the join handle"
+        );
+        assert_eq!(parked.await.unwrap().expect("waiter served"), 1);
+    });
+}
+
+#[cfg(feature = "metrics")]
+#[test]
+fn statistics_outlive_a_dropped_local_pool() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(2)
+            .test_on_check_out(false)
+            .build(Mgr);
+        {
+            let local = pool.local();
+            drop(local.get().await.unwrap());
+            assert_eq!(pool.state().connections, 1);
+        }
+        // The thread's pool is gone: its live gauges with it, its totals kept.
+        assert_eq!(pool.state(), compio_pool::State::default());
+        assert_eq!(pool.statistics().connections_created, 1);
+        assert_eq!(pool.statistics().get_direct, 1);
+
+        // A new pool on the thread adds to the same totals.
+        let local = pool.local();
+        drop(local.get().await.unwrap());
+        assert_eq!(pool.statistics().connections_created, 2);
+        assert_eq!(pool.state().connections, 1);
     });
 }
 
