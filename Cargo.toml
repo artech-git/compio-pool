@@ -10,6 +10,18 @@ homepage = "https://github.com/artech-git/compio-pool"
 readme = "README.md"
 keywords = ["compio", "io-uring", "pool", "bb8", "thread-per-core"]
 categories = ["asynchronous", "network-programming", "concurrency"]
+# Keep the published crate lean: ship the source, the prose docs and the result
+# summaries, but not editor cruft or the ~1 MB of raw benchmark logs and data
+# under docs/results. The linked README/report files in those folders stay.
+exclude = [
+    "**/.DS_Store",
+    "docs/results/**/*.log",
+    "docs/results/**/*.tsv",
+    "docs/results/**/*.jsonl",
+    "docs/results/**/*.json",
+    "docs/results/**/*.txt",
+    "docs/results/**/_raw/**",
+]
 # Bisected, not guessed: compio 0.19's executor uses `cfg_select!`, stable
 # since 1.95. 1.88 through 1.94 fail to build the dependency tree. Enforced by
 # the `msrv` job in CI.
