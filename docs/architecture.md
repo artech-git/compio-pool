@@ -1,7 +1,7 @@
 # Architecture
 
-How the server is put together, where every piece of state lives, and what runs on each
-event. For *why* any of it is shaped this way, see [decisions/](decisions/).
+How the pool is put together, where every piece of state lives, and what runs on each checkout
+and return. For *why* any of it is shaped this way, see [decisions/](decisions/).
 
 ## The constraint everything follows from
 
@@ -9,162 +9,195 @@ event. For *why* any of it is shaped this way, see [decisions/](decisions/).
 handles are bound to the ring that created them, and buffers are handed to the kernel by
 ownership for the duration of an operation. `compio::net::TcpStream` is `!Send`.
 
-So the unit of ownership is the core. Everything a connection touches — the listener that
-accepted it, the ring its I/O goes through, the pool it borrows from, the task that serves it —
-belongs to one worker thread. The only things that cross threads are the raw file descriptor of
-a connection nobody local can serve, and counters.
+So a connection cannot be pooled in a single shared, work-stealing store the way bb8 pools one on
+`tokio`: it can only ever be used from the thread whose ring opened it. The unit of ownership is
+the core. What crosses threads is not connections but the *blueprint* that stamps out a pool on
+each — the manager and the configuration, behind one `Arc`.
 
-## One worker
+## The two halves
 
 ```text
- thread "compio-pool/<i>", pinned to core c_i
- ┌───────────────────────────────────────────────────────────────────────┐
- │ compio Runtime (io_uring; coop_taskrun, single_issuer)                │
- │                                                                       │
- │  TcpListener         socket2: SO_REUSEADDR, SO_REUSEPORT, [SO_INCOMING_CPU=c_i], bind, listen
- │  LocalPool<R>        Rc<Inner>: idle: RefCell<Vec<R>>, taken: Cell, waiters
- │  Rc<Worker<S>>       the service clone, Sender/Receiver of the channel, Arc<WorkerStats>
- │                                                                       │
- │  task accept_loop    accept → try_reserve → spawn serve | hand_off     │
- │  task claim_loop     wait_available → recv → try_reserve → attach → spawn serve
- │  tasks serve × n     permit.acquire → service.handle(conn, &mut lease)  │
- └───────────────────────────────────────────────────────────────────────┘
+Pool<M>          Send + Sync + Clone — one Arc<Shared<M>>, the only thing that crosses threads
+  └ Shared<M>    manager: M · config: PoolConfig · closed: AtomicBool · [metrics registry]
+
+LocalPool<M>     !Send — one Rc<Inner<M>> per thread, from Pool::local()
+  └ Inner<M>     idle: RefCell<Vec<Conn>> · slots: Cell<u32> · waiters: Waiters · [metrics block]
 ```
 
-Startup order inside the thread matters and is fixed: pin (step 8), build the ring (10), bind
-the listener (9), wrap it in the runtime (10), build the pool (11), prewarm, report ready, then
-spawn the two loops. Worker 0 starts alone so that a configured port of 0 is resolved once; the
-others bind the port it got.
+`Pool` holds nothing hot. Cloning it is an `Arc` bump; every clone shares the one manager,
+config, shutdown flag and metrics registry. `LocalPool` holds everything on the lease path, all
+`Rc` / `Cell` / `RefCell`, and is `!Send` — the compiler keeps it, and the ring-bound connections
+it holds, on the one thread that called [`Pool::local`](../src/pool.rs). Call `local` once per
+compio thread and keep the handle; it is `Clone` (a cheap `Rc` bump) if several tasks on that
+thread need it.
+
+Every size is **per thread**. `max_size` caps one thread's `LocalPool`, not the process: a
+48-core server with `max_size(16)` holds up to `48 × 16` connections, 16 of them to any one ring.
 
 ## State, and which thread can see it
 
 | state | type | visible to |
 |---|---|---|
-| connections, resources, pool, runtime, ring | `Rc`, `Cell`, `RefCell` | one worker |
-| the service | `S: Clone + Send` | one clone per worker |
-| handoff channel | `flume::bounded<Overflow>` | every worker; lock-free MPMC |
-| per-worker counters | `WorkerStats`, relaxed atomics, 128-byte aligned | written by one worker, read by anyone |
-| configuration | `Arc<Config>` | everyone, read-only |
-| shutdown signal | `flume::Receiver<()>` per worker; the `Server` holds the only `Sender` | everyone |
+| manager, configuration | `M`, `PoolConfig` in `Arc<Shared>` | everyone, read-only |
+| shutdown flag | `AtomicBool` in `Shared` | everyone; set by `Pool::close` |
+| metrics registry *(metrics)* | `Mutex<Vec<Arc<Metrics>>>` | locked only on `local()` and on a scrape |
+| idle free-list | `RefCell<Vec<Conn>>`, LIFO | one thread |
+| slot count | `Cell<u32>` | one thread |
+| waiter list | `Waiters`, one `Waker` per parked `get` | one thread |
+| per-thread counters *(metrics)* | `Arc<Metrics>`, relaxed atomics | written by one thread, summed by anyone |
 
-`WorkerStats` is aligned to its own cache line so two workers never write the same line. The
-totals in `Server::stats()` are a sum of per-worker snapshots, taken counter by counter, not a
-consistent cut.
+Nothing on the lease path is an atomic or a lock: the slot count is a `Cell`, the idle list a
+`RefCell<Vec>`, the waiters a plain list. The `metrics` feature adds one `Arc<Metrics>` block per
+thread, written only by its owner (relaxed atomics, no contention) and registered with the `Pool`
+so an off-thread scrape can sum every thread's view. With the feature off, the block and the
+registry drop out of the build; `slots` is still tracked, because the cap is enforced against it.
 
-## The three loops
-
-### accept (steps 12–15)
+## A connection, and when it expires
 
 ```text
+Conn<C>   raw: C · created_at: Instant · last_used: Instant
+```
+
+Expiry is a pure function of those timestamps and the config: `max_lifetime` against
+`created_at`, `idle_timeout` against `last_used`, with age attributed to `max_lifetime` first. It
+is evaluated **lazily** — only as a connection is popped for checkout, returned on drop, or walked
+by [`reap`](#maintenance) — so a pool that goes quiet keeps its connections until maintenance runs.
+
+## Checking a connection out
+
+`LocalPool::get` wraps the loop below in `compio::time::timeout(connection_timeout, …)`; that
+elapse is the only unbounded wait, and it surfaces as `RunError::TimedOut`.
+
+```text
+get_inner:
 loop
-  (stream, peer) = race(listener.accept(), shutdown)      shutdown → return
-  stats.accepted++ ; set_nodelay
-  match pool.try_reserve()                                 Cell compare, no await
-    Some(permit) → stats.served_local++ ; spawn serve(permit, Connection{route: Local})
-    None         → fd = detach(stream).await               SharedFd::try_unwrap, immediate for a fresh socket
-                   match tx.try_send(Overflow{fd, peer, from: i, hops: 0})
-                     Ok           → stats.handed_off++
-                     Full(ov)     → stats.handoff_full++ ; channel_full(ov)
-                     Disconnected → drop (shutting down)
+  closed? → RunError::Closed
+  wait_ready().await           park until idle is non-empty, or slots < max_size, or closed
+  closed? → RunError::Closed
+
+  pop_fresh_idle()             newest idle, discarding any expired (each discard frees its slot)
+    Some(held) → test_on_check_out ? is_valid(conn).await : skip
+                   invalid → note_broken ; drop held (frees slot) ; continue
+                   valid   → return PooledConnection
+    None → (idle empty)
+
+  try_reserve()                slots < max_size ? take_slot → Held : None
+    Some(held) → manager.connect().await
+                   Ok  → fill held ; note_created ; return PooledConnection
+                   Err → held drops (slot released) ; RunError::User(e)
+    None → a task took the last slot between the wait and here: loop
 ```
 
-`accept` errors that mean "out of descriptors" (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) back
-off 10 ms before the next accept; anything else is counted and the loop continues.
+Three outcomes, in order: **reuse** the warmest idle connection, **open** one if under
+`max_size`, or **wait**. The check-and-take after `wait_ready` is synchronous, so what the wait
+observed still holds when `get` acts on it; if another task won the slot in between, the loop just
+goes round again.
 
-### claim (steps 16–17)
+## Returning one
+
+A `PooledConnection` derefs to the connection and owns it until drop. Drop decides its fate on the
+returning thread, touching no lock:
 
 ```text
-loop
-  race(pool.wait_available(), shutdown)                    shutdown → return
-  ov = race(rx.recv_async(), shutdown)                     shutdown / disconnected → return
-  match pool.try_reserve()
-    Some(permit) → stream = attach(ov.fd)                  TcpStream::from_std on THIS ring
-                   stats.claimed++ ; spawn serve(permit, Connection{route: Claimed{from, hops}})
-    None         → the listener took the slot meanwhile
-                   if ov.hops < max_hops → ov.hops++ ; tx.try_send(ov) → stats.bounced++ (Full → channel_full)
-                   else                  → channel_full(ov)
+PooledConnection::drop:
+  closed?        → drop ; release slot
+  has_broken?    → drop ; note_broken ; release slot
+  expired?       → drop ; note_expired ; release slot
+  else           → last_used = now ; push onto idle ; wake a waiter
 ```
 
-The wait comes before the receive on purpose: a worker only takes what it can serve, and it
-does not hold a slot while it waits, so an idle worker's full capacity stays available to its
-own listener. The price is the race in the `None` arm, which is bounded by `max_hops`.
+The idle list is LIFO, so the next `get` reuses the most recently returned connection — warmest
+in cache, least likely to have aged out. Either way, a release wakes parked waiters.
 
-### channel_full
+## The slot count and the `Held` reservation
 
-Only reached when every worker is at capacity *and* the queue is full.
+`slots: Cell<u32>` counts idle + checked out + reserved, and is the one value enforced against
+`max_size`. It is the source of truth whether or not metrics are compiled in.
 
-* `OverflowPolicy::ServeLocally` (default): `attach` on this ring, `reserve_unbounded`, serve.
-  The pool is over capacity by one until the connection ends; `stats.oversubscribed++`.
-* `OverflowPolicy::Reject`: drop the `Overflow`, which closes the socket; `stats.rejected++`.
+A slot is reserved *before* the connection exists: `try_reserve` bumps `slots` and returns a
+`Held`, an RAII guard that releases the slot if it is dropped before the connection is committed.
+That is what makes every early return and cancellation inside `get` / `warm` leak-free — a
+`connect()` that errors, a future dropped mid-await, a failed `is_valid` each drops its `Held` and
+the slot goes back. Only `into_pooled` / `into_idle` commit it.
 
-### serve
+## Waiting and waking
 
-```text
-stats.active++
-lease = permit.acquire().await          pop idle, else R::create(&cx).await; Err → stats.resource_errors++, slot released
-service.handle(conn, &mut lease).await  Ok → completed++ ; Err → handler_errors++
-stats.active--                          lease drops: recycle() ? idle.push : drop ; slot released
-```
+`Waiters` holds one `Waker` per parked `get`. Each waiter owns an id and withdraws its waker if
+its future is dropped before it resolves, so nothing stale is ever woken. Every slot release and
+every connection returned to the idle list calls `wake_all`; a woken task re-runs the synchronous
+check-and-take, so waking more than one is safe — at most one takes the freed slot and the rest
+re-park.
 
-## The pool
+## Maintenance
 
-```text
-capacity        fixed
-idle            Vec<R>, LIFO
-taken           permits + leases outstanding
-invariant       idle.len() + taken <= capacity   (except through reserve_unbounded)
-```
+Because expiry is lazy, a quiet pool would hold dead backend connections open. Thread-per-core has
+no shared reaper thread, so maintenance is driven per worker:
 
-* `try_reserve` → `Permit` if `taken < capacity`; `taken += 1`. Synchronous.
-* `Permit::acquire` → `Lease`: pops an idle resource or creates one. Dropping an unconverted
-  permit refunds the slot.
-* `Lease` drop: `taken -= 1`; the resource goes back on the idle list if `recycle()` says so
-  and there is room, else it is dropped. Over-capacity leases therefore never grow the idle list.
-* Waiting (`reserve`, `wait_available`, `drained`) registers exactly one waker per waiting
-  future, removed when the future resolves *or is dropped*, so nothing stale is ever woken.
-  Every release wakes all capacity waiters: a `wait_available` waiter does not consume the slot
-  it was woken for, so waking one could strand a `reserve` waiter while a slot is free.
+* `reap` — drop idle connections past `idle_timeout` / `max_lifetime`, free their slots.
+* `warm` — open connections up to `min_idle` and park them idle; doubles as the warm-up.
+* `maintain` — `reap` then `warm`, the step to call on a timer.
+* `clear` — drop every idle connection unconditionally, e.g. after a backend failover.
 
-## Moving an fd between rings
-
-```text
-detach(stream):  shared = stream.to_shared_fd()      refcount 2
-                 drop(stream)                        refcount 1
-                 shared.try_unwrap()                 Ok(socket2::Socket) → OwnedFd
-                 (Err → shared.take().await: an op is still in flight; wait for it)
-attach(fd):      TcpStream::from_std(std::net::TcpStream::from(fd))
-                 → Socket::from_socket2 → Attacher::new → Runtime::with_current(|r| r.attach(fd))
-```
-
-Nothing is submitted against a freshly accepted socket, so `detach` is synchronous in practice.
-`attach` must run inside the destination worker's runtime; that is what binds the fd to its
-ring. Between the two the fd is just an `OwnedFd` inside an `Overflow`, and dropping an
-`Overflow` closes it.
+Once the pool is closed they stop doing work: `warm` / `maintain` return `Ok(0)`.
 
 ## Shutdown
 
-1. `Server::shutdown` drops the only `Sender<()>`. Every worker's `recv_async` on its clone of
-   the receiver resolves with `Disconnected`.
-2. Both loops exit (their `race` against shutdown resolves); the worker awaits them.
-3. The worker waits for `pool.drained()` up to `drain_timeout`: in-flight handlers finish.
-4. `block_on` returns and the runtime drops. Whatever is still pending is cancelled with it; the
-   listener and any remaining sockets close.
-5. `Server::join` (or `Drop`) joins the threads.
+`Pool::close` sets the shared `AtomicBool`. From then on every thread's `get` fails
+`RunError::Closed`, a returned connection is dropped instead of recycled, and `warm` / `maintain`
+become no-ops. `is_closed` reports the flag.
 
-If the `Server` is dropped *while the dropping thread is unwinding*, the sender is dropped from a
-helper thread instead. compio's executor aborts the process when one of its task wakers runs on
-a thread that is already panicking, and the disconnect wakes worker tasks synchronously. See
-[decision 0006](decisions/0006-shutdown-and-the-unwinding-thread.md).
+The flag is shared, but the wakers that unpark a parked `get` are not — they live on each worker's
+own thread. A task already parked waiting for a slot therefore unblocks on its next *local* wake
+(another connection returning, or `clear`), or when its `connection_timeout` elapses, not the
+instant `close` is called from another thread. For a prompt drain, stop each worker's accept loop
+and call `clear` on its thread.
+
+## Metrics (the `metrics` feature)
+
+Off by default. With it on, each `LocalPool` owns one `Metrics` block and registers a clone
+(`Arc`) with the `Pool`. Only the owning thread writes its block, so the counters are plain
+relaxed atomics; the live gauges mirror `slots` / idle / waiters, and pool logic never reads them
+back — metrics is a pure observer.
+
+* `State` — live gauges: `connections`, `idle_connections`, `pending_waiters`.
+* `Statistics` — cumulative, monotonic counters: `get_direct`, `get_waited`, `get_timed_out`,
+  `connections_created`, `connections_closed_{broken,idle_timeout,max_lifetime}`,
+  `total_wait_time` (and `average_wait_time()`).
+
+`LocalPool::state` / `statistics` read this thread's block, lock-free. `Pool::state` /
+`statistics` take the registry lock — a cold path — and sum every block for a process-wide view.
+Two `Statistics` snapshots subtracted give the activity in between, the shape an exporter wants.
+With the feature off, all four still compile and return zeroes, so calling code builds either way.
+
+## The thread-per-core half
+
+The pool is the product; the accept loop, the thread spawning and the pinning are the developer's.
+The crate ships the helpers for that half so they come from one place:
+
+* `cpu` — the affinity mask ([`cpu::cores`](../src/cpu.rs)), thread pinning (`cpu::pin_current`),
+  and, behind the `affinity` feature, topology-aware selection (`cpu::CoreSet`).
+* [`listener::bind_reuseport`](../src/listener.rs) — a raw `SO_REUSEADDR` + `SO_REUSEPORT` socket,
+  optionally with `SO_INCOMING_CPU`, so every thread binds the same address and the kernel splits
+  connections by flow hash. See [0001](decisions/0001-listener-per-worker.md),
+  [0005](decisions/0005-incoming-cpu-opt-in.md).
+* `workers::PerCore` *(the `affinity` feature)* — spawns and pins one worker per selected core,
+  hands each its `CoreId`, and returns joinable `Workers`. See
+  [0009](decisions/0009-core-affinity-harness.md).
+
+See [operations.md](operations.md) for how to size and run it.
 
 ## Invariants
 
 These hold in every test and are what a change must keep true:
 
-* `idle + taken <= capacity` on every pool, except by `reserve_unbounded`.
-* `served_local + handed_off == accepted` per worker, at all times.
-* Over a quiescent server: `claimed + oversubscribed + rejected == handed_off` summed over
-  workers, `queued == 0`, `active == 0`.
-* `bounced` only ever increments from the claim loop's `None` arm, and a connection bounces at
-  most `max_hops` times.
-* A stream is only ever polled by the ring it is currently attached to. `detach` happens on the
-  accepting worker, `attach` on the claiming worker, and nothing touches the fd in between.
+* `idle.len() + checked_out + reserved == slots`, and `slots <= max_size`, on every thread. There
+  is no over-capacity path.
+* A connection is only ever polled by the ring that created it. `LocalPool` is `!Send`, so the
+  compiler proves connections never cross threads; nothing in the crate moves one.
+* Every slot release and every idle return wakes waiters, and a woken `get` re-checks
+  synchronously — so no caller acts on a stale observation, and a freed slot never strands a
+  waiter while it is free.
+* Expiry is checked only at checkout and return (and in `reap`), with `max_lifetime` attributed
+  before `idle_timeout`.
+* The metrics gauges mirror the real `slots` / idle / waiters; pool logic never reads them. With
+  the feature off the counters are absent and the behaviour is identical.

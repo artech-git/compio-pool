@@ -25,9 +25,11 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 [workspace]
 members = []
 # `compio-redis` is a nested repository with its own history, targeting the
-# previous API. `deadpool-baseline` is the tokio + deadpool yardstick for the
-# examples, its own workspace root. Neither is part of this build.
-exclude = ["crates/compio-redis", "crates/deadpool-baseline"]
+# previous API. `compio-pool-redis` is the Redis-specialized pool built on this
+# crate plus that client; it keeps its own Cargo.lock like the others.
+# `deadpool-baseline` is the tokio + deadpool yardstick for the examples, its own
+# workspace root. None of them are part of this build.
+exclude = ["crates/compio-redis", "crates/compio-pool-redis", "crates/deadpool-baseline"]
 
 [dependencies]
 # `default-features = false` drops `io-uring`, which is the whole point, so it

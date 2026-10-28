@@ -24,7 +24,7 @@ lockfile that is committed is the one that was built.
 
 | file | proves |
 |---|---|
-| [`tests/pool.rs`](../tests/pool.rs) | `LocalPool` accounting in isolation, inside one compio runtime: permits count against capacity and refund on drop; leases create lazily and reuse idle resources; `recycle() == false` and `discard` drop; a failed `create` releases the slot; `reserve` and `wait_available` wake on release and `wait_available` does not take the slot; `drained` resolves at zero; `reserve_unbounded` goes over capacity without growing the idle list; `prewarm` is capped |
+| [`tests/pool.rs`](../tests/pool.rs) | `LocalPool` behaviour, each test inside its own single-threaded compio runtime with a `u32`-id manager steered by thread-locals: an idle connection is reused; `max_size` is enforced and a `get` beyond it returns `RunError::TimedOut`, after which a freed slot lets the next succeed; `has_broken` and a failed `is_valid` drop the connection and free its slot; a failing `connect` surfaces `RunError::User` and frees the reserved slot; `warm` opens `min_idle` up front; `reap` / `maintain` retire expired idle then refill; `clear` drains idle; `close` rejects `get` and drops returns. The counter assertions — `State` / `Statistics`, and a parked waiter counted then served — are `#[cfg(feature = "metrics")]`, so the default build checks behaviour and the `--features metrics` build also checks the numbers. A compile-time assertion pins `Pool: Send + Sync + Clone` |
 | [`tests/affinity.rs`](../tests/affinity.rs) | *(the `affinity` feature)* `CoreSet` selection on synthetic topologies — `physical_only` drops SMT siblings and keeps distinct `(package, core)` across packages, `spread` round-robins packages while `pack` groups them, filters and `take` narrow the set; `permitted()` is a subset of the affinity mask; an empty core set is rejected; and `PerCore::spawn_each` / `block_on_each` pin, run and join one worker per core |
 Both `tests/pool.rs` and `tests/affinity.rs` are self-contained; the harness tests build a compio
 runtime on each pinned worker, and the suite keeps CPU pinning best-effort since it may run under a
@@ -32,25 +32,24 @@ restricted affinity mask.
 
 ### Things the tests had to learn
 
-* **The kernel decides who accepts.** Six connections against two listeners can land 6/0 or
-  3/3. Assertions are on totals (`active == 2`, `queued == 4`, `served_local ∈ {1, 2}`), and
-  every client speaks from its own thread, because the parked ones are only served once the
-  active ones close, and which is which is not knowable in advance.
-* **Counters tick after the client has its bytes.** `completed` increments when the handler
-  returns, which is after the client's `read` succeeded. Tests poll with `eventually` rather
-  than reading a counter straight after a roundtrip.
-* **A panic with a live `Server` used to abort the process.** compio's executor aborts if a
-  task waker runs on an unwinding thread; `Server::shutdown` now detours in that case. The
-  regression test is `#[should_panic]` — if the detour breaks, the whole `shutdown` binary dies
-  with `SIGABRT` rather than that one test passing. [Decision 0006](decisions/0006-shutdown-and-the-unwinding-thread.md).
+* **Behaviour and counters are tested apart.** The pool behaves identically with or without the
+  `metrics` feature, so the behavioural assertions always run and only the counter assertions are
+  `#[cfg(feature = "metrics")]`. A test that read `State` unconditionally would fail the default
+  build, where every counter is zero.
+* **Each test is one thread.** `LocalPool` is `!Send`, so a test builds one compio runtime and runs
+  the whole scenario on it — including the parked-waiter case, where a second task blocks in `get`
+  and is woken when the first connection is returned, all on that one thread. A compile-time check
+  keeps `Pool` `Send + Sync + Clone`.
+* **Waiting is driven by the timeout.** The max-size test sets a short `connection_timeout` so the
+  over-cap `get` parks and then returns `RunError::TimedOut` without wedging the test; dropping the
+  holder frees the slot and the next `get` succeeds immediately.
 
-## Flakiness
+## Pinning is best-effort
 
-The full suite was run repeatedly in the VM after the fixes above; the count and result of the
-last run are in the commit that introduced this page. The one distribution test
-(`every_worker_has_its_own_listener_on_the_same_port`) asserts only that *at least two* of four
-listeners accepted something over 64 connections. With `incoming_cpu` off, 60 trials of that
-shape in the VM never put more than 25 of 64 on one listener.
+The `affinity` harness tests assert that every worker *ran* and was joined, not that the kernel
+accepted each pin: a restricted cpuset (CI runners, containers) can refuse a core, and `PerCore`
+then runs that worker unpinned rather than failing. The `CoreSet` selection tests build synthetic
+topologies in memory, so they do not depend on the runner's real CPU layout and stay deterministic.
 
 ## The script
 
@@ -65,9 +64,9 @@ command it would run.
 | job | what |
 |---|---|
 | fmt | `cargo fmt --all --check` |
-| clippy | `cargo clippy --all-targets --locked -- -D warnings` |
-| test (stable, beta) | build all targets, run all tests, doctests; `-D warnings` on stable |
+| clippy | `cargo clippy --all-targets -- -D warnings`, and again `--features affinity` |
+| test (stable, beta) | build all targets, run all tests and doctests, both default and `--features affinity`; `-D warnings` on stable |
 | msrv | `cargo build --lib --locked` on Rust 1.95, the bisected minimum |
-| docs | `cargo doc --no-deps` with `-D warnings --cfg docsrs` |
-| shell | `bash -n`, `shellcheck`, `tune-nic.sh --check` |
+| docs | `cargo doc --no-deps --all-features` (nightly) with `-D warnings --cfg docsrs` |
+| shell | `bash -n`, `shellcheck`, `tune-nic.sh --self-test` and `--check` |
 | links | `lychee --offline` over every Markdown file |

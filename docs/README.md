@@ -6,7 +6,7 @@ that way, how to run it, and what it measures.
 
 | page | what it answers |
 |---|---|
-| [architecture.md](architecture.md) | What each worker owns, the three loops, where every piece of state lives, and the accounting invariants |
+| [architecture.md](architecture.md) | The `Pool` / `LocalPool` split, the checkout and return paths, where every piece of state lives, and the invariants |
 | [decisions/](decisions/) | Why each load-bearing choice was made, what was rejected, and what it costs |
 | [operations.md](operations.md) | Host tuning, sizing, the `io_uring` flags, reading the counters, failure modes |
 | [performance.md](performance.md) | What was measured, how, and the numbers |
