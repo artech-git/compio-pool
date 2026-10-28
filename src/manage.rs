@@ -44,7 +44,11 @@ pub trait ManageConnection: Send + Sync + 'static {
 }
 
 /// What [`LocalPool::get`](crate::LocalPool::get) returns on failure.
+///
+/// Marked `#[non_exhaustive]`: match it with a wildcard arm so a future variant
+/// does not break your code.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum RunError<E> {
     /// The manager failed to open or validate a connection.
     User(E),
