@@ -623,18 +623,24 @@ impl<M: ManageConnection> LocalPool<M> {
     /// min-idle maintenance step; [`maintain`](Self::maintain) pairs it with a
     /// reap. A no-op (returns `Ok(0)`) once the pool is [`closed`](Pool::close).
     /// Stops early and returns [`RunError::User`] if the manager fails to connect.
+    ///
+    /// Each dial is bounded by [`connection_timeout`](Builder::connection_timeout),
+    /// so a backend that has stopped answering cannot wedge the maintenance loop:
+    /// a dial that overruns returns [`RunError::TimedOut`] and frees the slot it
+    /// reserved, leaving any connections already opened on the idle list.
     pub async fn warm(&self) -> Result<u32, RunError<M::Error>> {
         if self.inner.closed() {
             return Ok(0);
         }
         let target = self.inner.shared.config.min_idle;
+        let timeout = self.inner.shared.config.connection_timeout;
         let mut made = 0;
         while self.inner.idle_len() < target {
             let Some(mut held) = self.try_reserve() else {
                 break;
             };
-            match self.inner.shared.manager.connect().await {
-                Ok(raw) => {
+            match compio::time::timeout(timeout, self.inner.shared.manager.connect()).await {
+                Ok(Ok(raw)) => {
                     let now = Instant::now();
                     held.conn = Some(Conn {
                         raw,
@@ -645,8 +651,9 @@ impl<M: ManageConnection> LocalPool<M> {
                     held.into_idle();
                     made += 1;
                 }
-                // `held` drops here, releasing the slot it reserved.
-                Err(e) => return Err(RunError::User(e)),
+                // `held` drops in either arm, releasing the slot it reserved.
+                Ok(Err(e)) => return Err(RunError::User(e)),
+                Err(_elapsed) => return Err(RunError::TimedOut),
             }
         }
         Ok(made)
