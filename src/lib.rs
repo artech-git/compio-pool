@@ -34,11 +34,14 @@
 //!
 //! * **Metrics** *(optional — the `metrics` feature, off by default)*. With it
 //!   on, each [`LocalPool`] keeps its own counters and registers them with the
-//!   [`Pool`]. [`LocalPool::state`] / [`LocalPool::statistics`] read one thread's
-//!   lock-free; [`Pool::state`] / [`Pool::statistics`] sum every thread's for a
-//!   process-wide [`State`] and [`Statistics`] to feed a metrics endpoint. With
-//!   the feature off the counters compile out and these report zero, so the
-//!   default build pays nothing for them.
+//!   [`Pool`]. [`LocalPool::statistics`] reads one thread's lock-free;
+//!   [`Pool::state`] / [`Pool::statistics`] sum every thread's for a process-wide
+//!   [`State`] and [`Statistics`] to feed a metrics endpoint. With the feature off
+//!   the cumulative [`Statistics`] counters compile out and report zero, so the
+//!   default build pays nothing for them. The live [`State`] gauges — open, idle
+//!   and waiting — are plain per-thread state, so [`LocalPool::state`] reports them
+//!   whether or not the feature is on; only the cross-thread [`Pool::state`]
+//!   roll-up needs it.
 //! * **Maintenance.** Expiry is lazy, so a quiet pool would hold dead backend
 //!   connections open. Call [`LocalPool::maintain`] on a timer on each worker — it
 //!   reaps expired idle connections ([`LocalPool::reap`]) and tops back up to

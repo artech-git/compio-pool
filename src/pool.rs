@@ -585,16 +585,17 @@ impl<M: ManageConnection> LocalPool<M> {
         self.inner.shared.config.max_size
     }
 
-    /// A snapshot of **this thread's** open, idle and waiting counts. Lock-free.
-    /// For the process-wide sum use [`Pool::state`]. Without the `metrics` feature
-    /// it reports [`State::default`] (zeroes).
+    /// A snapshot of **this thread's** open, idle and waiting counts. Lock-free,
+    /// and always available: the slot count, idle list and waiter queue are plain
+    /// per-thread state, so this reads them directly whether or not the `metrics`
+    /// feature is on. For the process-wide sum use [`Pool::state`] (which does
+    /// need the feature, since it aggregates across threads).
     pub fn state(&self) -> State {
-        #[cfg(feature = "metrics")]
-        {
-            self.inner.metrics.snapshot_state()
+        State {
+            connections: self.inner.connections(),
+            idle_connections: self.inner.idle_len(),
+            pending_waiters: self.inner.waiters.len(),
         }
-        #[cfg(not(feature = "metrics"))]
-        State::default()
     }
 
     /// **This thread's** cumulative counters. Lock-free. For the process-wide sum
@@ -1054,6 +1055,12 @@ impl Waiters {
             woken_upto: Cell::new(0),
             entries: RefCell::new(VecDeque::new()),
         }
+    }
+
+    /// How many tasks are parked right now. Always tracked (the queue exists with
+    /// or without the `metrics` feature), so [`LocalPool::state`] can read it.
+    fn len(&self) -> u32 {
+        self.entries.borrow().len() as u32
     }
 
     /// Mirror the queue length into the cross-thread gauge.
