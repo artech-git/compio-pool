@@ -789,6 +789,64 @@ impl<M: ManageConnection> LocalPool<M> {
         }
     }
 
+    /// Check a connection out **without ever waiting**.
+    ///
+    /// Like [`get`](Self::get), but the moment the thread is at
+    /// [`max_size`](Builder::max_size) with no connection to reuse, it returns
+    /// `Ok(None)` instead of parking for a slot. A thread-per-core server that
+    /// would rather shed load than queue requests wants this over `get`.
+    ///
+    /// It still reuses a live idle connection — validated first when
+    /// [`test_on_check_out`](Builder::test_on_check_out) is set — and still opens a
+    /// fresh one while under `max_size`; both of those await the manager. Only the
+    /// wait-for-a-slot step is dropped. Returns [`RunError::Closed`] if the pool is
+    /// [`closed`](Pool::close), or [`RunError::User`] if opening a connection fails.
+    pub async fn try_get(&self) -> Result<Option<PooledConnection<M>>, RunError<M::Error>> {
+        if self.inner.closed() {
+            return Err(RunError::Closed);
+        }
+        // Reuse a live idle connection, discarding any that fail validation.
+        while let Some(mut held) = self.pop_fresh_idle() {
+            if self.inner.shared.config.test_on_check_out {
+                let valid = {
+                    let conn = held.conn.as_mut().expect("idle held carries a connection");
+                    self.inner
+                        .shared
+                        .manager
+                        .is_valid(&mut conn.raw)
+                        .await
+                        .is_ok()
+                };
+                if !valid {
+                    self.inner.note_broken();
+                    drop(held);
+                    continue;
+                }
+            }
+            self.record_acquire(false, Instant::now());
+            return Ok(Some(held.into_pooled()));
+        }
+        // Nothing idle; open one if there is room, else give up without waiting.
+        if let Some(mut held) = self.try_reserve() {
+            match self.inner.shared.manager.connect().await {
+                Ok(raw) => {
+                    let now = Instant::now();
+                    held.conn = Some(Conn {
+                        raw,
+                        created_at: now,
+                        last_used: now,
+                    });
+                    self.inner.note_created();
+                    self.record_acquire(false, now);
+                    return Ok(Some(held.into_pooled()));
+                }
+                // `held` drops, releasing the reserved slot.
+                Err(e) => return Err(RunError::User(e)),
+            }
+        }
+        Ok(None)
+    }
+
     async fn get_inner(&self) -> Result<PooledConnection<M>, RunError<M::Error>> {
         let start = Instant::now();
         let mut waited = false;
