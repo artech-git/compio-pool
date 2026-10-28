@@ -47,6 +47,12 @@ use crate::{
     manage::{ManageConnection, RunError},
 };
 
+/// How long `get` waits between connect attempts when
+/// [`retry_connection`](Builder::retry_connection) is on, so a hard-down backend
+/// is retried steadily rather than in a tight loop. The caller's
+/// `connection_timeout` still bounds the total wait.
+const CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
 /// A blueprint for per-thread pools: build it once, clone it onto each compio
 /// thread you spawn, and call [`local`](Self::local) there.
 ///
@@ -927,8 +933,18 @@ impl<M: ManageConnection> LocalPool<M> {
                         self.record_acquire(waited, start);
                         return Ok(held.into_pooled());
                     }
-                    // `held` drops, releasing the reserved slot.
-                    Err(e) => return Err(RunError::User(e)),
+                    Err(e) => {
+                        if self.inner.shared.config.retry_connection && !self.inner.closed() {
+                            // Give the slot back, pause so a failing backend is not
+                            // hammered, and try again. The outer connection_timeout
+                            // bounds how long this can go on.
+                            drop(held);
+                            compio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+                            continue;
+                        }
+                        // `held` drops, releasing the reserved slot.
+                        return Err(RunError::User(e));
+                    }
                 }
             }
             // Another task took the slot between the wait and here: loop.

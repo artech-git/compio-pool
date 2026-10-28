@@ -891,3 +891,38 @@ fn statistics_count_manual_connection_closes() {
         );
     });
 }
+
+#[test]
+fn retry_connection_recovers_from_a_failed_dial() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(1)
+            .retry_connection(true)
+            .connection_timeout(Duration::from_secs(2))
+            .build(Mgr);
+        let local = pool.local();
+
+        // The first dial fails, the next succeeds. With retry on, get() recovers
+        // instead of surfacing the first error.
+        FAIL_CONNECT.with(|f| f.set(true));
+        let conn = local
+            .get()
+            .await
+            .expect("retry should recover from one failure");
+        assert_eq!(*conn, 1);
+    });
+}
+
+#[test]
+fn without_retry_a_failed_dial_is_surfaced() {
+    reset();
+    run(async {
+        // retry_connection defaults off.
+        let pool = Pool::builder().max_size(1).build(Mgr);
+        let local = pool.local();
+
+        FAIL_CONNECT.with(|f| f.set(true));
+        assert!(matches!(local.get().await, Err(RunError::User(_))));
+    });
+}

@@ -15,6 +15,7 @@ pub(crate) struct PoolConfig {
     pub idle_timeout: Option<Duration>,
     pub max_lifetime: Option<Duration>,
     pub test_on_check_out: bool,
+    pub retry_connection: bool,
 }
 
 impl Default for PoolConfig {
@@ -26,6 +27,7 @@ impl Default for PoolConfig {
             idle_timeout: Some(Duration::from_secs(10 * 60)),
             max_lifetime: Some(Duration::from_secs(30 * 60)),
             test_on_check_out: true,
+            retry_connection: false,
         }
     }
 }
@@ -100,6 +102,21 @@ impl<M: ManageConnection> Builder<M> {
     /// checked out. Default `true`.
     pub fn test_on_check_out(mut self, yes: bool) -> Self {
         self.config.test_on_check_out = yes;
+        self
+    }
+
+    /// Retry a failed [`connect`](ManageConnection::connect) rather than failing
+    /// the [`get`](crate::LocalPool::get) on the first error.
+    ///
+    /// With this on, a dial that errors is retried — after a short pause, so a
+    /// hard-down backend is not hammered — until one succeeds or the caller's
+    /// [`connection_timeout`](Self::connection_timeout) runs out, at which point
+    /// `get` returns [`RunError::TimedOut`]. With it off (the default), the first
+    /// error comes straight back as [`RunError::User`]. Only `get` retries;
+    /// [`try_get`](crate::LocalPool::try_get), which never waits, ignores this.
+    /// Default `false`.
+    pub fn retry_connection(mut self, yes: bool) -> Self {
+        self.config.retry_connection = yes;
         self
     }
 
