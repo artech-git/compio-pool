@@ -71,7 +71,9 @@ three pieces of state, all `Cell` / `RefCell`:
 2. **Open.** If none is idle and the slot count is below `max_size`, claim a slot and `await` the
    manager's `connect`.
 3. **Wait.** Otherwise register one waker and park up to `connection_timeout`, then retry; a
-   timeout returns `RunError::TimedOut`.
+   timeout returns `RunError::TimedOut`. Waiters form a FIFO: each returned connection or freed
+   slot wakes the oldest one only, so a return costs one task poll however deep the queue is, and
+   a woken waiter that gives up before acting (its timeout won the race) hands the wake on.
 
 The returned `PooledConnection` derefs to the connection. On **drop** the pool asks the manager
 `has_broken` and checks `idle_timeout` / `max_lifetime`: a healthy, in-date connection is pushed

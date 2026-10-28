@@ -1,4 +1,4 @@
-# 0010 — Metrics is an off-by-default, zero-cost observer
+# 0011 — Metrics is an off-by-default, zero-cost observer
 
 ## Constraint
 

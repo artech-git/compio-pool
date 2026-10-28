@@ -14,7 +14,7 @@ Split the pool in two along exactly that line:
 
 * **`Pool<M>`** is the blueprint: `Arc<Shared<M>>` holding the manager, the `PoolConfig`, the
   shutdown flag ([0006](0006-shutdown-and-the-unwinding-thread.md)) and the metrics registry
-  ([0010](0010-metrics-zero-cost-observer.md)). It is `Send + Sync + Clone`; cloning is an `Arc`
+  ([0011](0011-metrics-zero-cost-observer.md)). It is `Send + Sync + Clone`; cloning is an `Arc`
   bump. It is the only thing that crosses threads.
 * **`LocalPool<M>`** is the pool itself: `Rc<Inner<M>>` holding the idle free-list, the slot count
   and the waiter list, all `Cell` / `RefCell`. `Pool::local` stamps one out on the calling thread;

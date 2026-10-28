@@ -22,7 +22,8 @@ from either.
 | [0006](0006-shutdown-and-the-unwinding-thread.md) | Shutdown is a shared flag, not a cross-thread wake | `close` is not instantaneous; a parked `get` waits for a local wake or its timeout |
 | [0007](0007-linux-only.md) | Linux is the only supported target | No macOS or Windows runs; CI is Ubuntu only |
 | [0009](0009-core-affinity-harness.md) | Core affinity is an opt-in, feature-gated harness (`cpu::CoreSet` + `workers::PerCore`) | A sysfs topology reader to maintain; graceful shutdown stays yours; `0008` is reserved for the reuseport plan |
-| [0010](0010-metrics-zero-cost-observer.md) | Metrics is an off-by-default, zero-cost observer feature | Counters read zero without the feature; a registry lock on the cold scrape path |
+| [0010](0010-wake-one-fifo.md) | A returned connection or freed slot wakes one waiter, oldest first; a woken waiter that is dropped hands the wake on | Strict FIFO, no priority; a sorted-by-id queue invariant to keep when touching `Waiters` |
+| [0011](0011-metrics-zero-cost-observer.md) | Metrics is an off-by-default, zero-cost observer feature | Counters read zero without the feature; a registry lock on the cold scrape path |
 
 Related reading: [../architecture.md](../architecture.md) for what the code does, and
 [../operations.md](../operations.md) for running it.
