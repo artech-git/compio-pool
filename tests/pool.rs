@@ -954,3 +954,46 @@ fn without_retry_a_failed_dial_is_surfaced() {
         assert!(matches!(local.get().await, Err(RunError::User(_))));
     });
 }
+
+#[test]
+fn local_pool_reports_whether_it_is_closed() {
+    reset();
+    run(async {
+        let pool = Pool::builder().max_size(1).build(Mgr).unwrap();
+        let local = pool.local();
+        assert!(!local.is_closed());
+        pool.close();
+        assert!(local.is_closed());
+    });
+}
+
+#[test]
+fn builder_is_clone_and_debug_without_bounding_the_manager() {
+    // Mgr is neither Clone nor Debug; the builder still is.
+    let builder = Pool::<Mgr>::builder().max_size(7);
+    let clone = builder.clone();
+    assert!(format!("{clone:?}").contains("Builder"));
+    let pool = clone.build(Mgr).unwrap();
+    let _manager: &Mgr = pool.manager();
+    assert_eq!(pool.max_size(), 7);
+}
+
+#[test]
+fn pooled_connection_as_ref_and_as_mut() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .build(Mgr)
+            .unwrap();
+        let local = pool.local();
+        let mut conn = local.get().await.unwrap();
+
+        let r: &u32 = conn.as_ref();
+        assert_eq!(*r, 1);
+        let m: &mut u32 = conn.as_mut();
+        *m = 42;
+        assert_eq!(*conn.as_ref(), 42);
+    });
+}

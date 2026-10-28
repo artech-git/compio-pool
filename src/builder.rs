@@ -77,6 +77,25 @@ impl<M: ManageConnection> Default for Builder<M> {
     }
 }
 
+// Hand-written so the manager type carries no `Clone` / `Debug` bound of its own:
+// only the configuration is cloned or shown.
+impl<M: ManageConnection> Clone for Builder<M> {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<M: ManageConnection> fmt::Debug for Builder<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Builder")
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
 impl<M: ManageConnection> Builder<M> {
     /// A builder with the default settings.
     pub fn new() -> Self {

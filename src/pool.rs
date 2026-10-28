@@ -115,6 +115,12 @@ impl<M: ManageConnection> Pool<M> {
         self.shared.config.max_size
     }
 
+    /// The manager this pool was built with, shared by every thread's
+    /// [`LocalPool`].
+    pub fn manager(&self) -> &M {
+        &self.shared.manager
+    }
+
     /// Make this thread's pool.
     ///
     /// Each call creates an **independent** [`LocalPool`] bound to the calling
@@ -614,6 +620,12 @@ impl<M: ManageConnection> LocalPool<M> {
     /// The per-thread ceiling on open connections.
     pub fn max_size(&self) -> u32 {
         self.inner.shared.config.max_size
+    }
+
+    /// Whether the pool has been [`closed`](Pool::close). Once it is,
+    /// [`get`](Self::get) and [`try_get`](Self::try_get) hand out nothing.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed()
     }
 
     /// A snapshot of **this thread's** open, idle and waiting counts. Lock-free,
@@ -1122,6 +1134,18 @@ impl<M: ManageConnection> DerefMut for PooledConnection<M> {
             .as_mut()
             .expect("connection present until drop")
             .raw
+    }
+}
+
+impl<M: ManageConnection> AsRef<M::Connection> for PooledConnection<M> {
+    fn as_ref(&self) -> &M::Connection {
+        self
+    }
+}
+
+impl<M: ManageConnection> AsMut<M::Connection> for PooledConnection<M> {
+    fn as_mut(&mut self) -> &mut M::Connection {
+        self
     }
 }
 
