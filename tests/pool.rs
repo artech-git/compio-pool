@@ -855,3 +855,39 @@ fn take_removes_a_connection_and_frees_its_slot() {
         );
     });
 }
+
+#[cfg(feature = "metrics")]
+#[test]
+fn statistics_count_manual_connection_closes() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(3)
+            .test_on_check_out(false)
+            .build(Mgr);
+        let local = pool.local();
+
+        // Open two distinct connections, return both idle, then drain them by hand.
+        let a = local.get().await.unwrap();
+        let b = local.get().await.unwrap();
+        drop(a);
+        drop(b);
+        assert_eq!(local.clear(), 2);
+        assert_eq!(
+            local.statistics().connections_closed_manual,
+            2,
+            "clear() drops"
+        );
+
+        // A connection returned to a closed pool is dropped and counted too.
+        let c = local.get().await.unwrap();
+        pool.close();
+        drop(c);
+        let s = local.statistics();
+        assert_eq!(s.connections_closed_manual, 3, "closed-pool return counts");
+        assert_eq!(
+            s.connections_created, 3,
+            "three opened; created minus every close is zero live"
+        );
+    });
+}

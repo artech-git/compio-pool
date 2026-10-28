@@ -245,6 +245,11 @@ pub struct Statistics {
     pub connections_closed_idle_timeout: u64,
     /// Connections dropped for passing [`max_lifetime`](Builder::max_lifetime).
     pub connections_closed_max_lifetime: u64,
+    /// Connections dropped by hand rather than by age or health: drained with
+    /// [`clear`](LocalPool::clear), or returned to a pool that was already
+    /// [`closed`](Pool::close). Connections handed off with
+    /// [`PooledConnection::take`] are not counted — they leave the pool alive.
+    pub connections_closed_manual: u64,
     /// Total time [`get`](LocalPool::get) callers spent parked waiting, across the
     /// `get_waited` calls.
     pub total_wait_time: Duration,
@@ -268,6 +273,7 @@ impl Statistics {
         self.connections_closed_broken += other.connections_closed_broken;
         self.connections_closed_idle_timeout += other.connections_closed_idle_timeout;
         self.connections_closed_max_lifetime += other.connections_closed_max_lifetime;
+        self.connections_closed_manual += other.connections_closed_manual;
         self.total_wait_time += other.total_wait_time;
     }
 }
@@ -301,6 +307,7 @@ struct Metrics {
     connections_closed_broken: AtomicU64,
     connections_closed_idle_timeout: AtomicU64,
     connections_closed_max_lifetime: AtomicU64,
+    connections_closed_manual: AtomicU64,
     wait_micros: AtomicU64,
 }
 
@@ -349,6 +356,7 @@ impl Metrics {
             connections_closed_broken: self.connections_closed_broken.load(Relaxed),
             connections_closed_idle_timeout: self.connections_closed_idle_timeout.load(Relaxed),
             connections_closed_max_lifetime: self.connections_closed_max_lifetime.load(Relaxed),
+            connections_closed_manual: self.connections_closed_manual.load(Relaxed),
             total_wait_time: Duration::from_micros(self.wait_micros.load(Relaxed)),
         }
     }
@@ -374,6 +382,10 @@ impl Metrics {
             (
                 &self.connections_closed_max_lifetime,
                 &into.connections_closed_max_lifetime,
+            ),
+            (
+                &self.connections_closed_manual,
+                &into.connections_closed_manual,
             ),
             (&self.wait_micros, &into.wait_micros),
         ] {
@@ -515,6 +527,17 @@ impl<M: ManageConnection> Inner<M> {
     }
     #[cfg(not(feature = "metrics"))]
     fn note_broken(&self) {}
+
+    /// Count `n` connections closed by hand (a `clear`, or a return to a closed
+    /// pool). Metrics-only; a no-op otherwise.
+    #[cfg(feature = "metrics")]
+    fn note_closed_manual(&self, n: u32) {
+        self.metrics
+            .connections_closed_manual
+            .fetch_add(u64::from(n), Relaxed);
+    }
+    #[cfg(not(feature = "metrics"))]
+    fn note_closed_manual(&self, _n: u32) {}
 }
 
 impl<M: ManageConnection> Drop for Inner<M> {
@@ -747,6 +770,7 @@ impl<M: ManageConnection> LocalPool<M> {
         if n > 0 {
             #[cfg(feature = "metrics")]
             self.inner.metrics.dec_idle(n);
+            self.inner.note_closed_manual(n);
             self.inner.release_slots(n);
         }
         // Hand the freed capacity to waiting tasks. This runs even when nothing
@@ -1091,6 +1115,7 @@ impl<M: ManageConnection> Drop for PooledConnection<M> {
             // A closing pool keeps nothing; drop and free the slot.
             if self.inner.closed() {
                 drop(conn);
+                self.inner.note_closed_manual(1);
                 self.inner.release_slot();
                 return;
             }
