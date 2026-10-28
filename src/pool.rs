@@ -208,6 +208,7 @@ impl<M: ManageConnection> fmt::Debug for Pool<M> {
 /// A snapshot of live connection counts. From [`LocalPool::state`] it is one
 /// thread's; from [`Pool::state`] it is the sum across every thread.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct State {
     /// Open connections right now: idle plus checked out.
     pub connections: u32,
@@ -224,6 +225,7 @@ pub struct State {
 /// separately), so two snapshots subtracted give the activity in between — the
 /// shape a metrics exporter wants.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Statistics {
     /// [`get`](LocalPool::get) calls served without waiting — an idle connection
     /// was ready, or there was room to open one straight away.
