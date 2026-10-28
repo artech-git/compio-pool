@@ -39,6 +39,9 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo clippy --all-targets --features affinity --locked -- -D warnings
       - run: cargo clippy --all-targets --features metrics --locked -- -D warnings
+      # Both features at once: they share code (the metrics counters run inside the
+      # affinity harness's workers), so the combination is its own configuration.
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
     name: Test (${{ matrix.toolchain }})
@@ -80,6 +83,14 @@ jobs:
         run: cargo test --all-targets --features metrics --locked
       - name: Doc tests (metrics)
         run: cargo test --doc --features metrics --locked
+      # Both features together — nothing else exercises affinity and metrics in
+      # the same build, and they share code.
+      - name: Build (all features)
+        run: cargo build --all-targets --all-features --locked
+      - name: Test (all features)
+        run: cargo test --all-targets --all-features --locked
+      - name: Doc tests (all features)
+        run: cargo test --doc --all-features --locked
 
   msrv:
     name: MSRV (1.95)
