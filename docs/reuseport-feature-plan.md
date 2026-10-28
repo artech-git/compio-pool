@@ -44,7 +44,7 @@ and it is the reason (b)+(a) are unconditional while (c) is feature-gated.
 
 ## 2. Scope
 
-Most of it is one new file, [`src/reuseport.rs`](../src/reuseport.rs) (a rename of `listener.rs`;
+Most of it is one new file, `src/reuseport.rs` (a rename of `listener.rs`;
 it now covers datagrams too, so `listener` is the wrong name). Around it:
 
 | area | change |

@@ -152,8 +152,9 @@ impl<M: ManageConnection> Builder<M> {
     /// With this on, a dial that errors is retried — after a short pause, so a
     /// hard-down backend is not hammered — until one succeeds or the caller's
     /// [`connection_timeout`](Self::connection_timeout) runs out, at which point
-    /// `get` returns [`RunError::TimedOut`]. With it off (the default), the first
-    /// error comes straight back as [`RunError::User`]. Only `get` retries;
+    /// `get` returns [`RunError::TimedOut`](crate::RunError::TimedOut). With it off
+    /// (the default), the first error comes straight back as
+    /// [`RunError::User`](crate::RunError::User). Only `get` retries;
     /// [`try_get`](crate::LocalPool::try_get), which never waits, ignores this.
     /// Default `false`.
     pub fn retry_connection(mut self, yes: bool) -> Self {
