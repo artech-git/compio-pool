@@ -122,11 +122,14 @@ the slot goes back. Only `into_pooled` / `into_idle` commit it.
 
 ## Waiting and waking
 
-`Waiters` holds one `Waker` per parked `get`. Each waiter owns an id and withdraws its waker if
-its future is dropped before it resolves, so nothing stale is ever woken. Every slot release and
-every connection returned to the idle list calls `wake_all`; a woken task re-runs the synchronous
-check-and-take, so waking more than one is safe — at most one takes the freed slot and the rest
-re-park.
+`Waiters` holds one `Waker` per parked `get`, oldest at the front. Each waiter owns an id and
+withdraws its waker if its future is dropped before it resolves, so nothing stale is ever woken.
+Each freed slot or connection returned to the idle list wakes exactly one waiter — the oldest — so
+a return costs a single task poll however deep the queue is, and a waiter woken but dropped before
+it acts hands the wake on to the next. A closed pool is the one exception: it wakes everyone, since
+there is nothing left to ration. A woken task re-runs the synchronous check-and-take, so a wake it
+loses the race for is harmless — it simply re-parks. See
+[decision 0010](decisions/0010-wake-one-fifo.md).
 
 ## Maintenance
 

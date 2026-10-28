@@ -17,7 +17,7 @@ from either.
 | [0001](0001-listener-per-worker.md) | One `SO_REUSEPORT` listener per pinned worker; the kernel distributes connections by flow hash | No admission control before accept; distribution is only as even as the hash |
 | [0002](0002-blueprint-and-local-pool.md) | A `Send` blueprint (`Pool`) cloned onto each thread stamps out a `!Send` per-thread `LocalPool` | Every size is per-thread; no work-stealing or connection sharing between threads |
 | [0003](0003-reserve-before-create.md) | The slot is reserved synchronously (an RAII `Held`) before `connect` is awaited | The slot count includes reservations in flight, not just live connections |
-| [0004](0004-claim-without-holding-a-slot.md) | `get` waits for room without holding a slot, then wakes all and re-checks | A benign retry when another task wins the slot first |
+| [0004](0004-claim-without-holding-a-slot.md) | `get` waits for room without holding a slot, then re-checks after it wakes | A benign retry when another task wins the slot first |
 | [0005](0005-incoming-cpu-opt-in.md) | `SO_INCOMING_CPU` is off until the NIC is tuned | You flip one switch (`bind_reuseport`'s `incoming_cpu`) after running the script |
 | [0006](0006-shutdown-and-the-unwinding-thread.md) | Shutdown is a shared flag, not a cross-thread wake | `close` is not instantaneous; a parked `get` waits for a local wake or its timeout |
 | [0007](0007-linux-only.md) | Linux is the only supported target | No macOS or Windows runs; CI is Ubuntu only |
