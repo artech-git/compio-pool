@@ -1,4 +1,4 @@
-# 0004 — Wait for room without holding a slot; wake all and re-check
+# 0004 — Wait for room without holding a slot, then re-check
 
 ## Constraint
 
@@ -19,18 +19,17 @@ is non-empty, or `slots < max_size`, or the pool is closed — and reserves **no
 it wakes does `get` do the synchronous check-and-take (`pop_fresh_idle`, then `try_reserve`). If
 another task won the slot in between, both return nothing and the loop simply waits again.
 
-Every slot release and every connection returned to the idle list calls `wake_all`. Waking more
-than one waiter is deliberate and safe: each re-runs the synchronous check, at most one takes the
-freed slot, and the rest re-park. Each waiter owns an id and withdraws its waker if its future is
-dropped before it resolves, so nothing stale is ever woken.
+The re-check is what makes a wake safe: a woken waiter never assumes the capacity it was woken for
+is still there — it looks again, and if another task took it first, re-parks. Each waiter owns an id
+and withdraws its waker if its future is dropped before it resolves, so nothing stale is ever woken.
+*How many* waiters a release wakes is a separate question, decided in
+[0010](0010-wake-one-fifo.md): one, oldest first. This record only fixes that a parked waiter holds
+no slot and always re-checks after waking.
 
 ## Rejected
 
 * **Reserve a slot, then wait.** Race-free, but the reservation sits idle while the waiter waits
   for work that may never come; at `max_size = 1` the thread could never serve anything.
-* **Wake exactly one waiter per release.** A `wait_ready` waiter woken for a slot it does not
-  consume could strand another waiter while a slot is actually free. `wake_all` + re-check removes
-  that class of bug for the cost of a few spurious wakes.
 * **A cross-thread parking primitive (condvar, semaphore).** There is nothing to synchronise across
   threads — the pool is single-threaded ([0002](0002-blueprint-and-local-pool.md)); plain task
   wakers on the owning thread suffice.
@@ -38,6 +37,6 @@ dropped before it resolves, so nothing stale is ever woken.
 ## Costs
 
 * A benign retry: a woken `get` that lost the race goes round the loop once more. No syscall, no
-  reservation is churned — it re-parks on the same waiter list.
-* `wake_all` is O(waiters) on each release, bounded by the thread's own in-flight `get` count. On a
-  thread that is merely busy, not saturated, the waiter list is empty and the wake is free.
+  reservation is churned — it re-parks on the same waiter list. With the wake-one policy of
+  [0010](0010-wake-one-fifo.md) this is rare; it takes a same-thread task slipping in between the
+  wake and the waiter's next poll.
