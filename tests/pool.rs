@@ -267,6 +267,54 @@ fn warm_refills_the_idle_floor_after_checkouts() {
     });
 }
 
+#[test]
+fn state_reports_live_counts_without_the_metrics_feature() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(3)
+            .test_on_check_out(false)
+            .build(Mgr);
+        let local = pool.local();
+
+        let a = local.get().await.unwrap();
+        let b = local.get().await.unwrap();
+        let s = local.state();
+        assert_eq!(s.connections, 2, "two leased");
+        assert_eq!(s.idle_connections, 0);
+        assert_eq!(s.pending_waiters, 0);
+
+        drop(a); // returns to the idle list
+        let s = local.state();
+        assert_eq!(s.connections, 2, "still two open");
+        assert_eq!(s.idle_connections, 1, "one of them now idle");
+        drop(b);
+    });
+}
+
+#[test]
+fn state_counts_pending_waiters_without_the_metrics_feature() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .connection_timeout(Duration::from_secs(5))
+            .build(Mgr);
+        let local = pool.local();
+
+        let held = local.get().await.unwrap();
+        let w = local.clone();
+        let task = compio::runtime::spawn(async move { w.get().await.map(|c| *c) });
+        compio::time::sleep(Duration::from_millis(20)).await; // parked
+
+        assert_eq!(local.state().pending_waiters, 1);
+        drop(held); // wakes the waiter
+        let _ = task.await.unwrap();
+        assert_eq!(local.state().pending_waiters, 0);
+    });
+}
+
 #[cfg(feature = "metrics")]
 #[test]
 fn statistics_count_direct_reuse_and_creation() {
