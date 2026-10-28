@@ -774,3 +774,58 @@ fn reap_can_drop_a_connection_that_reenters_the_pool() {
         DROP_POOL.with(|p| *p.borrow_mut() = None);
     });
 }
+
+#[test]
+fn try_get_returns_none_at_capacity_instead_of_waiting() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .build(Mgr);
+        let local = pool.local();
+
+        let held = local.get().await.unwrap(); // the one slot is taken
+        let start = Instant::now();
+        assert!(
+            local.try_get().await.unwrap().is_none(),
+            "at capacity -> None"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "try_get() waited instead of returning at once"
+        );
+
+        drop(held);
+        assert!(local.try_get().await.unwrap().is_some(), "slot free again");
+    });
+}
+
+#[test]
+fn try_get_reuses_an_idle_connection_or_opens_one() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(2)
+            .test_on_check_out(false)
+            .build(Mgr);
+        let local = pool.local();
+
+        let a = local.try_get().await.unwrap().expect("room to open one");
+        let first = *a;
+        drop(a); // back to idle
+        let b = local.try_get().await.unwrap().expect("reuses the idle one");
+        assert_eq!(*b, first, "same connection came back, no new dial");
+    });
+}
+
+#[test]
+fn try_get_on_a_closed_pool_errors() {
+    reset();
+    run(async {
+        let pool = Pool::builder().max_size(1).build(Mgr);
+        let local = pool.local();
+        pool.close();
+        assert!(matches!(local.try_get().await, Err(RunError::Closed)));
+    });
+}
