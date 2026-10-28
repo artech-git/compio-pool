@@ -10,7 +10,7 @@ use std::{
     future::Future,
     rc::Rc,
     task::{Context, Waker},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use compio_pool::{ManageConnection, Pool, RunError};
@@ -20,6 +20,7 @@ thread_local! {
     static FAIL_CONNECT: Cell<bool> = const { Cell::new(false) };
     static INVALID_ONCE: Cell<bool> = const { Cell::new(false) };
     static BROKEN: Cell<bool> = const { Cell::new(false) };
+    static SLOW_CONNECT: Cell<Option<Duration>> = const { Cell::new(None) };
 }
 
 fn reset() {
@@ -27,6 +28,7 @@ fn reset() {
     FAIL_CONNECT.with(|c| c.set(false));
     INVALID_ONCE.with(|c| c.set(false));
     BROKEN.with(|c| c.set(false));
+    SLOW_CONNECT.with(|c| c.set(None));
 }
 
 #[derive(Debug)]
@@ -47,6 +49,9 @@ impl ManageConnection for Mgr {
     type Error = TestError;
 
     async fn connect(&self) -> Result<u32, TestError> {
+        if let Some(d) = SLOW_CONNECT.with(|c| c.get()) {
+            compio::time::sleep(d).await;
+        }
         if FAIL_CONNECT.with(|f| f.replace(false)) {
             return Err(TestError("connect failed"));
         }
@@ -208,6 +213,34 @@ fn warm_opens_min_idle_up_front() {
             assert_eq!(state.connections, 3);
             assert_eq!(state.idle_connections, 3);
         }
+    });
+}
+
+#[test]
+fn warm_times_out_on_a_hanging_connect() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(2)
+            .min_idle(2)
+            .connection_timeout(Duration::from_millis(100))
+            .build(Mgr);
+        let local = pool.local();
+
+        // A backend that never answers must not wedge warm() forever: each dial
+        // is bounded by connection_timeout.
+        SLOW_CONNECT.with(|c| c.set(Some(Duration::from_secs(10))));
+        let start = Instant::now();
+        assert!(matches!(local.warm().await, Err(RunError::TimedOut)));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "warm() ignored connection_timeout"
+        );
+
+        // The slot the timed-out dial reserved was freed, so a normal get()
+        // succeeds once the backend recovers.
+        SLOW_CONNECT.with(|c| c.set(None));
+        assert!(local.get().await.is_ok());
     });
 }
 
