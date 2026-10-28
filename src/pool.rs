@@ -1040,6 +1040,27 @@ pub struct PooledConnection<M: ManageConnection> {
     conn: Option<Conn<M::Connection>>,
 }
 
+impl<M: ManageConnection> PooledConnection<M> {
+    /// Remove this connection from the pool and hand it to the caller.
+    ///
+    /// The slot it held is freed at once — so the pool may open another in its
+    /// place, and a waiter is woken for it — and the connection does **not** go
+    /// back on the idle list when this value drops. It becomes the caller's, to
+    /// use and to close. Reach for it when a connection has left the pool's
+    /// borrow-and-return rhythm for good: a Redis `SUBSCRIBE`, a socket upgraded to
+    /// a streaming protocol, and the like.
+    pub fn take(mut self) -> M::Connection {
+        let conn = self
+            .conn
+            .take()
+            .expect("a live PooledConnection always holds a connection");
+        // Free the slot and wake a waiter now. With `conn` taken, this value's
+        // Drop finds nothing to return and does nothing.
+        self.inner.release_slot();
+        conn.raw
+    }
+}
+
 impl<M: ManageConnection> Deref for PooledConnection<M> {
     type Target = M::Connection;
 

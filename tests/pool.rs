@@ -829,3 +829,29 @@ fn try_get_on_a_closed_pool_errors() {
         assert!(matches!(local.try_get().await, Err(RunError::Closed)));
     });
 }
+
+#[test]
+fn take_removes_a_connection_and_frees_its_slot() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .build(Mgr);
+        let local = pool.local();
+
+        let conn = local.get().await.unwrap();
+        let id = *conn;
+        let raw = conn.take(); // leaves the pool entirely
+        assert_eq!(raw, id, "take() hands back the underlying connection");
+
+        // The slot is free (take did not park it on the idle list), so a new get()
+        // opens a fresh connection rather than timing out on a leaked slot.
+        assert_eq!(local.state().connections, 0, "take() freed the slot");
+        let next = local.get().await.unwrap();
+        assert_ne!(
+            *next, id,
+            "a fresh connection; the taken one did not return"
+        );
+    });
+}
