@@ -211,6 +211,29 @@ fn warm_opens_min_idle_up_front() {
     });
 }
 
+#[test]
+fn warm_refills_the_idle_floor_after_checkouts() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(5)
+            .min_idle(3)
+            .test_on_check_out(false)
+            .build(Mgr);
+        let local = pool.local();
+
+        // Three connections leased, none idle. The floor is three idle, and there
+        // is room for two more before max_size, so warm() opens two — it refills
+        // the idle floor rather than counting the three already-open slots as
+        // meeting it.
+        let a = local.get().await.unwrap();
+        let b = local.get().await.unwrap();
+        let c = local.get().await.unwrap();
+        assert_eq!(local.warm().await.unwrap(), 2);
+        drop((a, b, c));
+    });
+}
+
 #[cfg(feature = "metrics")]
 #[test]
 fn statistics_count_direct_reuse_and_creation() {

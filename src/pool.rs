@@ -434,6 +434,11 @@ impl<M: ManageConnection> Inner<M> {
         self.slots.get()
     }
 
+    /// Connections currently idle on the free list.
+    fn idle_len(&self) -> u32 {
+        self.idle.borrow().len() as u32
+    }
+
     /// Reserve a slot. Mirrors the live gauge when metrics are on.
     fn take_slot(&self) {
         self.slots.set(self.slots.get() + 1);
@@ -604,19 +609,27 @@ impl<M: ManageConnection> LocalPool<M> {
         Statistics::default()
     }
 
-    /// Open connections up to [`min_idle`](Builder::min_idle) and park them on the
-    /// idle list. Returns how many were created. Tops up to the floor each time it
-    /// is called, so it doubles as the warm-up and the min-idle maintenance step;
-    /// [`maintain`](Self::maintain) pairs it with a reap. A no-op (returns `Ok(0)`)
-    /// once the pool is [`closed`](Pool::close). Stops early and returns
-    /// [`RunError::User`] if the manager fails to connect.
+    /// Open connections until [`min_idle`](Builder::min_idle) of them are idle on
+    /// the free list, and park the new ones there. Returns how many were created.
+    ///
+    /// It counts the *idle* connections, not the total, so it refills the floor
+    /// after a burst of checkouts has drained it — with three of five connections
+    /// leased and `min_idle(3)`, it opens two more (room permitting) rather than
+    /// seeing three slots already taken and opening none. Creation stops at
+    /// [`max_size`](Builder::max_size), so a thread already full of leased
+    /// connections may finish below the floor until some return.
+    ///
+    /// Tops up each time it is called, so it doubles as the warm-up and the
+    /// min-idle maintenance step; [`maintain`](Self::maintain) pairs it with a
+    /// reap. A no-op (returns `Ok(0)`) once the pool is [`closed`](Pool::close).
+    /// Stops early and returns [`RunError::User`] if the manager fails to connect.
     pub async fn warm(&self) -> Result<u32, RunError<M::Error>> {
         if self.inner.closed() {
             return Ok(0);
         }
         let target = self.inner.shared.config.min_idle;
         let mut made = 0;
-        while self.inner.connections() < target {
+        while self.inner.idle_len() < target {
             let Some(mut held) = self.try_reserve() else {
                 break;
             };
