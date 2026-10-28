@@ -104,7 +104,10 @@ fn main() -> io::Result<()> {
         .unwrap_or(1024);
 
     std::fs::create_dir_all(&*WAL_DIR)?;
-    let pool = Pool::builder().max_size(capacity).build(WalManager);
+    let pool = Pool::builder()
+        .max_size(capacity)
+        .build(WalManager)
+        .expect("max_size is nonzero");
 
     let cores = cpu::cores();
     if cores.is_empty() {

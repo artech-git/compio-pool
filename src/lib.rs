@@ -85,7 +85,7 @@
 //! }
 //!
 //! // Build once; `Pool` is `Send + Clone`, so hand a clone to each thread.
-//! let pool = Pool::builder().max_size(1024).build(Buffers);
+//! let pool = Pool::builder().max_size(1024).build(Buffers).unwrap();
 //!
 //! // On each compio thread you spawn (see `examples/echo.rs` for the full
 //! // pinned, SO_REUSEPORT thread-per-core setup):
@@ -130,7 +130,7 @@ pub mod pool;
 #[cfg_attr(docsrs, doc(cfg(feature = "affinity")))]
 pub mod workers;
 
-pub use builder::Builder;
+pub use builder::{BuildError, Builder};
 pub use cpu::CoreId;
 #[cfg(feature = "affinity")]
 pub use cpu::{CoreInfo, CoreSet};

@@ -119,7 +119,7 @@ impl ManageConnection for Buffers {
 }
 
 // Build once; `Pool` is `Send + Clone`, so hand a clone to each thread.
-let pool = Pool::builder().max_size(1024).build(Buffers);
+let pool = Pool::builder().max_size(1024).build(Buffers).unwrap();
 
 // On each compio thread you spawn (see `examples/echo.rs` for the full
 // pinned, SO_REUSEPORT thread-per-core setup):
@@ -156,7 +156,7 @@ single-tenant tools.
 ```rust
 #[compio::main]
 async fn main() -> std::io::Result<()> {
-    let pool = Pool::builder().max_size(16).build(Buffers);
+    let pool = Pool::builder().max_size(16).build(Buffers).unwrap();
     let local = pool.local();          // this runtime's pool
     let mut buf = local.get().await?;  // lease, returned on drop
     buf.clear();
@@ -174,7 +174,7 @@ use compio::runtime::Runtime;
 
 let runtime = Runtime::builder().build()?;
 runtime.block_on(async {
-    let pool = Pool::builder().max_size(16).build(Buffers);
+    let pool = Pool::builder().max_size(16).build(Buffers).unwrap();
     let local = pool.local();
     // ... accept loop / client work on this one ring ...
 });
@@ -306,7 +306,7 @@ let pool = Pool::builder()
     .max_size(16)
     .min_idle(4)
     .connection_timeout(Duration::from_secs(5))
-    .build(manager);
+    .build(manager).unwrap();
 ```
 
 ---

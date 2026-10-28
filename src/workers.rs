@@ -21,7 +21,7 @@
 //! #     fn has_broken(&self, _: &mut Vec<u8>) -> bool { false }
 //! # }
 //!
-//! let pool = Pool::builder().max_size(1024).build(Buffers);
+//! let pool = Pool::builder().max_size(1024).build(Buffers).unwrap();
 //! // One pinned worker per physical core, spread across the machine:
 //! let workers = PerCore::new(CoreSet::permitted().physical_only().spread())
 //!     .name("echo")

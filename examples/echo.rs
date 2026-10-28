@@ -57,7 +57,10 @@ fn main() -> io::Result<()> {
         .unwrap_or(1024);
 
     // Build the pool once. `Pool` is `Send + Clone`; every worker gets a clone.
-    let pool = Pool::builder().max_size(capacity).build(Buffers);
+    let pool = Pool::builder()
+        .max_size(capacity)
+        .build(Buffers)
+        .expect("max_size is nonzero");
 
     // `PerCore` owns the per-core boilerplate: it spawns one thread per core,
     // pins it, and builds that thread's `compio` runtime. Each worker still binds
