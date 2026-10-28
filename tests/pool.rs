@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use compio_pool::{ManageConnection, Pool, RunError};
+use compio_pool::{LocalPool, ManageConnection, Pool, RunError};
 
 thread_local! {
     static CREATED: Cell<u32> = const { Cell::new(0) };
@@ -686,5 +686,91 @@ fn close_rejects_gets_and_drops_returns() {
             assert_eq!(local.state().connections, 0);
             assert_eq!(local.state().idle_connections, 0);
         }
+    });
+}
+
+// A connection that reaches back into its own pool when dropped — the exact
+// hazard reap()/clear() must not trip by dropping while the idle list is borrowed.
+thread_local! {
+    static DROP_POOL: RefCell<Option<LocalPool<DropMgr>>> = const { RefCell::new(None) };
+    static DROP_SAW_IDLE: Cell<i64> = const { Cell::new(-1) };
+}
+
+struct ReentrantConn;
+
+impl Drop for ReentrantConn {
+    fn drop(&mut self) {
+        // Reads state(), which borrows the idle list. If this runs while
+        // reap()/clear() still hold that borrow it panics; the deferred-drop fix
+        // is what lets it succeed.
+        DROP_POOL.with(|p| {
+            if let Some(local) = p.borrow().as_ref() {
+                DROP_SAW_IDLE.with(|c| c.set(i64::from(local.state().idle_connections)));
+            }
+        });
+    }
+}
+
+struct DropMgr;
+
+impl ManageConnection for DropMgr {
+    type Connection = ReentrantConn;
+    type Error = TestError;
+    async fn connect(&self) -> Result<ReentrantConn, TestError> {
+        Ok(ReentrantConn)
+    }
+    async fn is_valid(&self, _c: &mut ReentrantConn) -> Result<(), TestError> {
+        Ok(())
+    }
+    fn has_broken(&self, _c: &mut ReentrantConn) -> bool {
+        false
+    }
+}
+
+#[test]
+fn clear_can_drop_a_connection_that_reenters_the_pool() {
+    DROP_SAW_IDLE.with(|c| c.set(-1));
+    run(async {
+        let pool = Pool::builder()
+            .max_size(2)
+            .test_on_check_out(false)
+            .build(DropMgr);
+        let local = pool.local();
+        DROP_POOL.with(|p| *p.borrow_mut() = Some(local.clone()));
+
+        drop(local.get().await.unwrap()); // one connection, now idle
+        assert_eq!(local.clear(), 1);
+        assert_eq!(
+            DROP_SAW_IDLE.with(|c| c.get()),
+            0,
+            "the connection's Drop ran, and after the idle list was emptied"
+        );
+
+        DROP_POOL.with(|p| *p.borrow_mut() = None);
+    });
+}
+
+#[test]
+fn reap_can_drop_a_connection_that_reenters_the_pool() {
+    DROP_SAW_IDLE.with(|c| c.set(-1));
+    run(async {
+        let pool = Pool::builder()
+            .max_size(2)
+            .test_on_check_out(false)
+            .idle_timeout(Some(Duration::from_millis(1)))
+            .build(DropMgr);
+        let local = pool.local();
+        DROP_POOL.with(|p| *p.borrow_mut() = Some(local.clone()));
+
+        drop(local.get().await.unwrap()); // idle
+        compio::time::sleep(Duration::from_millis(5)).await; // age it past idle_timeout
+        assert_eq!(local.reap(), 1);
+        assert_eq!(
+            DROP_SAW_IDLE.with(|c| c.get()),
+            0,
+            "Drop ran after the idle borrow was released"
+        );
+
+        DROP_POOL.with(|p| *p.borrow_mut() = None);
     });
 }

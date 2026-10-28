@@ -671,19 +671,27 @@ impl<M: ManageConnection> LocalPool<M> {
     /// checked out is left to its holder.
     pub fn reap(&self) -> u32 {
         let now = Instant::now();
-        let cfg = &self.inner.shared.config;
-        let mut reaped = 0u32;
+        // Separate the expired connections from the rest under the borrow, but
+        // drop them only after releasing it. A connection's own `Drop` may reach
+        // back into this pool (the idle list, a counter), which would panic if it
+        // ran while we still held the borrow.
+        let mut expired: Vec<Conn<M::Connection>> = Vec::new();
         {
+            let cfg = &self.inner.shared.config;
             let mut idle = self.inner.idle.borrow_mut();
-            idle.retain(|conn| match expiry(conn, now, cfg) {
-                Some(reason) => {
+            let mut kept = Vec::with_capacity(idle.len());
+            for conn in idle.drain(..) {
+                if let Some(reason) = expiry(&conn, now, cfg) {
                     self.inner.note_expired(reason);
-                    reaped += 1;
-                    false
+                    expired.push(conn);
+                } else {
+                    kept.push(conn);
                 }
-                None => true,
-            });
+            }
+            *idle = kept;
         }
+        let reaped = expired.len() as u32;
+        drop(expired);
         if reaped > 0 {
             #[cfg(feature = "metrics")]
             self.inner.metrics.dec_idle(reaped);
@@ -724,12 +732,14 @@ impl<M: ManageConnection> LocalPool<M> {
     /// once [`Pool::close`] has been called. Unlike [`reap`](Self::reap) it ignores
     /// the timeouts and clears unconditionally.
     pub fn clear(&self) -> u32 {
-        let n = {
+        // Move the idle connections out under the borrow, then drop them with the
+        // borrow released — a connection's `Drop` may reach back into the pool.
+        let drained: Vec<Conn<M::Connection>> = {
             let mut idle = self.inner.idle.borrow_mut();
-            let n = idle.len() as u32;
-            idle.clear();
-            n
+            idle.drain(..).collect()
         };
+        let n = drained.len() as u32;
+        drop(drained);
         // Same bookkeeping as `reap`: the dropped connections give their slots
         // back (the count `max_size` is enforced against, metrics or not).
         if n > 0 {
@@ -757,6 +767,16 @@ impl<M: ManageConnection> LocalPool<M> {
     pub async fn get(&self) -> Result<PooledConnection<M>, RunError<M::Error>> {
         if self.inner.closed() {
             return Err(RunError::Closed);
+        }
+        // Fast path: when nothing async has to run — no check-out validation, and a
+        // live idle connection is ready — hand it back without arming a timeout
+        // timer. This is the common hit on a warm pool, and a timer per checkout is
+        // pure overhead there.
+        if !self.inner.shared.config.test_on_check_out
+            && let Some(held) = self.pop_fresh_idle()
+        {
+            self.record_acquire(false, Instant::now());
+            return Ok(held.into_pooled());
         }
         let timeout = self.inner.shared.config.connection_timeout;
         match compio::time::timeout(timeout, self.get_inner()).await {
