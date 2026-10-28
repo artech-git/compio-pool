@@ -439,6 +439,41 @@ fn clear_hands_the_freed_capacity_to_a_parked_waiter() {
 }
 
 #[test]
+fn clear_after_close_wakes_a_waiter_with_nothing_idle() {
+    reset();
+    run(async {
+        let pool = Pool::builder()
+            .max_size(1)
+            .test_on_check_out(false)
+            .connection_timeout(Duration::from_secs(5))
+            .build(Mgr);
+        let local = pool.local();
+
+        let held = local.get().await.unwrap(); // the one slot is taken
+        let waiter = local.clone();
+        let task = compio::runtime::spawn(async move {
+            let start = Instant::now();
+            let errored = waiter.get().await.is_err();
+            (start.elapsed(), errored)
+        });
+        compio::time::sleep(Duration::from_millis(20)).await; // parked
+
+        // `held` stays leased, so nothing is idle for clear() to free. After
+        // close(), clear() must still wake the parked waiter so it fails fast
+        // instead of sitting out the 5s connection_timeout.
+        pool.close();
+        assert_eq!(local.clear(), 0);
+        let (elapsed, errored) = task.await.unwrap();
+        assert!(errored, "a closed pool hands out nothing");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "waiter sat out its timeout instead of being woken: {elapsed:?}"
+        );
+        drop(held);
+    });
+}
+
+#[test]
 fn waiters_are_served_in_arrival_order() {
     reset();
     run(async {

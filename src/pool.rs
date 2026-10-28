@@ -730,14 +730,17 @@ impl<M: ManageConnection> LocalPool<M> {
             n
         };
         // Same bookkeeping as `reap`: the dropped connections give their slots
-        // back (the count `max_size` is enforced against, metrics or not) and the
-        // freed capacity is handed to waiting tasks.
+        // back (the count `max_size` is enforced against, metrics or not).
         if n > 0 {
             #[cfg(feature = "metrics")]
             self.inner.metrics.dec_idle(n);
             self.inner.release_slots(n);
-            self.inner.notify(n);
         }
+        // Hand the freed capacity to waiting tasks. This runs even when nothing
+        // was idle to free: on a closed pool `notify` wakes every waiter, so a
+        // drain after `close` tells a parked `get` to fail fast instead of
+        // leaving it to sit out its whole `connection_timeout`.
+        self.inner.notify(n);
         n
     }
 
