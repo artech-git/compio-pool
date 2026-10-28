@@ -20,6 +20,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     fmt,
     future::Future,
     ops::{Deref, DerefMut},
@@ -37,7 +38,7 @@ use std::{
 // machinery, so they drop out of the build when the feature is off.
 #[cfg(feature = "metrics")]
 use std::sync::{
-    Mutex, PoisonError,
+    Mutex, PoisonError, Weak,
     atomic::{AtomicU32, AtomicU64},
 };
 
@@ -62,10 +63,17 @@ pub(crate) struct Shared<M: ManageConnection> {
     config: PoolConfig,
     /// Set by [`Pool::close`]; read on every `get` and connection return.
     closed: AtomicBool,
-    /// One metrics block per [`LocalPool`] ever created, for process-wide
-    /// aggregation. Locked only when a pool is created or stats are read.
+    /// One metrics block per **live** [`LocalPool`], for process-wide
+    /// aggregation. Held weakly so a pool that has dropped falls out of the
+    /// registry instead of pinning its block forever; dead entries are pruned
+    /// whenever the lock is taken (a pool is created or stats are read).
     #[cfg(feature = "metrics")]
-    metrics: Mutex<Vec<Arc<Metrics>>>,
+    metrics: Mutex<Vec<Weak<Metrics>>>,
+    /// The cumulative counters of every [`LocalPool`] that has since dropped,
+    /// folded in by its `Drop`, so lifetime totals survive the thread that made
+    /// them. Only the cumulative counters are ever written; its gauges stay zero.
+    #[cfg(feature = "metrics")]
+    retired: Metrics,
 }
 
 impl<M: ManageConnection> Clone for Pool<M> {
@@ -85,6 +93,8 @@ impl<M: ManageConnection> Pool<M> {
                 closed: AtomicBool::new(false),
                 #[cfg(feature = "metrics")]
                 metrics: Mutex::new(Vec::new()),
+                #[cfg(feature = "metrics")]
+                retired: Metrics::default(),
             }),
         }
     }
@@ -119,9 +129,11 @@ impl<M: ManageConnection> Pool<M> {
     /// holders drop them.
     ///
     /// The flag is shared, but the wakers that unpark a task waiting in `get` are
-    /// not — they live on each worker's own thread. A task already parked waiting
-    /// for a slot therefore unblocks on its next **local** wake (another
-    /// connection returning, or [`LocalPool::clear`]) or when its
+    /// not — they live on each worker's own thread. Tasks already parked waiting
+    /// for a slot therefore unblock on that thread's next **local** wake (another
+    /// connection returning, a [`reap`](LocalPool::reap), or
+    /// [`LocalPool::clear`]) — the first one to notice the pool is closed passes
+    /// the news down the whole queue — or when their
     /// [`connection_timeout`](Builder::connection_timeout) elapses, not the instant
     /// `close` is called from another thread. For a prompt drain, stop each
     /// worker's accept loop and call [`LocalPool::clear`] on its thread.
@@ -141,17 +153,9 @@ impl<M: ManageConnection> Pool<M> {
     pub fn state(&self) -> State {
         #[cfg(feature = "metrics")]
         {
-            let registry = self
-                .shared
-                .metrics
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
             let mut state = State::default();
-            for m in registry.iter() {
-                state.connections += m.connections.load(Relaxed);
-                state.idle_connections += m.idle.load(Relaxed);
-                state.pending_waiters += m.waiters.load(Relaxed);
-            }
+            self.shared
+                .for_each_live_block(|m| state.add(&m.snapshot_state()));
             state
         }
         #[cfg(not(feature = "metrics"))]
@@ -159,36 +163,36 @@ impl<M: ManageConnection> Pool<M> {
     }
 
     /// Process-wide cumulative counters summed across every thread's
-    /// [`LocalPool`]. Like [`state`](Self::state) it takes the registry lock and is
-    /// meant for a scrape, not the hot path. For one thread's totals use
+    /// [`LocalPool`], including pools whose threads have since exited. Like
+    /// [`state`](Self::state) it takes the registry lock and is meant for a
+    /// scrape, not the hot path. For one thread's totals use
     /// [`LocalPool::statistics`].
     pub fn statistics(&self) -> Statistics {
         #[cfg(feature = "metrics")]
         {
-            let registry = self
-                .shared
-                .metrics
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let mut stats = Statistics::default();
-            let mut micros = 0u64;
-            for m in registry.iter() {
-                stats.get_direct += m.get_direct.load(Relaxed);
-                stats.get_waited += m.get_waited.load(Relaxed);
-                stats.get_timed_out += m.get_timed_out.load(Relaxed);
-                stats.connections_created += m.connections_created.load(Relaxed);
-                stats.connections_closed_broken += m.connections_closed_broken.load(Relaxed);
-                stats.connections_closed_idle_timeout +=
-                    m.connections_closed_idle_timeout.load(Relaxed);
-                stats.connections_closed_max_lifetime +=
-                    m.connections_closed_max_lifetime.load(Relaxed);
-                micros += m.wait_micros.load(Relaxed);
-            }
-            stats.total_wait_time = Duration::from_micros(micros);
+            let mut stats = self.shared.retired.snapshot_statistics();
+            self.shared
+                .for_each_live_block(|m| stats.add(&m.snapshot_statistics()));
             stats
         }
         #[cfg(not(feature = "metrics"))]
         Statistics::default()
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl<M: ManageConnection> Shared<M> {
+    /// Visit every live thread's metrics block under the registry lock, pruning
+    /// the entries whose [`LocalPool`] has dropped on the way.
+    fn for_each_live_block(&self, mut f: impl FnMut(&Metrics)) {
+        let mut registry = self.metrics.lock().unwrap_or_else(PoisonError::into_inner);
+        registry.retain(|weak| match weak.upgrade() {
+            Some(m) => {
+                f(&m);
+                true
+            }
+            None => false,
+        });
     }
 }
 
@@ -250,6 +254,29 @@ impl Statistics {
         self.total_wait_time
             .checked_div(self.get_waited as u32)
             .unwrap_or_default()
+    }
+
+    /// Fold another snapshot into this one (used to sum across threads).
+    #[cfg(feature = "metrics")]
+    fn add(&mut self, other: &Statistics) {
+        self.get_direct += other.get_direct;
+        self.get_waited += other.get_waited;
+        self.get_timed_out += other.get_timed_out;
+        self.connections_created += other.connections_created;
+        self.connections_closed_broken += other.connections_closed_broken;
+        self.connections_closed_idle_timeout += other.connections_closed_idle_timeout;
+        self.connections_closed_max_lifetime += other.connections_closed_max_lifetime;
+        self.total_wait_time += other.total_wait_time;
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl State {
+    /// Fold another snapshot into this one (used to sum across threads).
+    fn add(&mut self, other: &State) {
+        self.connections += other.connections;
+        self.idle_connections += other.idle_connections;
+        self.pending_waiters += other.pending_waiters;
     }
 }
 
@@ -321,6 +348,34 @@ impl Metrics {
             connections_closed_idle_timeout: self.connections_closed_idle_timeout.load(Relaxed),
             connections_closed_max_lifetime: self.connections_closed_max_lifetime.load(Relaxed),
             total_wait_time: Duration::from_micros(self.wait_micros.load(Relaxed)),
+        }
+    }
+
+    /// Move this block's cumulative counters into `into`, zeroing them here, so a
+    /// dropping [`LocalPool`]'s lifetime totals are kept by the [`Pool`] without
+    /// keeping the block. Each counter is swapped out then added, so a scrape
+    /// racing this sees a value in one place or the other, never both.
+    fn retire_into(&self, into: &Metrics) {
+        for (from, to) in [
+            (&self.get_direct, &into.get_direct),
+            (&self.get_waited, &into.get_waited),
+            (&self.get_timed_out, &into.get_timed_out),
+            (&self.connections_created, &into.connections_created),
+            (
+                &self.connections_closed_broken,
+                &into.connections_closed_broken,
+            ),
+            (
+                &self.connections_closed_idle_timeout,
+                &into.connections_closed_idle_timeout,
+            ),
+            (
+                &self.connections_closed_max_lifetime,
+                &into.connections_closed_max_lifetime,
+            ),
+            (&self.wait_micros, &into.wait_micros),
+        ] {
+            to.fetch_add(from.swap(0, Relaxed), Relaxed);
         }
     }
 }
@@ -397,10 +452,22 @@ impl<M: ManageConnection> Inner<M> {
         self.shared.closed.load(Relaxed)
     }
 
-    /// Give back one slot and wake anyone waiting for capacity.
+    /// Give back one slot and hand it to the next waiter.
     fn release_slot(&self) {
         self.release_slots(1);
-        self.waiters.wake_all();
+        self.notify(1);
+    }
+
+    /// `n` units of capacity (slots or idle connections) just became available:
+    /// wake that many waiters, oldest first. Each wake carries exactly one unit,
+    /// so a returned connection costs one task poll, not one per parked task. A
+    /// closing pool has nothing left to ration, so everyone is woken to fail fast.
+    fn notify(&self, n: u32) {
+        if self.closed() {
+            self.waiters.wake_all();
+        } else {
+            self.waiters.wake(n);
+        }
     }
 
     fn push_idle(&self, conn: Conn<M::Connection>) {
@@ -446,13 +513,16 @@ impl<M: ManageConnection> Inner<M> {
 impl<M: ManageConnection> Drop for Inner<M> {
     fn drop(&mut self) {
         // The connections this thread held drop with `idle`; zero the live gauges
-        // so a finished worker no longer shows up in `Pool::state`. The cumulative
-        // counters stay, so lifetime totals survive the thread.
+        // so a finished worker no longer shows up in `Pool::state`, and move the
+        // cumulative counters into the pool's retired block so lifetime totals
+        // survive the thread. The registry's weak entry dies with this block and
+        // is pruned on the next scrape.
         #[cfg(feature = "metrics")]
         {
             self.metrics.connections.store(0, Relaxed);
             self.metrics.idle.store(0, Relaxed);
             self.metrics.waiters.store(0, Relaxed);
+            self.metrics.retire_into(&self.shared.retired);
         }
     }
 }
@@ -480,11 +550,14 @@ impl<M: ManageConnection> LocalPool<M> {
         #[cfg(feature = "metrics")]
         let metrics = {
             let metrics = Arc::new(Metrics::default());
-            shared
+            let mut registry = shared
                 .metrics
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(metrics.clone());
+                .unwrap_or_else(PoisonError::into_inner);
+            // Prune here too, so a caller that keeps making short-lived pools
+            // cannot grow the registry even if nothing ever scrapes it.
+            registry.retain(|weak| weak.strong_count() > 0);
+            registry.push(Arc::downgrade(&metrics));
             metrics
         };
         Self {
@@ -594,7 +667,7 @@ impl<M: ManageConnection> LocalPool<M> {
             #[cfg(feature = "metrics")]
             self.inner.metrics.dec_idle(reaped);
             self.inner.release_slots(reaped);
-            self.inner.waiters.wake_all();
+            self.inner.notify(reaped);
         }
         reaped
     }
@@ -636,11 +709,14 @@ impl<M: ManageConnection> LocalPool<M> {
             idle.clear();
             n
         };
-        #[cfg(feature = "metrics")]
+        // Same bookkeeping as `reap`: the dropped connections give their slots
+        // back (the count `max_size` is enforced against, metrics or not) and the
+        // freed capacity is handed to waiting tasks.
         if n > 0 {
+            #[cfg(feature = "metrics")]
             self.inner.metrics.dec_idle(n);
-            self.inner.metrics.dec_conn(n);
-            self.inner.waiters.wake_all();
+            self.inner.release_slots(n);
+            self.inner.notify(n);
         }
         n
     }
@@ -837,7 +913,7 @@ impl<M: ManageConnection> Held<M> {
         if let Some(mut conn) = self.conn.take() {
             conn.last_used = Instant::now();
             self.inner.push_idle(conn);
-            self.inner.waiters.wake_all();
+            self.inner.notify(1);
         }
         self.released = true;
     }
@@ -904,8 +980,8 @@ impl<M: ManageConnection> Drop for PooledConnection<M> {
             } else {
                 conn.last_used = Instant::now();
                 self.inner.push_idle(conn);
-                // A connection is available again; wake a waiter.
-                self.inner.waiters.wake_all();
+                // One connection is available again; wake one waiter for it.
+                self.inner.notify(1);
             }
         }
     }
@@ -919,15 +995,31 @@ impl<M: ManageConnection> fmt::Debug for PooledConnection<M> {
     }
 }
 
-/// Wakers of futures waiting for the pool to be ready to hand out a connection.
+/// The FIFO of tasks parked in `get` because the thread is at `max_size`.
+///
+/// Capacity is rationed one wake per unit: a returned connection or a freed slot
+/// wakes the **oldest** waiter only ([`wake`](Self::wake)), so a return costs one
+/// task poll however long the queue is, and waiters are served in arrival order.
+/// Waking everyone ([`wake_all`](Self::wake_all)) is reserved for a closed pool,
+/// where there is nothing left to ration.
+///
 /// Each waiter owns an id so it can withdraw its waker if it is dropped first;
-/// nothing stale is ever woken. The registered count is mirrored into
-/// `Metrics::waiters` so [`Pool::state`] can see it from another thread.
+/// nothing stale is ever woken. Ids are handed out in increasing order and
+/// entries are only ever pushed at the back, so the queue is sorted by id and a
+/// waiter is found by binary search. Ids are popped from the front, in increasing
+/// order too, so `woken_upto` — the highest id ever woken — tells a waiter
+/// whether it has already been taken off the queue without searching it. The
+/// queued count is mirrored into `Metrics::waiters` so [`Pool::state`] can see it
+/// from another thread.
 struct Waiters {
     #[cfg(feature = "metrics")]
     metrics: Arc<Metrics>,
+    /// The next id to hand out; starts at 1 so `woken_upto == 0` means "none yet".
     next_id: Cell<u64>,
-    entries: RefCell<Vec<(u64, Waker)>>,
+    /// The highest id ever woken. An id at or below it is no longer queued.
+    woken_upto: Cell<u64>,
+    /// Parked waiters, oldest at the front, sorted by id.
+    entries: RefCell<VecDeque<(u64, Waker)>>,
 }
 
 impl Waiters {
@@ -935,52 +1027,84 @@ impl Waiters {
         Self {
             #[cfg(feature = "metrics")]
             metrics,
-            next_id: Cell::new(0),
-            entries: RefCell::new(Vec::new()),
+            next_id: Cell::new(1),
+            woken_upto: Cell::new(0),
+            entries: RefCell::new(VecDeque::new()),
         }
     }
 
+    /// Mirror the queue length into the cross-thread gauge.
+    fn mirror(&self, len: usize) {
+        #[cfg(feature = "metrics")]
+        self.metrics.waiters.store(len as u32, Relaxed);
+        #[cfg(not(feature = "metrics"))]
+        let _ = len;
+    }
+
+    /// Queue `id`'s waker, or refresh it if `id` is still queued. A waiter that
+    /// was woken but found nothing to take (a direct `get` call got there first)
+    /// rejoins at the back under a fresh id.
     fn register(&self, id: &mut Option<u64>, waker: &Waker) {
         let mut entries = self.entries.borrow_mut();
         if let Some(existing) = *id
-            && let Some(entry) = entries.iter_mut().find(|(i, _)| *i == existing)
+            && existing > self.woken_upto.get()
+            && let Ok(pos) = entries.binary_search_by_key(&existing, |(i, _)| *i)
         {
+            let entry = &mut entries[pos];
             if !entry.1.will_wake(waker) {
                 entry.1 = waker.clone();
             }
             return;
         }
         let new_id = self.next_id.get();
-        self.next_id.set(new_id.wrapping_add(1));
-        entries.push((new_id, waker.clone()));
-        #[cfg(feature = "metrics")]
-        self.metrics.waiters.store(entries.len() as u32, Relaxed);
+        self.next_id.set(new_id + 1);
+        entries.push_back((new_id, waker.clone()));
         *id = Some(new_id);
+        self.mirror(entries.len());
     }
 
-    fn unregister(&self, id: Option<u64>) {
-        if let Some(id) = id {
-            let mut entries = self.entries.borrow_mut();
-            entries.retain(|(i, _)| *i != id);
-            #[cfg(feature = "metrics")]
-            self.metrics.waiters.store(entries.len() as u32, Relaxed);
+    /// Take `id` off the queue. Returns `false` if it was not there — meaning it
+    /// had already been woken, so the caller holds a wake it has not used.
+    fn unregister(&self, id: u64) -> bool {
+        if id <= self.woken_upto.get() {
+            return false;
+        }
+        let mut entries = self.entries.borrow_mut();
+        match entries.binary_search_by_key(&id, |(i, _)| *i) {
+            Ok(pos) => {
+                entries.remove(pos);
+                self.mirror(entries.len());
+                true
+            }
+            Err(_) => false,
         }
     }
 
-    /// Wake everyone. The borrow is dropped before any waker runs, so a waker
+    /// Wake up to `n` waiters, oldest first — one per unit of capacity that just
+    /// became available. Each waker runs with the queue unborrowed, so a waker
     /// that polls inline can register again without a double borrow.
-    fn wake_all(&self) {
-        let wakers: Vec<Waker> = self
-            .entries
-            .borrow_mut()
-            .drain(..)
-            .map(|(_, w)| w)
-            .collect();
-        #[cfg(feature = "metrics")]
-        self.metrics.waiters.store(0, Relaxed);
-        for waker in wakers {
+    fn wake(&self, n: u32) {
+        for _ in 0..n {
+            let next = {
+                let mut entries = self.entries.borrow_mut();
+                let next = entries.pop_front();
+                if next.is_some() {
+                    self.mirror(entries.len());
+                }
+                next
+            };
+            let Some((id, waker)) = next else {
+                break;
+            };
+            self.woken_upto.set(id);
             waker.wake();
         }
+    }
+
+    /// Wake everyone — for a closed pool, where every waiter will fail fast.
+    fn wake_all(&self) {
+        let queued = self.entries.borrow().len();
+        self.wake(u32::try_from(queued).unwrap_or(u32::MAX));
     }
 }
 
@@ -988,6 +1112,10 @@ impl Waiters {
 /// is room to open one, or the pool has closed — keeping exactly one waker
 /// registered until then. Its output is whether it ever parked, so `get` can tell
 /// a direct checkout from one that waited.
+///
+/// A wake is a unit of capacity handed to this waiter. If the future is dropped
+/// after being woken but before it could act — its `connection_timeout` won the
+/// race — the wake is passed to the next waiter rather than lost.
 struct WaitReady<'a, M: ManageConnection> {
     pool: &'a LocalPool<M>,
     id: Option<u64>,
@@ -1000,7 +1128,14 @@ impl<M: ManageConnection> Future for WaitReady<'_, M> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
         let this = self.get_mut();
         if this.pool.ready_now() {
-            this.pool.inner.waiters.unregister(this.id.take());
+            if let Some(id) = this.id.take() {
+                this.pool.inner.waiters.unregister(id);
+            }
+            // A closed pool is "ready" for everyone: pass the news down the queue
+            // so the others fail fast too instead of sitting out their timeouts.
+            if this.pool.inner.closed() {
+                this.pool.inner.waiters.wake_all();
+            }
             Poll::Ready(this.parked)
         } else {
             this.parked = true;
@@ -1012,6 +1147,11 @@ impl<M: ManageConnection> Future for WaitReady<'_, M> {
 
 impl<M: ManageConnection> Drop for WaitReady<'_, M> {
     fn drop(&mut self) {
-        self.pool.inner.waiters.unregister(self.id.take());
+        if let Some(id) = self.id.take()
+            && !self.pool.inner.waiters.unregister(id)
+        {
+            // Woken, but gone before acting on it: hand the capacity on.
+            self.pool.inner.waiters.wake(1);
+        }
     }
 }

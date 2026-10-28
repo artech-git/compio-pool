@@ -40,6 +40,10 @@ use compio::{
 };
 use compio_pool::{LocalPool, ManageConnection, Pool};
 
+/// The longest line a peer may send. Past this the connection is dropped, so a
+/// peer that never sends a newline cannot grow the buffer without bound.
+const MAX_LINE: usize = 64 * 1024;
+
 /// A newline-framed connection: one `io_uring`-bound stream, a read buffer, and a
 /// health flag for the pool. Used for the client, the shard clients, and the
 /// shard backends alike.
@@ -68,6 +72,9 @@ impl Line {
                     .trim_end_matches('\r')
                     .to_string();
                 return Ok(Some(text));
+            }
+            if self.buf.len() >= MAX_LINE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
             }
             // compio reads into spare capacity and grows the length; keep room.
             if self.buf.len() == self.buf.capacity() {
