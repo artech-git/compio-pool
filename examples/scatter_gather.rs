@@ -162,7 +162,10 @@ fn main() -> io::Result<()> {
             let addr = listener.local_addr()?;
             compio::runtime::spawn(shard_loop(listener, id, delay_ms)).detach();
 
-            let pool = Pool::builder().max_size(capacity).build(Shard { addr });
+            let pool = Pool::builder()
+                .max_size(capacity)
+                .build(Shard { addr })
+                .expect("max_size is nonzero");
             shard_pools.push(pool.local());
         }
         let shards = Rc::new(shard_pools);

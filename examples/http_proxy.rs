@@ -220,7 +220,8 @@ fn main() -> io::Result<()> {
 
         let pool = Pool::builder()
             .max_size(capacity)
-            .build(Origin { addr: origin_addr });
+            .build(Origin { addr: origin_addr })
+            .expect("max_size is nonzero");
         let local = pool.local();
 
         let proxy = TcpListener::bind(listen).await?;

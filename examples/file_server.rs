@@ -69,7 +69,10 @@ fn main() -> io::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
 
-    let pool = Pool::builder().max_size(capacity).build(Buffers);
+    let pool = Pool::builder()
+        .max_size(capacity)
+        .build(Buffers)
+        .expect("max_size is nonzero");
 
     // `PerCore` spawns one pinned worker per core and builds each thread's
     // runtime; the accept loop and its own `SO_REUSEPORT` listener stay here

@@ -91,7 +91,8 @@ fn reuses_an_idle_connection() {
         let pool = Pool::builder()
             .max_size(2)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let first = *local.get().await.unwrap(); // dropped here → returned idle
@@ -110,7 +111,8 @@ fn enforces_max_size_then_times_out() {
             .max_size(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_millis(50))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let held = local.get().await.unwrap();
@@ -134,7 +136,8 @@ fn drops_a_broken_connection() {
         let pool = Pool::builder()
             .max_size(2)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         BROKEN.with(|b| b.set(true));
@@ -158,7 +161,8 @@ fn replaces_a_connection_that_fails_validation() {
         let pool = Pool::builder()
             .max_size(2)
             .test_on_check_out(true)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         drop(local.get().await.unwrap()); // id 1 → idle
@@ -180,7 +184,8 @@ fn surfaces_a_connect_error_and_frees_the_slot() {
         let pool = Pool::builder()
             .max_size(1)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         FAIL_CONNECT.with(|f| f.set(true));
@@ -203,7 +208,7 @@ fn surfaces_a_connect_error_and_frees_the_slot() {
 fn warm_opens_min_idle_up_front() {
     reset();
     run(async {
-        let pool = Pool::builder().max_size(5).min_idle(3).build(Mgr);
+        let pool = Pool::builder().max_size(5).min_idle(3).build(Mgr).unwrap();
         let local = pool.local();
 
         assert_eq!(local.warm().await.unwrap(), 3);
@@ -224,7 +229,8 @@ fn warm_times_out_on_a_hanging_connect() {
             .max_size(2)
             .min_idle(2)
             .connection_timeout(Duration::from_millis(100))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         // A backend that never answers must not wedge warm() forever: each dial
@@ -252,7 +258,8 @@ fn warm_refills_the_idle_floor_after_checkouts() {
             .max_size(5)
             .min_idle(3)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         // Three connections leased, none idle. The floor is three idle, and there
@@ -274,7 +281,8 @@ fn state_reports_live_counts_without_the_metrics_feature() {
         let pool = Pool::builder()
             .max_size(3)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let a = local.get().await.unwrap();
@@ -300,7 +308,8 @@ fn state_counts_pending_waiters_without_the_metrics_feature() {
             .max_size(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_secs(5))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let held = local.get().await.unwrap();
@@ -323,7 +332,8 @@ fn statistics_count_direct_reuse_and_creation() {
         let pool = Pool::builder()
             .max_size(2)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         drop(local.get().await.unwrap()); // opens id 1, returns it idle
@@ -349,7 +359,8 @@ fn statistics_count_timeouts() {
             .max_size(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_millis(50))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let _held = local.get().await.unwrap();
@@ -366,7 +377,8 @@ fn a_waiter_is_counted_and_then_served() {
             .max_size(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_secs(5))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let held = local.get().await.unwrap(); // the only slot
@@ -402,7 +414,8 @@ fn reap_and_maintain_retire_then_refill() {
             .test_on_check_out(false)
             .idle_timeout(None)
             .max_lifetime(Some(Duration::from_millis(10)))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         assert_eq!(local.warm().await.unwrap(), 2);
@@ -435,7 +448,8 @@ fn clear_drains_idle_connections_and_frees_their_slots() {
             .min_idle(3)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_millis(100))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         local.warm().await.unwrap();
@@ -468,7 +482,8 @@ fn clear_hands_the_freed_capacity_to_a_parked_waiter() {
             .max_size(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_millis(300))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let held = local.get().await.unwrap();
@@ -494,7 +509,8 @@ fn clear_after_close_wakes_a_waiter_with_nothing_idle() {
             .max_size(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_secs(5))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let held = local.get().await.unwrap(); // the one slot is taken
@@ -529,7 +545,8 @@ fn waiters_are_served_in_arrival_order() {
             .max_size(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_secs(5))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
         let held = local.get().await.unwrap();
 
@@ -569,7 +586,8 @@ fn a_woken_waiter_that_gives_up_passes_the_wake_on() {
             .max_size(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_millis(300))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
         let held = local.get().await.unwrap();
 
@@ -604,7 +622,8 @@ fn a_task_that_panics_holding_a_lease_returns_it() {
             .max_size(1)
             .test_on_check_out(false)
             .connection_timeout(Duration::from_secs(5))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let holder = local.clone();
@@ -638,7 +657,8 @@ fn statistics_outlive_a_dropped_local_pool() {
         let pool = Pool::builder()
             .max_size(2)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         {
             let local = pool.local();
             drop(local.get().await.unwrap());
@@ -664,7 +684,8 @@ fn close_rejects_gets_and_drops_returns() {
         let pool = Pool::builder()
             .max_size(2)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let held = local.get().await.unwrap();
@@ -734,7 +755,8 @@ fn clear_can_drop_a_connection_that_reenters_the_pool() {
         let pool = Pool::builder()
             .max_size(2)
             .test_on_check_out(false)
-            .build(DropMgr);
+            .build(DropMgr)
+            .unwrap();
         let local = pool.local();
         DROP_POOL.with(|p| *p.borrow_mut() = Some(local.clone()));
 
@@ -758,7 +780,8 @@ fn reap_can_drop_a_connection_that_reenters_the_pool() {
             .max_size(2)
             .test_on_check_out(false)
             .idle_timeout(Some(Duration::from_millis(1)))
-            .build(DropMgr);
+            .build(DropMgr)
+            .unwrap();
         let local = pool.local();
         DROP_POOL.with(|p| *p.borrow_mut() = Some(local.clone()));
 
@@ -782,7 +805,8 @@ fn try_get_returns_none_at_capacity_instead_of_waiting() {
         let pool = Pool::builder()
             .max_size(1)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let held = local.get().await.unwrap(); // the one slot is taken
@@ -808,7 +832,8 @@ fn try_get_reuses_an_idle_connection_or_opens_one() {
         let pool = Pool::builder()
             .max_size(2)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let a = local.try_get().await.unwrap().expect("room to open one");
@@ -823,7 +848,7 @@ fn try_get_reuses_an_idle_connection_or_opens_one() {
 fn try_get_on_a_closed_pool_errors() {
     reset();
     run(async {
-        let pool = Pool::builder().max_size(1).build(Mgr);
+        let pool = Pool::builder().max_size(1).build(Mgr).unwrap();
         let local = pool.local();
         pool.close();
         assert!(matches!(local.try_get().await, Err(RunError::Closed)));
@@ -837,7 +862,8 @@ fn take_removes_a_connection_and_frees_its_slot() {
         let pool = Pool::builder()
             .max_size(1)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         let conn = local.get().await.unwrap();
@@ -864,7 +890,8 @@ fn statistics_count_manual_connection_closes() {
         let pool = Pool::builder()
             .max_size(3)
             .test_on_check_out(false)
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         // Open two distinct connections, return both idle, then drain them by hand.
@@ -900,7 +927,8 @@ fn retry_connection_recovers_from_a_failed_dial() {
             .max_size(1)
             .retry_connection(true)
             .connection_timeout(Duration::from_secs(2))
-            .build(Mgr);
+            .build(Mgr)
+            .unwrap();
         let local = pool.local();
 
         // The first dial fails, the next succeeds. With retry on, get() recovers
@@ -919,7 +947,7 @@ fn without_retry_a_failed_dial_is_surfaced() {
     reset();
     run(async {
         // retry_connection defaults off.
-        let pool = Pool::builder().max_size(1).build(Mgr);
+        let pool = Pool::builder().max_size(1).build(Mgr).unwrap();
         let local = pool.local();
 
         FAIL_CONNECT.with(|f| f.set(true));

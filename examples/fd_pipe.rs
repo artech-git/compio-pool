@@ -56,7 +56,10 @@ fn main() -> io::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(256);
 
-    let pool = Pool::builder().max_size(64).build(Buffers { size });
+    let pool = Pool::builder()
+        .max_size(64)
+        .build(Buffers { size })
+        .expect("max_size is nonzero");
 
     // A single runtime: a pipe has no fan-out, and both ends must share the ring.
     let runtime = Runtime::builder().build().expect("build compio runtime");

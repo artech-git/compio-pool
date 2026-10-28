@@ -61,7 +61,10 @@ fn main() -> io::Result<()> {
     // EADDRINUSE, so clear it first.
     let _ = std::fs::remove_file(&path);
 
-    let pool = Pool::builder().max_size(capacity).build(Buffers);
+    let pool = Pool::builder()
+        .max_size(capacity)
+        .build(Buffers)
+        .expect("max_size is nonzero");
 
     // One listener, so one worker. Pin it to the first permitted core so the ring
     // and the socket share a CPU, the same discipline the fan-out examples apply

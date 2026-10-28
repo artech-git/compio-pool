@@ -1,9 +1,31 @@
 //! Build a [`Pool`] from a manager and a handful of knobs — the bb8 `Builder`,
 //! minus the settings that only make sense for a single shared pool.
 
-use std::{marker::PhantomData, time::Duration};
+use std::{fmt, marker::PhantomData, time::Duration};
 
 use crate::{manage::ManageConnection, pool::Pool};
+
+/// Why [`Builder::build`] refused to make a [`Pool`].
+///
+/// Marked `#[non_exhaustive]`: match it with a wildcard arm so a future reason
+/// does not break your code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BuildError {
+    /// [`max_size`](Builder::max_size) was 0. A pool must allow at least one
+    /// connection per thread.
+    ZeroMaxSize,
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BuildError::ZeroMaxSize => f.write_str("max_size must be at least 1"),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}
 
 /// The resolved configuration every thread's pool reads. Cheap to copy; it lives
 /// behind the pool's `Arc` and is shared read-only across threads.
@@ -122,13 +144,15 @@ impl<M: ManageConnection> Builder<M> {
 
     /// Finish, producing the `Send + Clone` [`Pool`] blueprint.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// If `max_size` is 0.
-    pub fn build(self, manager: M) -> Pool<M> {
-        assert!(self.config.max_size > 0, "max_size must be at least 1");
+    /// Returns [`BuildError::ZeroMaxSize`] if [`max_size`](Self::max_size) is 0.
+    pub fn build(self, manager: M) -> Result<Pool<M>, BuildError> {
+        if self.config.max_size == 0 {
+            return Err(BuildError::ZeroMaxSize);
+        }
         let mut config = self.config;
         config.min_idle = config.min_idle.min(config.max_size);
-        Pool::new(manager, config)
+        Ok(Pool::new(manager, config))
     }
 }

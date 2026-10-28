@@ -96,7 +96,8 @@ fn main() -> io::Result<()> {
         // 2. One pool of upstreams to the backend, and this thread's LocalPool.
         let pool = Pool::builder()
             .max_size(capacity)
-            .build(Upstreams { addr: backend_addr });
+            .build(Upstreams { addr: backend_addr })
+            .expect("max_size is nonzero");
         let local = pool.local();
 
         println!(

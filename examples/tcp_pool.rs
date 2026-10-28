@@ -99,7 +99,10 @@ fn main() -> io::Result<()> {
         .unwrap_or(64);
 
     // Build the pool once; every worker gets a clone of the `Send` handle.
-    let pool = Pool::builder().max_size(capacity).build(Backend);
+    let pool = Pool::builder()
+        .max_size(capacity)
+        .build(Backend)
+        .expect("max_size is nonzero");
 
     // `PerCore` spawns one pinned worker per core and builds each thread's
     // runtime; each worker binds its own `SO_REUSEPORT` listener and carves its
